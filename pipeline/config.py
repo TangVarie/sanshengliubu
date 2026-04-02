@@ -21,8 +21,6 @@ MODELS: dict[str, str] = {
     # 工部 — planner (Opus for complex synthesis), builder (Sonnet for execution)
     "ministry_works": "claude-opus-4-6-thinking",
     "ministry_works_builder": "claude-sonnet-4-6",
-    # 中书省矩阵填充 (Opus)
-    "secretariat_matrix": "claude-opus-4-6-thinking",
     # 终审
     "chancellery_final": "claude-opus-4-6-thinking",
 }
@@ -44,7 +42,6 @@ MAX_TOKENS_STRATEGY = 32000  # Opus stages with thinking need more headroom
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
-    "secretariat_matrix": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
     "ministry_works": MAX_TOKENS_STRATEGY,
     "ministry_works_builder": 8000,
@@ -52,12 +49,17 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
-MATRIX_CELLS_PER_BATCH = 2      # cells per builder call
+MATRIX_BATCH_CONCURRENCY = 5    # max parallel builder calls
+MATRIX_CELLS_PER_BATCH = 3      # cells per builder call
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # Opus stages benefit from deep reasoning; Sonnet stages skip thinking for speed
 THINKING_BUDGET_TOKENS = 10000  # max tokens for thinking before answering
+
+# Per-stage thinking budget overrides (merged tasks need more thinking room)
+STAGE_THINKING_BUDGET: dict[str, int] = {
+    "ministry_works": 16000,  # handles both matrix filling + architecture design
+}
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 

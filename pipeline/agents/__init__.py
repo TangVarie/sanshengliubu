@@ -17,7 +17,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_BUDGET_TOKENS
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_BUDGET_TOKENS, STAGE_THINKING_BUDGET
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -97,9 +97,10 @@ class BaseAgent:
         if self._use_thinking:
             # Extended thinking: system prompt goes into user message (thinking doesn't support system param),
             # and we enable the thinking block with a budget.
+            budget = STAGE_THINKING_BUDGET.get(self.stage_name, THINKING_BUDGET_TOKENS)
             kwargs["thinking"] = {
                 "type": "enabled",
-                "budget_tokens": THINKING_BUDGET_TOKENS,
+                "budget_tokens": budget,
             }
         else:
             kwargs["system"] = system_prompt

@@ -24,9 +24,3 @@ class Secretariat(BaseAgent):
         if previous_plan:
             input_data["previous_plan"] = previous_plan
         return await self.run(input_data, run_id, db)
-
-
-class SecretariatMatrix(BaseAgent):
-    """中书省矩阵填充 — fills platform_content_logic for each active cell."""
-    stage_name = "secretariat_matrix"
-    prompt_file = "secretariat_matrix.md"

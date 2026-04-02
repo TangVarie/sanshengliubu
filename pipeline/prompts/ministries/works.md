@@ -6,10 +6,25 @@
 
 ## 任务
 
-接收前五部全部产出 + 中书省矩阵方案，产出：
-1. **共享骨架**（shared_skeleton）——跨格子共用的 prompt 结构元素
-2. **每个格子的定制计划**（cell_plans）——含精炼的部门产出摘要
-3. **人设集成策略**（persona_integration_strategy）——人设如何影响内容策略
+接收前五部全部产出 + 中书省策略方案（含 matrix_skeleton），产出：
+1. **平台内容逻辑**——为 matrix_skeleton.active_cells 中每个格子生成 platform_content_logic 和 persona_strategy_notes
+2. **共享骨架**（shared_skeleton）——跨格子共用的 prompt 结构元素
+3. **每个格子的定制计划**（cell_plans）——含平台内容逻辑 + 精炼的部门产出摘要
+4. **人设集成策略**（persona_integration_strategy）——人设如何影响内容策略
+
+## 平台内容逻辑填充
+
+运用**平台生态感知**框架，为每个 active_cell 生成 platform_content_logic：
+- 同一个方向在不同平台，内容逻辑是根本不同的：
+  - 小红书是"我发现了一个好东西想安利给姐妹"的语境
+  - 抖音是"前3秒抓住你让你停下来"的语境
+  - B站是"我要把这件事讲明白"的语境
+  - 知乎是"我要给出一个有深度的回答"的语境
+  - 微博是"制造话题让人参与讨论"的语境
+- `platform_content_logic` 必须体现这种根本差异，不能只是"把文字缩短/加长"
+- 必须具体到"这个平台上的用户刷到这条内容时的心理状态和行为模式"
+
+`persona_strategy_notes` 要说明不同人设类型在这个格子里怎么调整内容策略——不是换个称呼，是换思考角度。至少覆盖2种人设类型。
 
 ## 核心职责：ministry_digest 精炼
 
@@ -36,6 +51,8 @@
 3. `applicable_personas` 必须按优先级排序——排在前面的优先生产。排序依据：campaign_objectives（可能多个）的综合匹配度 > 该格子方向的匹配度 > 受众覆盖面
 4. `ministry_digest` 的每个字段都必须是**自包含的**——构建者只看这一个 digest 就有足够信息
 5. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
+6. `platform_content_logic` 必须具体到该平台用户刷到这条内容时的心理状态和行为模式，不能只是格式差异
+7. 每个格子的 `persona_strategy_notes` 至少覆盖2种人设类型的差异化说明
 
 ## 不确定性传递
 
@@ -72,7 +89,8 @@
       "direction_id": "D1",
       "direction_name": "方向名称",
       "platform": "小红书",
-      "platform_content_logic": "该方向在该平台的内容逻辑（来自中书省矩阵）",
+      "platform_content_logic": "该方向在该平台的内容逻辑（由你原创生成，具体到用户消费场景、内容形式、互动模式）",
+      "persona_strategy_notes": "学生党：侧重XX，切入角度是YY；职场人：侧重AA，切入角度是BB",
       "customization_notes": "该格子的特殊处理说明和独特性",
       "applicable_personas": ["persona_type_1", "persona_type_2"],
       "ministry_digest": {

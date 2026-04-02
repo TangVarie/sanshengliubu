@@ -17,7 +17,7 @@ from pipeline.config import (
 )
 from pipeline.agents import ClarificationNeeded
 from pipeline.agents.crown_prince import CrownPrince
-from pipeline.agents.secretariat import Secretariat, SecretariatMatrix
+from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
 from pipeline.agents.dispatcher import Dispatcher
 from pipeline.agents.ministries.personnel import Personnel
@@ -42,7 +42,6 @@ class PipelineOrchestrator:
 
         self.crown_prince = CrownPrince()
         self.secretariat = Secretariat()
-        self.secretariat_matrix = SecretariatMatrix()
         self.chancellery = Chancellery()
         self.dispatcher = Dispatcher()
         self.ministries = {
@@ -146,27 +145,6 @@ class PipelineOrchestrator:
                 plan = done["secretariat"]
             else:
                 plan = await self._strategy_loop(structured_brief)
-
-            # 2b. 中书省矩阵填充 (step 2: fill active cells)
-            if "secretariat_matrix" in done:
-                logger.info("Resuming: skipping secretariat_matrix (already completed)")
-                plan["platform_direction_matrix"] = done["secretariat_matrix"].get(
-                    "platform_direction_matrix", []
-                )
-            else:
-                matrix_input = {
-                    "plan": plan,
-                    "brief": structured_brief,
-                    "matrix_skeleton": plan.get("matrix_skeleton", {}),
-                    "tactical_directions": plan.get("tactical_directions", []),
-                    "target_platforms": plan.get("target_platforms", []),
-                }
-                matrix_fill = await self._run_with_clarification(
-                    self.secretariat_matrix, matrix_input
-                )
-                plan["platform_direction_matrix"] = matrix_fill.get(
-                    "platform_direction_matrix", []
-                )
 
             # 3. 尚书省 — dispatch
             if "dispatcher" in done:

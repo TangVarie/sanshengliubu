@@ -86,7 +86,6 @@ STAGE_DISPLAY_NAMES = {
     "ministry_justice": "刑部",
     "ministry_works": "工部·规划",
     "ministry_works_builder": "工部·构建",
-    "secretariat_matrix": "中书省·矩阵",
 }
 
 needs_input_logs = [l for l in stage_logs if l.get("status") == "needs_input"]
@@ -217,17 +216,6 @@ with tabs[1]:
     else:
         st.caption("等待执行...")
 
-    # Secretariat matrix fill (step 2)
-    matrix_log = log_map.get("secretariat_matrix")
-    if matrix_log:
-        st.divider()
-        st.markdown("**中书省·矩阵填充**")
-        if matrix_log.get("output_data"):
-            render_stage_output(matrix_log["output_data"])
-        elif matrix_log.get("error_message"):
-            st.error(matrix_log["error_message"])
-        else:
-            st.info(f"状态：{matrix_log.get('status', 'pending')}")
 
 # Tab 2: Chancellery
 with tabs[2]:
