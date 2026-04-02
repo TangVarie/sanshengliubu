@@ -62,7 +62,7 @@
   "core_claim": "核心卖点/差异化主张（一句话）",
   "target_platforms": ["xiaohongshu", "douyin"],
   "target_audience": "目标人群画像描述",
-  "campaign_objective": "种草 | 搜索占位 | 口碑扭转 | 新品上市 | 其他",
+  "campaign_objective": ["种草", "搜索占位"],
   "competitive_context": "竞品/竞争环境描述",
   "constraints": "预算约束、合规红线、品牌调性底线等限制条件",
   "task_type": "new_system | iteration | extension",

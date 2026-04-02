@@ -5,7 +5,7 @@
 
 MODELS: dict[str, str] = {
     # 太子 — parsing (Sonnet sufficient)
-    "crown_prince": "claude-sonnet-4-6",
+    "crown_prince": "claude-opus-4-6-thinking",
     # 中书省 — strategy (needs Opus depth)
     "secretariat": "claude-opus-4-6-thinking",
     # 门下省 — review (needs Opus for critical analysis)
@@ -42,6 +42,7 @@ MAX_TOKENS_DEFAULT = 4096
 MAX_TOKENS_STRATEGY = 16000  # Opus stages with thinking need more headroom
 
 STAGE_MAX_TOKENS: dict[str, int] = {
+    "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "secretariat_matrix": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,

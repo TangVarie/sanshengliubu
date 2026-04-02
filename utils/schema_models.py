@@ -37,7 +37,7 @@ class ProductBrief(BaseModel):
     core_claim: str
     target_platforms: list[str] = []
     target_audience: str = ""
-    campaign_objective: str = ""
+    campaign_objective: list[str] = []
     competitive_context: str = ""
     constraints: str = ""
     task_type: str = "new_system"  # new_system | iteration | extension

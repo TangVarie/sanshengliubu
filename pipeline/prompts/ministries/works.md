@@ -33,7 +33,7 @@
 
 1. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
 2. cell_plans 覆盖所有 active_cells，不多不少
-3. `applicable_personas` 必须按优先级排序——排在前面的优先生产。排序依据：campaign_objective 的匹配度 > 该格子方向的匹配度 > 受众覆盖面
+3. `applicable_personas` 必须按优先级排序——排在前面的优先生产。排序依据：campaign_objectives（可能多个）的综合匹配度 > 该格子方向的匹配度 > 受众覆盖面
 4. `ministry_digest` 的每个字段都必须是**自包含的**——构建者只看这一个 digest 就有足够信息
 5. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
 

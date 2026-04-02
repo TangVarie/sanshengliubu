@@ -71,9 +71,10 @@ with tab_new:
             default=["小红书"], key="new_plat",
         )
     with col2:
-        objective = st.selectbox(
-            "Campaign 目标",
+        objective = st.multiselect(
+            "Campaign 目标（可多选）",
             ["种草", "搜索占位", "口碑扭转", "新品上市", "品牌认知", "其他"],
+            default=["种草"],
             key="new_obj",
         )
         competitor = st.text_input("主要竞品（可选）", placeholder="例：竞品A、竞品B", key="new_comp")
@@ -106,7 +107,7 @@ with tab_new:
             if category:
                 full_text += f"品类：{category}\n"
             full_text += f"目标平台：{', '.join(platforms)}\n"
-            full_text += f"Campaign目标：{objective}\n"
+            full_text += f"Campaign目标：{', '.join(objective)}\n"
             if competitor:
                 full_text += f"竞品：{competitor}\n"
             if constraints:
@@ -170,7 +171,7 @@ with tab_iterate:
                     f"**继承信息** — 产品：{brief.get('product_name', '?')} · "
                     f"品类：{brief.get('product_category', '?')} · "
                     f"平台：{', '.join(brief.get('target_platforms', []))} · "
-                    f"目标：{brief.get('campaign_objective', '?')}"
+                    f"目标：{', '.join(brief['campaign_objective']) if isinstance(brief.get('campaign_objective'), list) else brief.get('campaign_objective', '?')}"
                 )
                 with st.expander("查看完整 brief"):
                     st.json(brief)
@@ -240,7 +241,7 @@ with tab_iterate:
             m_cat = st.text_input("品类", key="mig_cat")
             m_plat = st.multiselect("目标平台", ["小红书", "抖音", "微博", "B站", "快手"], key="mig_plat")
         with col2:
-            m_obj = st.selectbox("Campaign 目标", ["种草", "搜索占位", "口碑扭转", "新品上市", "其他"], key="mig_obj")
+            m_obj = st.multiselect("Campaign 目标（可多选）", ["种草", "搜索占位", "口碑扭转", "新品上市", "品牌认知", "其他"], default=["种草"], key="mig_obj")
             m_comp = st.text_input("竞品（可选）", key="mig_comp")
 
         m_notes = st.text_area(
@@ -263,7 +264,7 @@ with tab_iterate:
                     full_text += f"品类：{m_cat}\n"
                 if m_plat:
                     full_text += f"目标平台：{', '.join(m_plat)}\n"
-                full_text += f"Campaign目标：{m_obj}\n"
+                full_text += f"Campaign目标：{', '.join(m_obj)}\n"
                 if m_comp:
                     full_text += f"竞品：{m_comp}\n"
 
