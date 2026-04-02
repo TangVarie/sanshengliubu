@@ -5,26 +5,26 @@
 
 MODELS: dict[str, str] = {
     # 太子 — parsing (Sonnet sufficient)
-    "crown_prince": "claude-sonnet-4-20250514",
+    "crown_prince": "claude-sonnet-4-6",
     # 中书省 — strategy (needs Opus depth)
-    "secretariat": "claude-opus-4-20250514",
+    "secretariat": "claude-opus-4-6",
     # 门下省 — review (needs Opus for critical analysis)
-    "chancellery": "claude-opus-4-20250514",
+    "chancellery": "claude-opus-4-6",
     # 尚书省 — task splitting (Sonnet sufficient)
-    "dispatcher": "claude-sonnet-4-20250514",
+    "dispatcher": "claude-sonnet-4-6",
     # 六部 — execution (Sonnet for parallel efficiency)
-    "ministry_personnel": "claude-sonnet-4-20250514",
-    "ministry_revenue": "claude-sonnet-4-20250514",
-    "ministry_rites": "claude-sonnet-4-20250514",
-    "ministry_war": "claude-sonnet-4-20250514",
-    "ministry_justice": "claude-sonnet-4-20250514",
+    "ministry_personnel": "claude-sonnet-4-6",
+    "ministry_revenue": "claude-sonnet-4-6",
+    "ministry_rites": "claude-sonnet-4-6",
+    "ministry_war": "claude-sonnet-4-6",
+    "ministry_justice": "claude-sonnet-4-6",
     # 工部 — planner (Opus for complex synthesis), builder (Sonnet for execution)
-    "ministry_works": "claude-opus-4-20250514",
-    "ministry_works_builder": "claude-sonnet-4-20250514",
+    "ministry_works": "claude-opus-4-6",
+    "ministry_works_builder": "claude-sonnet-4-6",
     # 中书省矩阵填充 (Opus)
-    "secretariat_matrix": "claude-opus-4-20250514",
+    "secretariat_matrix": "claude-opus-4-6",
     # 终审
-    "chancellery_final": "claude-opus-4-20250514",
+    "chancellery_final": "claude-opus-4-6",
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -61,13 +61,13 @@ THINKING_BUDGET_TOKENS = 10000  # max tokens for thinking before answering
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
 COST_PER_1M_INPUT: dict[str, float] = {
-    "claude-opus-4-20250514": 15.0,
-    "claude-sonnet-4-20250514": 3.0,
+    "claude-opus-4-6": 15.0,
+    "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
-    "claude-opus-4-20250514": 75.0,
-    "claude-sonnet-4-20250514": 15.0,
+    "claude-opus-4-6": 75.0,
+    "claude-sonnet-4-6": 15.0,
 }
 
 # ── UI polling ─────────────────────────────────────────────────────────────
