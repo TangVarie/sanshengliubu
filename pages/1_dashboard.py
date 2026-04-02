@@ -59,6 +59,7 @@ try:
                     st.caption(f"状态：**{status}**")
                 with c4:
                     if st.button("查看详情", key=f"view_{pid}"):
+                        st.session_state["current_project_id"] = pid
                         st.query_params["project_id"] = pid
                         st.switch_page("pages/3_pipeline_detail.py")
 

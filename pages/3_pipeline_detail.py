@@ -35,10 +35,12 @@ def render_stage_output(output_data: dict):
 
 # ── Get project ID ─────────────────────────────────────────────────────────
 
-project_id = st.query_params.get("project_id")
+project_id = st.session_state.get("current_project_id") or st.query_params.get("project_id")
 if not project_id:
     st.warning("请从「项目总览」选择一个项目查看。")
     st.stop()
+# Sync for URL sharing and page refresh
+st.query_params["project_id"] = project_id
 
 try:
     db = SupabaseClient.get_instance()
@@ -81,7 +83,9 @@ STAGE_DISPLAY_NAMES = {
     "ministry_rites": "礼部",
     "ministry_war": "兵部",
     "ministry_justice": "刑部",
-    "ministry_works": "工部",
+    "ministry_works": "工部·规划",
+    "ministry_works_builder": "工部·构建",
+    "secretariat_matrix": "中书省·矩阵",
 }
 
 needs_input_logs = [l for l in stage_logs if l.get("status") == "needs_input"]
@@ -200,6 +204,18 @@ with tabs[1]:
     else:
         st.caption("等待执行...")
 
+    # Secretariat matrix fill (step 2)
+    matrix_log = log_map.get("secretariat_matrix")
+    if matrix_log:
+        st.divider()
+        st.markdown("**中书省·矩阵填充**")
+        if matrix_log.get("output_data"):
+            render_stage_output(matrix_log["output_data"])
+        elif matrix_log.get("error_message"):
+            st.error(matrix_log["error_message"])
+        else:
+            st.info(f"状态：{matrix_log.get('status', 'pending')}")
+
 # Tab 2: Chancellery
 with tabs[2]:
     chan_logs = [l for l in stage_logs if l["stage_name"].startswith("chancellery_")]
@@ -263,23 +279,38 @@ with tabs[4]:
         "ministry_personnel", "ministry_revenue", "ministry_rites",
         "ministry_war", "ministry_justice", "ministry_works",
     ]
+    def _render_stage_log(stage_key: str, label: str = ""):
+        log = log_map.get(stage_key)
+        if log and log.get("output_data"):
+            render_stage_output(log["output_data"])
+        elif log:
+            s = log.get("status", "pending")
+            if s == "running":
+                st.info("⏳ 执行中...")
+            elif s == "failed":
+                st.error(f"执行失败：{log.get('error_message', '')}")
+            elif s == "skipped":
+                st.warning("⏭️ 已跳过")
+            else:
+                st.caption(f"状态：{s}")
+        else:
+            st.caption("等待执行...")
+
     for i, mk in enumerate(ministry_keys):
         with ministry_tabs[i]:
-            log = log_map.get(mk)
-            if log and log.get("output_data"):
-                render_stage_output(log["output_data"])
-            elif log:
-                s = log.get("status", "pending")
-                if s == "running":
-                    st.info("⏳ 执行中...")
-                elif s == "failed":
-                    st.error(f"执行失败：{log.get('error_message', '')}")
-                elif s == "skipped":
-                    st.warning("⏭️ 已跳过")
-                else:
-                    st.caption(f"状态：{s}")
-            else:
-                st.caption("等待执行...")
+            _render_stage_log(mk)
+            # Works tab also shows builder logs
+            if mk == "ministry_works":
+                builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
+                if builder_logs:
+                    st.divider()
+                    st.markdown("**工部·构建（分批执行）**")
+                    for bl in builder_logs:
+                        with st.expander(f"构建批次 {builder_logs.index(bl) + 1}", expanded=False):
+                            if bl.get("output_data"):
+                                render_stage_output(bl["output_data"])
+                            elif bl.get("error_message"):
+                                st.error(bl["error_message"])
 
 # Tab 5: Final Review
 with tabs[5]:
@@ -320,14 +351,17 @@ c1, c2, c3 = st.columns(3)
 with c1:
     if status == "completed":
         if st.button("📦 查看产出"):
+            st.session_state["current_project_id"] = project_id
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
 with c2:
     if status == "completed" or status == "failed":
         if st.button("🔄 重跑流水线"):
             from pipeline.orchestrator import start_pipeline_in_background
+            from pipeline.agents import init_api_config
             new_run = db.create_pipeline_run(project_id)
             db.update_project(project_id, status="running")
+            init_api_config()
             start_pipeline_in_background(project_id, new_run["id"], db)
             st.rerun()
 

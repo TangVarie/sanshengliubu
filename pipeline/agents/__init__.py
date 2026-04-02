@@ -17,6 +17,15 @@ from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
+# ── API config cache (populated in main thread, used by background threads) ──
+_api_config: dict[str, str] = {}
+
+
+def init_api_config():
+    """Call from Streamlit main thread to cache API secrets for background use."""
+    _api_config["api_key"] = st.secrets["ANTHROPIC_API_KEY"]
+    _api_config["base_url"] = st.secrets.get("ANTHROPIC_BASE_URL", "")
+
 
 class ClarificationNeeded(Exception):
     """Raised when an agent needs user input to continue."""
@@ -41,10 +50,11 @@ class BaseAgent:
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
 
     def _get_client(self) -> anthropic.Anthropic:
-        base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
-        kwargs: dict[str, str] = {"api_key": st.secrets["ANTHROPIC_API_KEY"]}
-        if base_url:
-            kwargs["base_url"] = base_url
+        if not _api_config:
+            init_api_config()
+        kwargs: dict[str, str] = {"api_key": _api_config["api_key"]}
+        if _api_config.get("base_url"):
+            kwargs["base_url"] = _api_config["base_url"]
         return anthropic.Anthropic(**kwargs)
 
     def load_system_prompt(self) -> str:

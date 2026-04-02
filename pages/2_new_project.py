@@ -117,11 +117,14 @@ with tab_new:
             try:
                 from db.supabase_client import SupabaseClient
                 from pipeline.orchestrator import start_pipeline_in_background
+                from pipeline.agents import init_api_config
                 db = SupabaseClient.get_instance()
                 project = db.create_project(name=product_name, free_text=full_text, task_type="new_system")
                 run = db.create_pipeline_run(project["id"])
+                init_api_config()
                 start_pipeline_in_background(project["id"], run["id"], db)
                 st.success("✅ 流水线已启动！")
+                st.session_state["current_project_id"] = project["id"]
                 st.query_params["project_id"] = project["id"]
                 st.switch_page("pages/3_pipeline_detail.py")
             except Exception as e:
@@ -208,8 +211,11 @@ with tab_iterate:
                         )
                         run = db.create_pipeline_run(project["id"])
                         from pipeline.orchestrator import start_pipeline_in_background
+                        from pipeline.agents import init_api_config
+                        init_api_config()
                         start_pipeline_in_background(project["id"], run["id"], db)
                         st.success("✅ 流水线已启动！")
+                        st.session_state["current_project_id"] = project["id"]
                         st.query_params["project_id"] = project["id"]
                         st.switch_page("pages/3_pipeline_detail.py")
                     except Exception as e:
@@ -271,11 +277,14 @@ with tab_iterate:
                 try:
                     from db.supabase_client import SupabaseClient
                     from pipeline.orchestrator import start_pipeline_in_background
+                    from pipeline.agents import init_api_config
                     db = SupabaseClient.get_instance()
                     project = db.create_project(name=m_name, free_text=full_text, task_type=task_type_iter)
                     run = db.create_pipeline_run(project["id"])
+                    init_api_config()
                     start_pipeline_in_background(project["id"], run["id"], db)
                     st.success("✅ 流水线已启动！")
+                    st.session_state["current_project_id"] = project["id"]
                     st.query_params["project_id"] = project["id"]
                     st.switch_page("pages/3_pipeline_detail.py")
                 except Exception as e:

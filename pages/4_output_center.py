@@ -9,7 +9,9 @@ from utils.export import export_as_markdown, export_as_json
 st.set_page_config(page_title="产出中心", page_icon="📦", layout="wide")
 st.title("📦 产出中心")
 
-project_id = st.query_params.get("project_id")
+project_id = st.session_state.get("current_project_id") or st.query_params.get("project_id")
+if project_id:
+    st.query_params["project_id"] = project_id
 
 try:
     db = SupabaseClient.get_instance()
@@ -198,10 +200,13 @@ if uncertainty_summary:
                 )
 
                 from pipeline.orchestrator import start_pipeline_in_background
+                from pipeline.agents import init_api_config
                 new_run = db.create_pipeline_run(project_id)
+                init_api_config()
                 start_pipeline_in_background(project_id, new_run["id"], db)
 
                 st.success("已提交补充数据，流水线正在重新优化...")
+                st.session_state["current_project_id"] = project_id
                 st.query_params["project_id"] = project_id
                 st.switch_page("pages/3_pipeline_detail.py")
 
