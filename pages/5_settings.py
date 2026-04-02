@@ -15,8 +15,13 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("**Anthropic API**")
     api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
     if api_key and api_key != "sk-ant-...":
         st.success(f"✅ 已配置 (***{api_key[-4:]})")
+        if base_url:
+            st.info(f"🔀 中转：`{base_url}`")
+        else:
+            st.caption("直连 Anthropic 官方 API")
     else:
         st.error("❌ 未配置")
         st.caption("在 `.streamlit/secrets.toml` 中设置 `ANTHROPIC_API_KEY`")
