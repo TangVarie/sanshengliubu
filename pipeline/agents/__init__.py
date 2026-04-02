@@ -1,0 +1,135 @@
+"""Base agent class for all pipeline agents."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+import anthropic
+import streamlit as st
+
+from db.supabase_client import SupabaseClient
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT
+
+PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+
+class BaseAgent:
+    """Base class for all pipeline agents. Subclasses set stage_name and prompt_file."""
+
+    stage_name: str = ""
+    prompt_file: str = ""  # relative to pipeline/prompts/
+
+    def __init__(self):
+        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-20250514")
+        self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
+
+    def _get_client(self) -> anthropic.Anthropic:
+        return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+    def load_system_prompt(self) -> str:
+        path = PROMPTS_DIR / self.prompt_file
+        return path.read_text(encoding="utf-8")
+
+    def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
+        """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens)."""
+        client = self._get_client()
+        response = client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        text = response.content[0].text
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        return text, input_tokens, output_tokens
+
+    @staticmethod
+    def _extract_json(response_text: str) -> dict[str, Any]:
+        """Extract JSON from Claude response, handling markdown code blocks."""
+        # Try direct parse
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            pass
+
+        # Try ```json ... ``` block
+        match = re.search(r"```json\s*\n?(.*?)\n?\s*```", response_text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try any ``` ... ``` block
+        match = re.search(r"```\s*\n?(.*?)\n?\s*```", response_text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try outermost braces
+        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"Could not extract JSON from response: {response_text[:500]}")
+
+    async def run(self, input_data: dict, run_id: str, db: SupabaseClient) -> dict:
+        """Execute the agent: log → call Claude → parse → validate → update log."""
+        log = db.create_stage_log(run_id, self.stage_name, input_data)
+        log_id = log["id"]
+        start_time = time.time()
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                system_prompt = self.load_system_prompt()
+                user_message = json.dumps(input_data, ensure_ascii=False, indent=2)
+
+                text, input_tokens, output_tokens = await asyncio.to_thread(
+                    self._call_claude, system_prompt, user_message
+                )
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+
+                output = self._extract_json(text)
+                duration = time.time() - start_time
+
+                db.update_stage_log(
+                    log_id,
+                    status="completed",
+                    output_data=output,
+                    model_used=self.model,
+                    tokens_used=total_input_tokens + total_output_tokens,
+                    duration_seconds=round(duration, 2),
+                )
+                return output
+
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                    await asyncio.sleep(delay)
+
+        # All retries exhausted
+        duration = time.time() - start_time
+        db.update_stage_log(
+            log_id,
+            status="failed",
+            error_message=str(last_error),
+            tokens_used=total_input_tokens + total_output_tokens,
+            duration_seconds=round(duration, 2),
+        )
+        raise last_error  # type: ignore[misc]
