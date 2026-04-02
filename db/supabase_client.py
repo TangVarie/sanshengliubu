@@ -125,6 +125,10 @@ class SupabaseClient:
         )
         return resp.data
 
+    def get_stage_log_by_id(self, log_id: str) -> dict | None:
+        resp = self.client.table("stage_logs").select("*").eq("id", log_id).execute()
+        return resp.data[0] if resp.data else None
+
     def get_stage_log_by_name(self, run_id: str, stage_name: str) -> dict | None:
         resp = (
             self.client.table("stage_logs")

@@ -16,6 +16,7 @@ class StageStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    NEEDS_INPUT = "needs_input"
 
 
 class PipelineStatus(str, Enum):
@@ -42,6 +43,8 @@ class ProductBrief(BaseModel):
     task_type: str = "new_system"  # new_system | iteration | extension
     iteration_context: str = ""
     raw_materials: str = ""
+    reference_summary: str = ""
+    existing_prompt_analysis: str = ""
 
 
 # ── 中书省 · Secretariat Output ───────────────────────────────────────────
