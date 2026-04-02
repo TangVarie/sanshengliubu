@@ -29,7 +29,11 @@ class BaseAgent:
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
 
     def _get_client(self) -> anthropic.Anthropic:
-        return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+        base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
+        kwargs: dict[str, str] = {"api_key": st.secrets["ANTHROPIC_API_KEY"]}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return anthropic.Anthropic(**kwargs)
 
     def load_system_prompt(self) -> str:
         path = PROMPTS_DIR / self.prompt_file
