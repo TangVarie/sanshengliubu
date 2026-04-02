@@ -49,7 +49,7 @@ try:
             created = project.get("created_at", "")[:16].replace("T", " ")
 
             with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 1, 1])
                 with c1:
                     st.markdown(f"### {emoji} {project['name']}")
                 with c2:
@@ -62,6 +62,22 @@ try:
                         st.session_state["current_project_id"] = pid
                         st.query_params["project_id"] = pid
                         st.switch_page("pages/3_pipeline_detail.py")
+                with c5:
+                    if st.button("🗑️", key=f"del_{pid}", help="删除项目"):
+                        st.session_state[f"confirm_del_{pid}"] = True
+
+            if st.session_state.get(f"confirm_del_{pid}"):
+                st.warning(f"确定要删除「{project['name']}」？所有运行记录和产出将一并删除，不可恢复。")
+                cc1, cc2, _ = st.columns([1, 1, 4])
+                with cc1:
+                    if st.button("确认删除", key=f"yes_{pid}", type="primary"):
+                        db.delete_project(pid)
+                        st.session_state.pop(f"confirm_del_{pid}", None)
+                        st.rerun()
+                with cc2:
+                    if st.button("取消", key=f"no_{pid}"):
+                        st.session_state.pop(f"confirm_del_{pid}", None)
+                        st.rerun()
 
         # Auto-refresh if any project is running
         if running > 0:

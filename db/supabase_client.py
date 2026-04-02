@@ -67,6 +67,10 @@ class SupabaseClient:
         resp = self.client.table("projects").update(fields).eq("id", project_id).execute()
         return resp.data[0]
 
+    def delete_project(self, project_id: str) -> None:
+        """Delete a project and all associated runs/logs/outputs (CASCADE)."""
+        self.client.table("projects").delete().eq("id", project_id).execute()
+
     # ── Pipeline Runs ──────────────────────────────────────────────────
 
     def create_pipeline_run(self, project_id: str) -> dict:
