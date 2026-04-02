@@ -95,6 +95,37 @@ if guide:
     with st.expander("📖 使用指南"):
         st.markdown(guide)
 
+# Uncertainty summary
+uncertainty_summary = prompt_system.get("_uncertainty_summary", {})
+if uncertainty_summary:
+    st.subheader("⚠️ 数据验证清单")
+    st.caption("以下内容基于 AI 推断，建议在使用前用真实数据验证")
+
+    high = uncertainty_summary.get("high_impact", [])
+    if high:
+        st.markdown("### 🔴 高优先级（强烈建议验证）")
+        for item in high:
+            st.error(
+                f"**{item.get('source', '')}** → {item.get('field', '')}\n\n"
+                f"{item.get('reason', '')}\n\n"
+                f"📋 {item.get('data_suggestion', '')}"
+            )
+
+    medium = uncertainty_summary.get("medium_impact", [])
+    if medium:
+        st.markdown("### 🟡 中优先级")
+        for item in medium:
+            st.warning(
+                f"**{item.get('source', '')}** → {item.get('field', '')}\n\n"
+                f"📋 {item.get('data_suggestion', '')}"
+            )
+
+    checklist = uncertainty_summary.get("data_checklist", [])
+    if checklist:
+        st.markdown("### 📋 建议补充的数据源")
+        for item in checklist:
+            st.markdown(f"- {item}")
+
 # Batch rules
 batch_rules = prompt_system.get("batch_rules", {})
 if batch_rules:
