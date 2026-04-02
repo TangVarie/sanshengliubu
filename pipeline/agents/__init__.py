@@ -13,7 +13,7 @@ import anthropic
 import streamlit as st
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_BUDGET_TOKENS
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -57,16 +57,44 @@ class BaseAgent:
             prompt += "\n\n---\n\n" + foundation_path.read_text(encoding="utf-8")
         return prompt
 
+    @property
+    def _use_thinking(self) -> bool:
+        return "opus" in self.model
+
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
-        """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens)."""
+        """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
+
+        Opus models use extended thinking for deeper reasoning.
+        """
         client = self._get_client()
-        response = client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        text = response.content[0].text
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": system_prompt + "\n\n---\n\n" + user_message}]
+            if self._use_thinking
+            else [{"role": "user", "content": user_message}],
+        }
+
+        if self._use_thinking:
+            # Extended thinking: system prompt goes into user message (thinking doesn't support system param),
+            # and we enable the thinking block with a budget.
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": THINKING_BUDGET_TOKENS,
+            }
+        else:
+            kwargs["system"] = system_prompt
+
+        response = client.messages.create(**kwargs)
+
+        # Extract text from response — thinking responses have multiple content blocks
+        text = ""
+        for block in response.content:
+            if block.type == "text":
+                text = block.text
+                break
+
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
         return text, input_tokens, output_tokens

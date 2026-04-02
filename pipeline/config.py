@@ -36,7 +36,7 @@ MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
 # ── Token limits ───────────────────────────────────────────────────────────
 
 MAX_TOKENS_DEFAULT = 4096
-MAX_TOKENS_STRATEGY = 8192  # Secretariat, Works, Chancellery
+MAX_TOKENS_STRATEGY = 16000  # Opus stages with thinking need more headroom
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "secretariat": MAX_TOKENS_STRATEGY,
@@ -44,6 +44,10 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_works": MAX_TOKENS_STRATEGY,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
+
+# ── Extended Thinking ─────────────────────────────────────────────────────
+# Opus stages benefit from deep reasoning; Sonnet stages skip thinking for speed
+THINKING_BUDGET_TOKENS = 10000  # max tokens for thinking before answering
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
