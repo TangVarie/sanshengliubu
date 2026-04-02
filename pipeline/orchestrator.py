@@ -55,6 +55,17 @@ class PipelineOrchestrator:
         self.works = Works()
         self.works_builder = WorksBuilder()
 
+    # ── Completed stages cache (for resume) ───────────────────────────
+
+    def _load_completed_stages(self) -> dict[str, dict]:
+        """Load outputs from already-completed stages in this run."""
+        logs = self.db.get_stage_logs(self.run_id)
+        return {
+            log["stage_name"]: log["output_data"]
+            for log in logs
+            if log.get("status") == "completed" and log.get("output_data")
+        }
+
     # ── Clarification handling ─────────────────────────────────────────
 
     async def _wait_for_clarification(self, log_id: str) -> dict:
@@ -105,55 +116,83 @@ class PipelineOrchestrator:
     # ── Main pipeline ──────────────────────────────────────────────────
 
     async def run(self):
-        """Execute the full pipeline."""
+        """Execute the full pipeline with resume support.
+
+        If this run has previously completed stages (e.g. after a failure and
+        restart), those stages are skipped and their outputs are reused.
+        """
         try:
+            self.db.update_pipeline_run(self.run_id, status="running")
             self.db.update_project(self.project_id, status="running")
 
+            done = self._load_completed_stages()
+
             # 1. 太子 — parse brief
-            project = self.db.get_project(self.project_id)
-            raw_input = {
-                "free_text": project.get("free_text", ""),
-                "brief": project.get("brief") or {},
-            }
-            structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
-            self.db.update_project(self.project_id, brief=structured_brief)
+            if "crown_prince" in done:
+                logger.info("Resuming: skipping crown_prince (already completed)")
+                structured_brief = done["crown_prince"]
+            else:
+                project = self.db.get_project(self.project_id)
+                raw_input = {
+                    "free_text": project.get("free_text", ""),
+                    "brief": project.get("brief") or {},
+                }
+                structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
+                self.db.update_project(self.project_id, brief=structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
-            plan = await self._strategy_loop(structured_brief)
+            if "secretariat" in done:
+                logger.info("Resuming: skipping strategy loop (already completed)")
+                plan = done["secretariat"]
+            else:
+                plan = await self._strategy_loop(structured_brief)
 
             # 2b. 中书省矩阵填充 (step 2: fill active cells)
-            matrix_input = {
-                "plan": plan,
-                "brief": structured_brief,
-                "matrix_skeleton": plan.get("matrix_skeleton", {}),
-                "tactical_directions": plan.get("tactical_directions", []),
-                "target_platforms": plan.get("target_platforms", []),
-            }
-            matrix_fill = await self._run_with_clarification(
-                self.secretariat_matrix, matrix_input
-            )
-            # Merge matrix fill back into plan
-            plan["platform_direction_matrix"] = matrix_fill.get(
-                "platform_direction_matrix", []
-            )
+            if "secretariat_matrix" in done:
+                logger.info("Resuming: skipping secretariat_matrix (already completed)")
+                plan["platform_direction_matrix"] = done["secretariat_matrix"].get(
+                    "platform_direction_matrix", []
+                )
+            else:
+                matrix_input = {
+                    "plan": plan,
+                    "brief": structured_brief,
+                    "matrix_skeleton": plan.get("matrix_skeleton", {}),
+                    "tactical_directions": plan.get("tactical_directions", []),
+                    "target_platforms": plan.get("target_platforms", []),
+                }
+                matrix_fill = await self._run_with_clarification(
+                    self.secretariat_matrix, matrix_input
+                )
+                plan["platform_direction_matrix"] = matrix_fill.get(
+                    "platform_direction_matrix", []
+                )
 
             # 3. 尚书省 — dispatch
-            dispatch_input = {"plan": plan, "brief": structured_brief}
-            tasks = await self._run_with_clarification(self.dispatcher, dispatch_input)
+            if "dispatcher" in done:
+                logger.info("Resuming: skipping dispatcher (already completed)")
+                tasks = done["dispatcher"]
+            else:
+                dispatch_input = {"plan": plan, "brief": structured_brief}
+                tasks = await self._run_with_clarification(self.dispatcher, dispatch_input)
 
-            # 4. 六部（前五部并行）
-            ministry_outputs = await self._run_ministries(tasks, structured_brief, plan)
+            # 4. 六部（前五部并行，跳过已完成的）
+            ministry_outputs = await self._run_ministries(tasks, structured_brief, plan, done)
 
             # 5a. 工部·规划 — design matrix architecture (single Opus call)
-            works_planner_input = {
-                "ministry_outputs": ministry_outputs,
-                "brief": structured_brief,
-                "plan": plan,
-                "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
-            }
-            works_plan = await self._run_with_clarification(
-                self.works, works_planner_input
-            )
+            if "ministry_works" in done:
+                logger.info("Resuming: skipping ministry_works planner (already completed)")
+                works_plan = done["ministry_works"]
+            else:
+                works_planner_input = {
+                    "ministry_outputs": ministry_outputs,
+                    "brief": structured_brief,
+                    "plan": plan,
+                    "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
+                }
+                works_plan = await self._run_with_clarification(
+                    self.works, works_planner_input
+                )
 
             # 5b. 工部·构建 — generate per-cell prompts (Sonnet, batched)
             final_system = await self._run_works_builders(works_plan)
@@ -210,11 +249,19 @@ class PipelineOrchestrator:
 
         return plan  # Forced pass on last round
 
-    async def _run_ministries(self, tasks: dict, brief: dict, plan: dict) -> dict:
-        """Run first 5 ministries in parallel, return dict of outputs."""
+    async def _run_ministries(
+        self, tasks: dict, brief: dict, plan: dict, done: dict | None = None
+    ) -> dict:
+        """Run first 5 ministries in parallel, skip already-completed ones."""
         task_map = tasks.get("tasks", {})
+        done = done or {}
 
         async def run_one(name: str) -> tuple[str, dict | None]:
+            # Skip if already completed in a previous run attempt
+            if name in done:
+                logger.info(f"Resuming: skipping {name} (already completed)")
+                return name, done[name]
+
             agent = self.ministries[name]
             ministry_task = task_map.get(name, {})
             input_data = {
@@ -306,3 +353,10 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     thread = threading.Thread(target=_thread_target, daemon=True)
     thread.start()
     return thread
+
+
+def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
+    """Resume a failed pipeline run — reuses existing run_id and skips completed stages."""
+    # Reset run status so UI shows it as running again
+    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    return start_pipeline_in_background(project_id, run_id, db)

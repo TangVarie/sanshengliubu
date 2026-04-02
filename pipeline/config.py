@@ -7,9 +7,9 @@ MODELS: dict[str, str] = {
     # 太子 — parsing (Sonnet sufficient)
     "crown_prince": "claude-sonnet-4-6",
     # 中书省 — strategy (needs Opus depth)
-    "secretariat": "claude-opus-4-6",
+    "secretariat": "claude-opus-4-6-thinking",
     # 门下省 — review (needs Opus for critical analysis)
-    "chancellery": "claude-opus-4-6",
+    "chancellery": "claude-opus-4-6-thinking",
     # 尚书省 — task splitting (Sonnet sufficient)
     "dispatcher": "claude-sonnet-4-6",
     # 六部 — execution (Sonnet for parallel efficiency)
@@ -19,12 +19,12 @@ MODELS: dict[str, str] = {
     "ministry_war": "claude-sonnet-4-6",
     "ministry_justice": "claude-sonnet-4-6",
     # 工部 — planner (Opus for complex synthesis), builder (Sonnet for execution)
-    "ministry_works": "claude-opus-4-6",
+    "ministry_works": "claude-opus-4-6-thinking",
     "ministry_works_builder": "claude-sonnet-4-6",
     # 中书省矩阵填充 (Opus)
-    "secretariat_matrix": "claude-opus-4-6",
+    "secretariat_matrix": "claude-opus-4-6-thinking",
     # 终审
-    "chancellery_final": "claude-opus-4-6",
+    "chancellery_final": "claude-opus-4-6-thinking",
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -61,12 +61,12 @@ THINKING_BUDGET_TOKENS = 10000  # max tokens for thinking before answering
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
 COST_PER_1M_INPUT: dict[str, float] = {
-    "claude-opus-4-6": 15.0,
+    "claude-opus-4-6-thinking": 15.0,
     "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
-    "claude-opus-4-6": 75.0,
+    "claude-opus-4-6-thinking": 75.0,
     "claude-sonnet-4-6": 15.0,
 }
 

@@ -59,3 +59,9 @@ CREATE INDEX idx_pipeline_runs_project ON pipeline_runs(project_id);
 CREATE INDEX idx_stage_logs_run ON stage_logs(run_id);
 CREATE INDEX idx_stage_logs_stage ON stage_logs(stage_name);
 CREATE INDEX idx_outputs_run ON outputs(run_id);
+
+-- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
+ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
+ALTER TABLE pipeline_runs DISABLE ROW LEVEL SECURITY;
+ALTER TABLE stage_logs DISABLE ROW LEVEL SECURITY;
+ALTER TABLE outputs DISABLE ROW LEVEL SECURITY;

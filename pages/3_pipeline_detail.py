@@ -1,5 +1,6 @@
 """流水线详情 — Real-time pipeline progress and stage outputs."""
 
+import base64
 import json
 import time
 
@@ -113,9 +114,9 @@ for ni_log in needs_input_logs:
             key=f"answer_{ni_log['id']}",
         )
         uploaded_files = st.file_uploader(
-            "补充参考文件（可选）",
+            "拖拽或点击上传补充文件（支持多选，可一次拖入多张图片）",
             accept_multiple_files=True,
-            type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg"],
+            type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg", "gif", "webp", "json"],
             key=f"files_{ni_log['id']}",
         )
         submitted = st.form_submit_button("📤 提交补充信息")
@@ -126,14 +127,26 @@ for ni_log in needs_input_logs:
                 file_texts = []
                 for f in uploaded_files:
                     try:
-                        file_texts.append(f"[补充文件: {f.name}]\n{f.read().decode('utf-8', errors='replace')}")
+                        name = f.name.lower()
+                        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                            file_texts.append(f"[补充图片: {f.name}]\n[BASE64_IMAGE:{b64}]")
+                        else:
+                            file_texts.append(f"[补充文件: {f.name}]\n{f.read().decode('utf-8', errors='replace')}")
                     except Exception:
                         file_texts.append(f"[补充文件: {f.name}]（无法读取）")
                 intervention["supplementary_files"] = "\n\n".join(file_texts)
-            db.update_stage_log(ni_log["id"], human_intervention=intervention)
-            st.success("已提交！流水线将自动恢复执行。")
-            time.sleep(1)
-            st.rerun()
+            try:
+                db.update_stage_log(ni_log["id"], human_intervention=intervention)
+                st.success("已提交！流水线将自动恢复执行。")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(
+                    f"提交失败：{e}\n\n"
+                    "如果是权限错误，请在 Supabase SQL Editor 中执行：\n"
+                    "`ALTER TABLE stage_logs DISABLE ROW LEVEL SECURITY;`"
+                )
 
     st.divider()
 
@@ -355,8 +368,16 @@ with c1:
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
 with c2:
+    if status == "failed":
+        if st.button("▶️ 继续执行", help="从失败处继续，跳过已完成的阶段"):
+            from pipeline.orchestrator import resume_pipeline_in_background
+            from pipeline.agents import init_api_config
+            init_api_config()
+            resume_pipeline_in_background(project_id, run_id, db)
+            st.rerun()
+with c3:
     if status == "completed" or status == "failed":
-        if st.button("🔄 重跑流水线"):
+        if st.button("🔄 重跑流水线", help="完全从头开始"):
             from pipeline.orchestrator import start_pipeline_in_background
             from pipeline.agents import init_api_config
             new_run = db.create_pipeline_run(project_id)
