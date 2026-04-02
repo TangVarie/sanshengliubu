@@ -101,7 +101,7 @@ if uncertainty_summary:
     items = uncertainty_summary.get("items", [])
     checklist = uncertainty_summary.get("data_checklist", [])
     if items or checklist:
-        with st.expander("💡 可选优化项 — 补充数据可进一步提升产出质量"):
+        with st.expander("💡 可选优化项 — 补充数据可进一步提升产出质量", expanded=True):
             if items:
                 for item in items:
                     st.warning(
@@ -113,6 +113,61 @@ if uncertainty_summary:
                 st.markdown("**建议补充的数据源：**")
                 for c in checklist:
                     st.markdown(f"- {c}")
+
+            st.divider()
+            st.markdown("### 📤 补充数据并自动优化")
+            with st.form(key="uncertainty_supplement"):
+                supplement_text = st.text_area(
+                    "补充说明",
+                    placeholder="针对上述优化项，补充你掌握的数据和信息...",
+                    height=120,
+                )
+                supplement_files = st.file_uploader(
+                    "上传补充文件",
+                    accept_multiple_files=True,
+                    type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg"],
+                    key="uncertainty_files",
+                )
+                submitted = st.form_submit_button("🔄 补充并重跑优化")
+
+            if submitted and (supplement_text.strip() or supplement_files):
+                # Build supplementary content
+                parts = []
+                if supplement_text.strip():
+                    parts.append(supplement_text.strip())
+                if supplement_files:
+                    for f in supplement_files:
+                        try:
+                            content = f.read().decode("utf-8", errors="replace")
+                            parts.append(f"[补充文件: {f.name}]\n{content}")
+                        except Exception:
+                            parts.append(f"[补充文件: {f.name}]（无法读取）")
+
+                supplement_content = "\n\n".join(parts)
+
+                # Update project brief with supplement and create iteration run
+                existing_brief = project.get("brief") or {}
+                existing_free_text = project.get("free_text", "")
+                new_free_text = (
+                    existing_free_text
+                    + "\n\n--- 用户补充数据（针对可选优化项） ---\n\n"
+                    + supplement_content
+                )
+
+                db.update_project(
+                    project_id,
+                    free_text=new_free_text,
+                    task_type="iteration",
+                    status="running",
+                )
+
+                from pipeline.orchestrator import start_pipeline_in_background
+                new_run = db.create_pipeline_run(project_id)
+                start_pipeline_in_background(project_id, new_run["id"], db)
+
+                st.success("已提交补充数据，流水线正在重新优化...")
+                st.query_params["project_id"] = project_id
+                st.switch_page("pages/3_pipeline_detail.py")
 
 # Batch rules
 batch_rules = prompt_system.get("batch_rules", {})
