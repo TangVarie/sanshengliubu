@@ -26,7 +26,7 @@ except Exception as e:
 
 # ── Header ─────────────────────────────────────────────────────────────────
 
-STATUS_EMOJI = {"draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌"}
+STATUS_EMOJI = {"draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌", "paused_for_review": "⏸️"}
 status = project.get("status", "draft")
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
@@ -44,6 +44,70 @@ stage_logs = db.get_stage_logs(run_id)
 log_map: dict[str, dict] = {}
 for log in stage_logs:
     log_map[log["stage_name"]] = log
+
+# ── Clarification Alert ───────────────────────────────────────────────────
+
+STAGE_DISPLAY_NAMES = {
+    "crown_prince": "太子",
+    "secretariat": "中书省",
+    "chancellery": "门下省",
+    "dispatcher": "尚书省",
+    "ministry_personnel": "吏部",
+    "ministry_revenue": "户部",
+    "ministry_rites": "礼部",
+    "ministry_war": "兵部",
+    "ministry_justice": "刑部",
+    "ministry_works": "工部",
+}
+
+needs_input_logs = [l for l in stage_logs if l.get("status") == "needs_input"]
+for ni_log in needs_input_logs:
+    output = ni_log.get("output_data", {})
+    stage_display = STAGE_DISPLAY_NAMES.get(ni_log["stage_name"], ni_log["stage_name"])
+    questions = output.get("questions", [])
+    context_info = output.get("context", "")
+
+    st.warning(f"⏸️ **{stage_display}** 需要你补充信息才能继续")
+
+    if context_info:
+        st.info(f"**为什么需要这些信息：** {context_info}")
+
+    if questions:
+        st.markdown("**需要回答的问题：**")
+        for i, q in enumerate(questions, 1):
+            st.markdown(f"{i}. {q}")
+
+    with st.form(key=f"clarification_{ni_log['id']}"):
+        user_answer = st.text_area(
+            "请补充说明",
+            placeholder="回答上述问题，提供缺失的信息...",
+            height=120,
+            key=f"answer_{ni_log['id']}",
+        )
+        uploaded_files = st.file_uploader(
+            "补充参考文件（可选）",
+            accept_multiple_files=True,
+            type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg"],
+            key=f"files_{ni_log['id']}",
+        )
+        submitted = st.form_submit_button("📤 提交补充信息")
+
+        if submitted and user_answer.strip():
+            intervention = {"answer": user_answer.strip()}
+            if uploaded_files:
+                file_texts = []
+                for f in uploaded_files:
+                    try:
+                        file_texts.append(f"[补充文件: {f.name}]\n{f.read().decode('utf-8', errors='replace')}")
+                    except Exception:
+                        file_texts.append(f"[补充文件: {f.name}]（无法读取）")
+                intervention["supplementary_files"] = "\n\n".join(file_texts)
+            db.update_stage_log(ni_log["id"], human_intervention=intervention)
+            st.success("已提交！流水线将自动恢复执行。")
+            time.sleep(1)
+            st.rerun()
+
+    st.divider()
 
 # ── Pipeline Progress Bar ──────────────────────────────────────────────────
 
@@ -65,6 +129,8 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
             st.success(f"{stage_icon}\n{stage_label}")
         elif s == "running":
             st.warning(f"{stage_icon}\n{stage_label}")
+        elif s == "needs_input":
+            st.error(f"⏸️\n{stage_label}\n需要补充")
         elif s == "failed":
             st.error(f"{stage_icon}\n{stage_label}")
         elif s == "skipped":
@@ -241,7 +307,7 @@ with c2:
             start_pipeline_in_background(project_id, new_run["id"], db)
             st.rerun()
 
-# Auto-refresh when running
-if status == "running" or run.get("status") == "running":
+# Auto-refresh when running or paused for review (waiting for user input)
+if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
     time.sleep(POLL_INTERVAL_SECONDS)
     st.rerun()

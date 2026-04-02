@@ -1,4 +1,4 @@
-"""Pipeline orchestrator — sequences all agents through the full flow."""
+"""Pipeline orchestrator — sequences all agents, handles clarification pauses."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import MAX_CHANCELLERY_REJECTIONS
+from pipeline.agents import ClarificationNeeded
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
@@ -22,6 +23,10 @@ from pipeline.agents.ministries.justice import Justice
 from pipeline.agents.ministries.works import Works
 
 logger = logging.getLogger(__name__)
+
+MAX_CLARIFICATION_PER_AGENT = 2
+CLARIFICATION_POLL_INTERVAL = 5  # seconds
+CLARIFICATION_TIMEOUT = 3600  # 1 hour
 
 
 class PipelineOrchestrator:
@@ -43,6 +48,55 @@ class PipelineOrchestrator:
         }
         self.works = Works()
 
+    # ── Clarification handling ─────────────────────────────────────────
+
+    async def _wait_for_clarification(self, log_id: str) -> dict:
+        """Poll DB until user provides clarification or timeout."""
+        self.db.update_pipeline_run(self.run_id, status="paused_for_review")
+        self.db.update_project(self.project_id, status="paused_for_review")
+
+        start = time.time()
+        while time.time() - start < CLARIFICATION_TIMEOUT:
+            log = self.db.get_stage_log_by_id(log_id)
+            if log and log.get("human_intervention"):
+                # User has responded — resume
+                self.db.update_pipeline_run(self.run_id, status="running")
+                self.db.update_project(self.project_id, status="running")
+                return log["human_intervention"]
+            await asyncio.sleep(CLARIFICATION_POLL_INTERVAL)
+
+        raise TimeoutError("Clarification request timed out after 1 hour")
+
+    async def _run_with_clarification(
+        self, agent, input_data: dict, max_asks: int = MAX_CLARIFICATION_PER_AGENT
+    ) -> dict:
+        """Run an agent, handling clarification requests up to max_asks times."""
+        asks = 0
+        current_input = input_data.copy()
+
+        while True:
+            try:
+                return await agent.run(current_input, self.run_id, self.db)
+            except ClarificationNeeded as cn:
+                asks += 1
+                if asks > max_asks:
+                    # Force continue with partial output
+                    logger.warning(
+                        f"Agent {cn.stage_name} exceeded max clarifications ({max_asks}), forcing continue"
+                    )
+                    if cn.partial_output:
+                        return cn.partial_output
+                    raise
+
+                # Wait for user response
+                user_response = await self._wait_for_clarification(cn.log_id)
+
+                # Inject user's clarification into input and re-run
+                current_input["clarification_response"] = user_response
+                current_input["previous_questions"] = cn.questions
+
+    # ── Main pipeline ──────────────────────────────────────────────────
+
     async def run(self):
         """Execute the full pipeline."""
         try:
@@ -54,7 +108,7 @@ class PipelineOrchestrator:
                 "free_text": project.get("free_text", ""),
                 "brief": project.get("brief") or {},
             }
-            structured_brief = await self.crown_prince.run(raw_input, self.run_id, self.db)
+            structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
             self.db.update_project(self.project_id, brief=structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop
@@ -62,7 +116,7 @@ class PipelineOrchestrator:
 
             # 3. 尚书省 — dispatch
             dispatch_input = {"plan": plan, "brief": structured_brief}
-            tasks = await self.dispatcher.run(dispatch_input, self.run_id, self.db)
+            tasks = await self._run_with_clarification(self.dispatcher, dispatch_input)
 
             # 4. 六部（前五部并行）
             ministry_outputs = await self._run_ministries(tasks, structured_brief, plan)
@@ -74,7 +128,7 @@ class PipelineOrchestrator:
                 "plan": plan,
                 "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
             }
-            final_system = await self.works.run(works_input, self.run_id, self.db)
+            final_system = await self._run_with_clarification(self.works, works_input)
 
             # 6. 门下省终审
             final_review = await self.chancellery.run_final_review(
@@ -106,9 +160,10 @@ class PipelineOrchestrator:
         review = None
 
         for round_num in range(1, MAX_CHANCELLERY_REJECTIONS + 2):
-            # Generate / revise plan
             if plan is None:
-                plan = await self.secretariat.run({"brief": brief}, self.run_id, self.db)
+                plan = await self._run_with_clarification(
+                    self.secretariat, {"brief": brief}
+                )
             else:
                 plan = await self.secretariat.run_with_revision(
                     brief=brief,
@@ -118,7 +173,6 @@ class PipelineOrchestrator:
                     db=self.db,
                 )
 
-            # Review
             review = await self.chancellery.run_review(
                 plan, brief, self.run_id, self.db, round_number=round_num
             )
@@ -141,7 +195,7 @@ class PipelineOrchestrator:
                 "plan": plan,
             }
             try:
-                result = await agent.run(input_data, self.run_id, self.db)
+                result = await self._run_with_clarification(agent, input_data)
                 return name, result
             except Exception:
                 logger.exception(f"Ministry {name} failed, marking as skipped")

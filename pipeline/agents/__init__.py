@@ -18,6 +18,18 @@ from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
+class ClarificationNeeded(Exception):
+    """Raised when an agent needs user input to continue."""
+
+    def __init__(self, stage_name: str, questions: list[str], context: str, partial_output: dict, log_id: str):
+        self.stage_name = stage_name
+        self.questions = questions
+        self.context = context
+        self.partial_output = partial_output
+        self.log_id = log_id
+        super().__init__(f"Agent {stage_name} needs clarification: {questions}")
+
+
 class BaseAgent:
     """Base class for all pipeline agents. Subclasses set stage_name and prompt_file."""
 
@@ -36,8 +48,14 @@ class BaseAgent:
         return anthropic.Anthropic(**kwargs)
 
     def load_system_prompt(self) -> str:
+        """Load agent-specific prompt + append shared foundation knowledge."""
         path = PROMPTS_DIR / self.prompt_file
-        return path.read_text(encoding="utf-8")
+        prompt = path.read_text(encoding="utf-8")
+        # Inject foundation methodology knowledge
+        foundation_path = PROMPTS_DIR / "foundation.md"
+        if foundation_path.exists():
+            prompt += "\n\n---\n\n" + foundation_path.read_text(encoding="utf-8")
+        return prompt
 
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
         """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens)."""
@@ -89,7 +107,7 @@ class BaseAgent:
         raise ValueError(f"Could not extract JSON from response: {response_text[:500]}")
 
     async def run(self, input_data: dict, run_id: str, db: SupabaseClient) -> dict:
-        """Execute the agent: log → call Claude → parse → validate → update log."""
+        """Execute the agent: log → call Claude → parse → check clarification → update log."""
         log = db.create_stage_log(run_id, self.stage_name, input_data)
         log_id = log["id"]
         start_time = time.time()
@@ -111,6 +129,24 @@ class BaseAgent:
                 output = self._extract_json(text)
                 duration = time.time() - start_time
 
+                # ── Check if agent is requesting clarification ─────────
+                if output.get("status") == "needs_clarification":
+                    db.update_stage_log(
+                        log_id,
+                        status="needs_input",
+                        output_data=output,
+                        model_used=self.model,
+                        tokens_used=total_input_tokens + total_output_tokens,
+                        duration_seconds=round(duration, 2),
+                    )
+                    raise ClarificationNeeded(
+                        stage_name=self.stage_name,
+                        questions=output.get("questions", []),
+                        context=output.get("context", ""),
+                        partial_output=output.get("partial_output", {}),
+                        log_id=log_id,
+                    )
+
                 db.update_stage_log(
                     log_id,
                     status="completed",
@@ -120,6 +156,9 @@ class BaseAgent:
                     duration_seconds=round(duration, 2),
                 )
                 return output
+
+            except ClarificationNeeded:
+                raise  # Don't retry clarification requests
 
             except Exception as e:
                 last_error = e
