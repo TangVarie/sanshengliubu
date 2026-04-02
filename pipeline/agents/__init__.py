@@ -9,8 +9,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import logging
+
 import anthropic
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_BUDGET_TOKENS
@@ -104,10 +108,20 @@ class BaseAgent:
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
+        has_thinking = False
         for block in response.content:
+            if block.type == "thinking":
+                has_thinking = True
             if block.type == "text":
                 text = block.text
                 break
+
+        if self._use_thinking:
+            logger.info(
+                f"[{self.stage_name}] thinking enabled={self._use_thinking}, "
+                f"response has thinking block={has_thinking}, "
+                f"content block types={[b.type for b in response.content]}"
+            )
 
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
