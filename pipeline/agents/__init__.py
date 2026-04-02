@@ -24,7 +24,11 @@ _api_config: dict[str, str] = {}
 def init_api_config():
     """Call from Streamlit main thread to cache API secrets for background use."""
     _api_config["api_key"] = st.secrets["ANTHROPIC_API_KEY"]
-    _api_config["base_url"] = st.secrets.get("ANTHROPIC_BASE_URL", "")
+    base_url = st.secrets.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    # SDK auto-appends /v1, strip if user already included it
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    _api_config["base_url"] = base_url
 
 
 class ClarificationNeeded(Exception):
