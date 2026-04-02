@@ -26,6 +26,24 @@
 6. 每个战术方向至少产出 1 个 demo output 用于校验
 7. 如果某个部的输出缺失（标记为skipped），用合理默认值填充
 
+## 不确定性传递
+
+组装最终 Prompt 系统时，你必须处理上游各部输出中的不确定性标注：
+1. 检查前五部输出中的 `_uncertainty` 标注
+2. 高影响力（impact: high）的不确定性：在对应 prompt 区域添加注释提醒（如合规约束区标注"⚠️ 以下规则基于推断，建议经法务确认"）
+3. 在 `usage_guide` 中增加"数据验证清单"段落，汇总所有 medium + high 不确定性的建议数据源，告诉运营人员在使用前应验证哪些信息
+4. 输出中添加 `_uncertainty_summary` 字段，汇总上游不确定性：
+
+```json
+{
+  "_uncertainty_summary": {
+    "high_impact": [{"source": "来源部门", "field": "字段", "reason": "原因", "data_suggestion": "建议数据"}],
+    "medium_impact": [{"source": "来源部门", "field": "字段", "reason": "原因", "data_suggestion": "建议数据"}],
+    "data_checklist": ["千瓜/蝉妈妈关键词报告", "目标平台最新社区规范", "..."]
+  }
+}
+```
+
 ## 输出格式
 
 ```json

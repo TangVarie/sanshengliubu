@@ -9,6 +9,30 @@ from pipeline.config import PIPELINE_STAGES, POLL_INTERVAL_SECONDS
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
 
+
+def render_stage_output(output_data: dict):
+    """Render stage output with uncertainty annotations separated out."""
+    uncertainties = output_data.get("_uncertainty", [])
+    # Show clean output without _uncertainty metadata
+    clean = {k: v for k, v in output_data.items() if not k.startswith("_uncertainty")}
+    st.json(clean)
+
+    if uncertainties:
+        with st.expander(f"⚠️ 不确定性标注 ({len(uncertainties)}项)", expanded=False):
+            for u in uncertainties:
+                level = u.get("level", "inferred")
+                impact = u.get("impact", "low")
+                impact_label = {"high": "🔴 高", "medium": "🟡 中", "low": "🟢 低"}.get(impact, impact)
+                msg = (
+                    f"**{u.get('field', '')}**（影响：{impact_label}）\n\n"
+                    f"{u.get('reason', '')}\n\n"
+                    f"📋 **建议补充：** {u.get('data_suggestion', '')}"
+                )
+                if level == "speculative":
+                    st.error(msg)
+                else:
+                    st.warning(msg)
+
 # ── Get project ID ─────────────────────────────────────────────────────────
 
 project_id = st.query_params.get("project_id")
@@ -154,7 +178,7 @@ tabs = st.tabs(tab_names)
 with tabs[0]:
     log = log_map.get("crown_prince")
     if log and log.get("output_data"):
-        st.json(log["output_data"])
+        render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
         if log.get("error_message"):
@@ -170,7 +194,7 @@ with tabs[1]:
         for sl in sec_logs:
             with st.expander(f"方案 (轮次 {sec_logs.index(sl) + 1})", expanded=(sl == sec_logs[-1])):
                 if sl.get("output_data"):
-                    st.json(sl["output_data"])
+                    render_stage_output(sl["output_data"])
                 elif sl.get("error_message"):
                     st.error(sl["error_message"])
     else:
@@ -226,7 +250,7 @@ with tabs[2]:
 with tabs[3]:
     log = log_map.get("dispatcher")
     if log and log.get("output_data"):
-        st.json(log["output_data"])
+        render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
     else:
@@ -243,7 +267,7 @@ with tabs[4]:
         with ministry_tabs[i]:
             log = log_map.get(mk)
             if log and log.get("output_data"):
-                st.json(log["output_data"])
+                render_stage_output(log["output_data"])
             elif log:
                 s = log.get("status", "pending")
                 if s == "running":
@@ -267,7 +291,7 @@ with tabs[5]:
             st.success("✅ 终审通过")
         else:
             st.warning(f"⚠️ 终审判定：{verdict}")
-        st.json(output)
+        render_stage_output(output)
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
     else:
