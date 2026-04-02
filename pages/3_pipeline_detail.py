@@ -84,7 +84,8 @@ STAGE_DISPLAY_NAMES = {
     "ministry_rites": "礼部",
     "ministry_war": "兵部",
     "ministry_justice": "刑部",
-    "ministry_works": "工部·规划",
+    "ministry_works": "工部·架构",
+    "ministry_works_cell_planner": "工部·格子规划",
     "ministry_works_builder": "工部·构建",
 }
 
@@ -300,8 +301,18 @@ with tabs[4]:
     for i, mk in enumerate(ministry_keys):
         with ministry_tabs[i]:
             _render_stage_log(mk)
-            # Works tab also shows builder logs
+            # Works tab also shows cell planner + builder logs
             if mk == "ministry_works":
+                cell_planner_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_cell_planner"]
+                if cell_planner_logs:
+                    st.divider()
+                    st.markdown("**工部·格子规划（分批执行）**")
+                    for cl in cell_planner_logs:
+                        with st.expander(f"格子规划批次 {cell_planner_logs.index(cl) + 1}", expanded=False):
+                            if cl.get("output_data"):
+                                render_stage_output(cl["output_data"])
+                            elif cl.get("error_message"):
+                                st.error(cl["error_message"])
                 builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
                 if builder_logs:
                     st.divider()

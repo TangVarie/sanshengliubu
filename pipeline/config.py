@@ -18,8 +18,9 @@ MODELS: dict[str, str] = {
     "ministry_rites": "claude-sonnet-4-6",
     "ministry_war": "claude-sonnet-4-6",
     "ministry_justice": "claude-sonnet-4-6",
-    # 工部 — planner (Opus for complex synthesis), builder (Sonnet for execution)
+    # 工部 — architect (Opus), cell planner (Sonnet batched), builder (Sonnet batched)
     "ministry_works": "claude-opus-4-6-thinking",
+    "ministry_works_cell_planner": "claude-sonnet-4-6",
     "ministry_works_builder": "claude-sonnet-4-6",
     # 终审
     "chancellery_final": "claude-opus-4-6-thinking",
@@ -43,7 +44,8 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
-    "ministry_works": MAX_TOKENS_STRATEGY,
+    "ministry_works": 16000,  # architect only — small output, no cell_plans
+    "ministry_works_cell_planner": 8000,
     "ministry_works_builder": 8000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
@@ -52,13 +54,17 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 MATRIX_BATCH_CONCURRENCY = 5    # max parallel builder calls
 MATRIX_CELLS_PER_BATCH = 3      # cells per builder call
 
+# ── Cell Planner Batching ────────────────────────────────────────────────
+CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
+CELL_PLANNER_CONCURRENCY = 5    # max parallel cell-planner calls
+
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # Opus stages benefit from deep reasoning; Sonnet stages skip thinking for speed
 THINKING_BUDGET_TOKENS = 10000  # max tokens for thinking before answering
 
 # Per-stage thinking budget overrides (merged tasks need more thinking room)
 STAGE_THINKING_BUDGET: dict[str, int] = {
-    "ministry_works": 16000,  # handles both matrix filling + architecture design
+    "ministry_works": 10000,  # architect only — global skeleton design
 }
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
@@ -89,7 +95,8 @@ PIPELINE_STAGES = [
     ("ministry_rites", "礼部", "🎭"),
     ("ministry_war", "兵部", "⚔️"),
     ("ministry_justice", "刑部", "⚖️"),
-    ("ministry_works", "工部·规划", "🏗️"),
+    ("ministry_works", "工部·架构", "🏗️"),
+    ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
     ("chancellery_final", "终审", "✅"),
 ]

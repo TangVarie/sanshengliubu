@@ -11,6 +11,8 @@ from itertools import groupby
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    CELL_PLANNER_BATCH_SIZE,
+    CELL_PLANNER_CONCURRENCY,
     MAX_CHANCELLERY_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
@@ -25,7 +27,7 @@ from pipeline.agents.ministries.revenue import Revenue
 from pipeline.agents.ministries.rites import Rites
 from pipeline.agents.ministries.war import War
 from pipeline.agents.ministries.justice import Justice
-from pipeline.agents.ministries.works import Works, WorksBuilder
+from pipeline.agents.ministries.works import Works, WorksCellPlanner, WorksBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,7 @@ class PipelineOrchestrator:
             "ministry_justice": Justice(),
         }
         self.works = Works()
+        self.works_cell_planner = WorksCellPlanner()
         self.works_builder = WorksBuilder()
 
     # ── Completed stages cache (for resume) ───────────────────────────
@@ -157,10 +160,10 @@ class PipelineOrchestrator:
             # 4. 六部（前五部并行，跳过已完成的）
             ministry_outputs = await self._run_ministries(tasks, structured_brief, plan, done)
 
-            # 5a. 工部·规划 — design matrix architecture (single Opus call)
+            # 5a. 工部·架构 — global skeleton design (Opus, small output)
             if "ministry_works" in done:
-                logger.info("Resuming: skipping ministry_works planner (already completed)")
-                works_plan = done["ministry_works"]
+                logger.info("Resuming: skipping ministry_works architect (already completed)")
+                works_arch = done["ministry_works"]
             else:
                 works_planner_input = {
                     "ministry_outputs": ministry_outputs,
@@ -168,11 +171,18 @@ class PipelineOrchestrator:
                     "plan": plan,
                     "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
                 }
-                works_plan = await self._run_with_clarification(
+                works_arch = await self._run_with_clarification(
                     self.works, works_planner_input
                 )
 
-            # 5b. 工部·构建 — generate per-cell prompts (Sonnet, batched)
+            # 5b. 工部·格子规划 — per-cell plans (Sonnet, batched + parallel)
+            cell_plans = await self._run_cell_planners(
+                works_arch, ministry_outputs, structured_brief, plan
+            )
+            # Assemble full works_plan for builder
+            works_plan = {**works_arch, "cell_plans": cell_plans}
+
+            # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
             final_system = await self._run_works_builders(works_plan)
 
             # 6. 门下省终审
@@ -259,6 +269,64 @@ class PipelineOrchestrator:
         )
 
         return {name: output for name, output in results if output is not None}
+
+    async def _run_cell_planners(
+        self,
+        works_arch: dict,
+        ministry_outputs: dict,
+        brief: dict,
+        plan: dict,
+    ) -> list[dict]:
+        """Run WorksCellPlanner in batches to generate cell_plans.
+
+        Splits active_cells into batches and runs them in parallel with Sonnet.
+        Each batch receives shared_skeleton + ministry_outputs + its cell subset.
+        """
+        active_cells = plan.get("matrix_skeleton", {}).get("active_cells", [])
+        if not active_cells:
+            logger.warning("No active_cells found in matrix_skeleton, returning empty cell_plans")
+            return []
+
+        shared_skeleton = works_arch.get("shared_skeleton", {})
+        semaphore = asyncio.Semaphore(CELL_PLANNER_CONCURRENCY)
+
+        # Split into batches
+        batches: list[list] = []
+        for i in range(0, len(active_cells), CELL_PLANNER_BATCH_SIZE):
+            batches.append(active_cells[i : i + CELL_PLANNER_BATCH_SIZE])
+
+        logger.info(
+            f"Cell planner: {len(active_cells)} cells → {len(batches)} batches "
+            f"(size={CELL_PLANNER_BATCH_SIZE}, concurrency={CELL_PLANNER_CONCURRENCY})"
+        )
+
+        async def plan_batch(batch: list, batch_idx: int) -> dict:
+            async with semaphore:
+                batch_input = {
+                    "active_cells": batch,
+                    "shared_skeleton": shared_skeleton,
+                    "ministry_outputs": ministry_outputs,
+                    "brief": brief,
+                    "plan_summary": {
+                        "tactical_directions": plan.get("tactical_directions", []),
+                        "target_platforms": plan.get("target_platforms", []),
+                    },
+                }
+                return await self.works_cell_planner.run(
+                    batch_input, self.run_id, self.db
+                )
+
+        results = await asyncio.gather(
+            *[plan_batch(b, i) for i, b in enumerate(batches)]
+        )
+
+        # Merge all batch cell_plans
+        all_cell_plans: list[dict] = []
+        for r in results:
+            all_cell_plans.extend(r.get("cell_plans", []))
+
+        logger.info(f"Cell planner completed: {len(all_cell_plans)} cell_plans generated")
+        return all_cell_plans
 
     async def _run_works_builders(self, works_plan: dict) -> dict:
         """Run WorksBuilder in batches with concurrency control.
