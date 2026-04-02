@@ -28,17 +28,14 @@
 
 ## 不确定性传递
 
-组装最终 Prompt 系统时，你必须处理上游各部输出中的不确定性标注：
-1. 检查前五部输出中的 `_uncertainty` 标注
-2. 高影响力（impact: high）的不确定性：在对应 prompt 区域添加注释提醒（如合规约束区标注"⚠️ 以下规则基于推断，建议经法务确认"）
-3. 在 `usage_guide` 中增加"数据验证清单"段落，汇总所有 medium + high 不确定性的建议数据源，告诉运营人员在使用前应验证哪些信息
-4. 输出中添加 `_uncertainty_summary` 字段，汇总上游不确定性：
+组装最终 Prompt 系统时，检查前五部输出中的 `_uncertainty` 标注（这些是低影响的残余不确定性——高影响的已在上游通过请旨解决）：
+1. 在 `usage_guide` 中增加"可选优化项"段落，汇总上游 `_uncertainty` 标注，告诉运营人员哪些数据可以进一步优化产出
+2. 输出中添加 `_uncertainty_summary` 字段：
 
 ```json
 {
   "_uncertainty_summary": {
-    "high_impact": [{"source": "来源部门", "field": "字段", "reason": "原因", "data_suggestion": "建议数据"}],
-    "medium_impact": [{"source": "来源部门", "field": "字段", "reason": "原因", "data_suggestion": "建议数据"}],
+    "items": [{"source": "来源部门", "field": "字段", "reason": "原因", "data_suggestion": "建议数据"}],
     "data_checklist": ["千瓜/蝉妈妈关键词报告", "目标平台最新社区规范", "..."]
   }
 }

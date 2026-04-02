@@ -68,29 +68,26 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
             lines.append("---")
             lines.append("")
 
-    # Uncertainty summary
+    # Uncertainty summary (low-impact residuals)
     uncertainty_summary = prompt_system.get("_uncertainty_summary", {})
     if uncertainty_summary:
-        lines.append("## ⚠️ 数据验证清单")
-        lines.append("")
-        lines.append("> 以下内容基于 AI 推断，建议在使用前用真实数据验证")
-        lines.append("")
-
-        for item in uncertainty_summary.get("high_impact", []):
-            lines.append(f"- 🔴 **{item.get('source', '')}** / {item.get('field', '')}: {item.get('reason', '')}")
-            lines.append(f"  - 建议补充: {item.get('data_suggestion', '')}")
-        for item in uncertainty_summary.get("medium_impact", []):
-            lines.append(f"- 🟡 **{item.get('source', '')}** / {item.get('field', '')}: {item.get('reason', '')}")
-            lines.append(f"  - 建议补充: {item.get('data_suggestion', '')}")
-
+        items = uncertainty_summary.get("items", [])
         checklist = uncertainty_summary.get("data_checklist", [])
-        if checklist:
+        if items or checklist:
+            lines.append("## 💡 可选优化项")
             lines.append("")
-            lines.append("### 建议补充的数据源")
+            lines.append("> 以下内容基于合理推断，补充真实数据可进一步提升产出质量")
             lines.append("")
-            for c in checklist:
-                lines.append(f"- [ ] {c}")
-        lines.append("")
+            for item in items:
+                lines.append(f"- **{item.get('source', '')}** / {item.get('field', '')}: {item.get('reason', '')}")
+                lines.append(f"  - 建议补充: {item.get('data_suggestion', '')}")
+            if checklist:
+                lines.append("")
+                lines.append("### 建议补充的数据源")
+                lines.append("")
+                for c in checklist:
+                    lines.append(f"- [ ] {c}")
+            lines.append("")
 
     # Batch rules
     batch_rules = prompt_system.get("batch_rules", {})
