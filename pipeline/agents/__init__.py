@@ -104,7 +104,12 @@ class BaseAgent:
         else:
             kwargs["system"] = system_prompt
 
-        response = client.messages.create(**kwargs)
+        if self._use_thinking:
+            # Streaming required for long-running thinking requests (>10 min)
+            with client.messages.stream(**kwargs) as stream:
+                response = stream.get_final_message()
+        else:
+            response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
