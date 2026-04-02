@@ -129,7 +129,7 @@ class BaseAgent:
 
     @staticmethod
     def _extract_json(response_text: str) -> dict[str, Any]:
-        """Extract JSON from Claude response, handling markdown code blocks."""
+        """Extract JSON from Claude response, handling markdown code blocks and truncation."""
         # Try direct parse
         try:
             return json.loads(response_text)
@@ -160,7 +160,77 @@ class BaseAgent:
             except json.JSONDecodeError:
                 pass
 
-        raise ValueError(f"Could not extract JSON from response: {response_text[:500]}")
+        # Try to repair truncated JSON (response cut off by max_tokens)
+        json_start = response_text.find("{")
+        if json_start >= 0:
+            fragment = response_text[json_start:]
+            repaired = BaseAgent._try_repair_truncated_json(fragment)
+            if repaired is not None:
+                logger.warning(
+                    f"JSON was truncated (len={len(response_text)}), repaired by closing brackets"
+                )
+                return repaired
+
+        raise ValueError(
+            f"Could not extract JSON from response (len={len(response_text)}, "
+            f"last 200 chars: ...{response_text[-200:]!r})"
+        )
+
+    @staticmethod
+    def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
+        """Attempt to repair truncated JSON by closing unclosed brackets/braces."""
+        # Track open brackets
+        open_braces = 0
+        open_brackets = 0
+        in_string = False
+        escape_next = False
+
+        for ch in fragment:
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                if in_string:
+                    escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                open_braces += 1
+            elif ch == "}":
+                open_braces -= 1
+            elif ch == "[":
+                open_brackets += 1
+            elif ch == "]":
+                open_brackets -= 1
+
+        if open_braces <= 0 and open_brackets <= 0:
+            return None  # Not a truncation issue
+
+        # Truncate at last complete value (last comma or colon+value)
+        # Then close all open brackets/braces
+        # Strip trailing incomplete value after last comma
+        trimmed = fragment.rstrip()
+        # Remove trailing incomplete key-value or array element
+        for end_char in (",", "[", "{", ":"):
+            idx = trimmed.rfind(end_char)
+            if idx > 0:
+                candidate = trimmed[: idx].rstrip().rstrip(",")
+                suffix = "]" * open_brackets + "}" * open_braces
+                try:
+                    return json.loads(candidate + suffix)
+                except json.JSONDecodeError:
+                    continue
+
+        # Last resort: just close brackets
+        suffix = "]" * open_brackets + "}" * open_braces
+        try:
+            return json.loads(fragment + suffix)
+        except json.JSONDecodeError:
+            return None
 
     async def run(self, input_data: dict, run_id: str, db: SupabaseClient) -> dict:
         """Execute the agent: log → call Claude → parse → check clarification → update log."""

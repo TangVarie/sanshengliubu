@@ -39,7 +39,7 @@ MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
 # ── Token limits ───────────────────────────────────────────────────────────
 
 MAX_TOKENS_DEFAULT = 4096
-MAX_TOKENS_STRATEGY = 16000  # Opus stages with thinking need more headroom
+MAX_TOKENS_STRATEGY = 32000  # Opus stages with thinking need more headroom
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
