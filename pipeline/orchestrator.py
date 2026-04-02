@@ -7,12 +7,17 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from itertools import groupby
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MAX_CHANCELLERY_REJECTIONS
+from pipeline.config import (
+    MAX_CHANCELLERY_REJECTIONS,
+    MATRIX_BATCH_CONCURRENCY,
+    MATRIX_CELLS_PER_BATCH,
+)
 from pipeline.agents import ClarificationNeeded
 from pipeline.agents.crown_prince import CrownPrince
-from pipeline.agents.secretariat import Secretariat
+from pipeline.agents.secretariat import Secretariat, SecretariatMatrix
 from pipeline.agents.chancellery import Chancellery
 from pipeline.agents.dispatcher import Dispatcher
 from pipeline.agents.ministries.personnel import Personnel
@@ -20,7 +25,7 @@ from pipeline.agents.ministries.revenue import Revenue
 from pipeline.agents.ministries.rites import Rites
 from pipeline.agents.ministries.war import War
 from pipeline.agents.ministries.justice import Justice
-from pipeline.agents.ministries.works import Works
+from pipeline.agents.ministries.works import Works, WorksBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,7 @@ class PipelineOrchestrator:
 
         self.crown_prince = CrownPrince()
         self.secretariat = Secretariat()
+        self.secretariat_matrix = SecretariatMatrix()
         self.chancellery = Chancellery()
         self.dispatcher = Dispatcher()
         self.ministries = {
@@ -47,6 +53,7 @@ class PipelineOrchestrator:
             "ministry_justice": Justice(),
         }
         self.works = Works()
+        self.works_builder = WorksBuilder()
 
     # ── Clarification handling ─────────────────────────────────────────
 
@@ -111,8 +118,24 @@ class PipelineOrchestrator:
             structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
             self.db.update_project(self.project_id, brief=structured_brief)
 
-            # 2. 中书省 ↔ 门下省 — strategy loop
+            # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
             plan = await self._strategy_loop(structured_brief)
+
+            # 2b. 中书省矩阵填充 (step 2: fill active cells)
+            matrix_input = {
+                "plan": plan,
+                "brief": structured_brief,
+                "matrix_skeleton": plan.get("matrix_skeleton", {}),
+                "tactical_directions": plan.get("tactical_directions", []),
+                "target_platforms": plan.get("target_platforms", []),
+            }
+            matrix_fill = await self._run_with_clarification(
+                self.secretariat_matrix, matrix_input
+            )
+            # Merge matrix fill back into plan
+            plan["platform_direction_matrix"] = matrix_fill.get(
+                "platform_direction_matrix", []
+            )
 
             # 3. 尚书省 — dispatch
             dispatch_input = {"plan": plan, "brief": structured_brief}
@@ -121,14 +144,19 @@ class PipelineOrchestrator:
             # 4. 六部（前五部并行）
             ministry_outputs = await self._run_ministries(tasks, structured_brief, plan)
 
-            # 5. 工部 — assembly
-            works_input = {
+            # 5a. 工部·规划 — design matrix architecture (single Opus call)
+            works_planner_input = {
                 "ministry_outputs": ministry_outputs,
                 "brief": structured_brief,
                 "plan": plan,
                 "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
             }
-            final_system = await self._run_with_clarification(self.works, works_input)
+            works_plan = await self._run_with_clarification(
+                self.works, works_planner_input
+            )
+
+            # 5b. 工部·构建 — generate per-cell prompts (Sonnet, batched)
+            final_system = await self._run_works_builders(works_plan)
 
             # 6. 门下省终审
             final_review = await self.chancellery.run_final_review(
@@ -206,6 +234,59 @@ class PipelineOrchestrator:
         )
 
         return {name: output for name, output in results if output is not None}
+
+    async def _run_works_builders(self, works_plan: dict) -> dict:
+        """Run WorksBuilder in batches with concurrency control.
+
+        Smart batching: same-platform cells are grouped together for context reuse.
+        Builder only receives shared_skeleton + cell_plans (with ministry_digest),
+        NOT the full ministry outputs.
+        """
+        cell_plans = works_plan.get("cell_plans", [])
+        shared_skeleton = works_plan.get("shared_skeleton", {})
+        semaphore = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
+
+        # Group by platform, then split into batches of MATRIX_CELLS_PER_BATCH
+        def platform_key(cell: dict) -> str:
+            return cell.get("platform", cell.get("cell_id", "").split("_")[-1])
+
+        sorted_cells = sorted(cell_plans, key=platform_key)
+        batches: list[list[dict]] = []
+        for _, group in groupby(sorted_cells, key=platform_key):
+            platform_cells = list(group)
+            for i in range(0, len(platform_cells), MATRIX_CELLS_PER_BATCH):
+                batches.append(platform_cells[i : i + MATRIX_CELLS_PER_BATCH])
+
+        async def build_batch(batch: list[dict], batch_idx: int) -> dict:
+            async with semaphore:
+                builder_input = {
+                    "cell_plans": batch,
+                    "shared_skeleton": shared_skeleton,
+                }
+                return await self.works_builder.run(
+                    builder_input, self.run_id, self.db
+                )
+
+        results = await asyncio.gather(
+            *[build_batch(b, i) for i, b in enumerate(batches)]
+        )
+
+        # Merge all batch results
+        all_cells: list[dict] = []
+        all_demos: list[dict] = []
+        for r in results:
+            all_cells.extend(r.get("prompt_cells", []))
+            all_demos.extend(r.get("demo_outputs", []))
+
+        return {
+            "prompt_matrix": all_cells,
+            "prompt_templates": all_cells,  # backward compatibility
+            "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
+            "batch_rules": works_plan.get("batch_rules", {}),
+            "usage_guide": works_plan.get("usage_guide", ""),
+            "demo_outputs": all_demos,
+            "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
+        }
 
 
 def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):

@@ -53,9 +53,45 @@ if final_review:
     else:
         st.warning(f"⚠️ 终审状态：{verdict}")
 
-# Display prompt templates by direction
+# Display prompt matrix (platform → direction) or legacy templates
+matrix = prompt_system.get("prompt_matrix", [])
 templates = prompt_system.get("prompt_templates", [])
-if templates:
+
+if matrix:
+    st.subheader("Prompt 矩阵")
+    platforms = list(dict.fromkeys(c.get("platform", "") for c in matrix))
+    platform_tabs = st.tabs(platforms)
+
+    for p_idx, platform in enumerate(platforms):
+        with platform_tabs[p_idx]:
+            cells = [c for c in matrix if c.get("platform") == platform]
+            for cell in cells:
+                label = f"{cell.get('direction_id', '')}: {cell.get('direction_name', '')}"
+                with st.expander(label):
+                    with st.expander("System Prompt", expanded=True):
+                        st.code(cell.get("system_prompt", ""), language=None)
+
+                    with st.expander("User Prompt Template"):
+                        st.code(cell.get("user_prompt_template", ""), language=None)
+
+                    variables = cell.get("variables", {})
+                    if variables:
+                        with st.expander("变量说明"):
+                            for var_name, var_desc in variables.items():
+                                st.markdown(f"- `{{{{{var_name}}}}}`: {var_desc}")
+
+                    rules = cell.get("persona_adaptation_rules", {})
+                    if rules:
+                        with st.expander("人设适配规则"):
+                            st.json(rules)
+
+                    demo = cell.get("demo_output", "")
+                    if demo:
+                        with st.expander("示例输出"):
+                            st.markdown(demo)
+
+elif templates:
+    # Legacy: direction-based display for old project data
     st.subheader("Prompt 模板")
     direction_tabs = st.tabs([t.get("direction_name", f"方向{i+1}") for i, t in enumerate(templates)])
 

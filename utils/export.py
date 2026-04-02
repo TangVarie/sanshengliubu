@@ -20,9 +20,78 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
         lines.append(guide)
         lines.append("")
 
-    # Prompt templates
+    # Prompt matrix (platform → direction) or legacy templates
+    matrix = prompt_system.get("prompt_matrix", [])
     templates = prompt_system.get("prompt_templates", [])
-    if templates:
+
+    if matrix:
+        # Group by platform
+        platforms: dict[str, list[dict]] = {}
+        for cell in matrix:
+            p = cell.get("platform", "未知平台")
+            platforms.setdefault(p, []).append(cell)
+
+        for platform, cells in platforms.items():
+            lines.append(f"## {platform}")
+            lines.append("")
+
+            for cell in cells:
+                d_id = cell.get("direction_id", "")
+                d_name = cell.get("direction_name", "")
+                lines.append(f"### {d_id}: {d_name}")
+                lines.append("")
+
+                sp = cell.get("system_prompt", "")
+                if sp:
+                    lines.append("#### System Prompt")
+                    lines.append("")
+                    lines.append("```")
+                    lines.append(sp)
+                    lines.append("```")
+                    lines.append("")
+
+                up = cell.get("user_prompt_template", "")
+                if up:
+                    lines.append("#### User Prompt Template")
+                    lines.append("")
+                    lines.append("```")
+                    lines.append(up)
+                    lines.append("```")
+                    lines.append("")
+
+                variables = cell.get("variables", {})
+                if variables:
+                    lines.append("#### 变量说明")
+                    lines.append("")
+                    for var_name, var_desc in variables.items():
+                        lines.append(f"- `{{{{{var_name}}}}}`: {var_desc}")
+                    lines.append("")
+
+                persona_rules = cell.get("persona_adaptation_rules", {})
+                if persona_rules:
+                    lines.append("#### 人设适配规则")
+                    lines.append("")
+                    for persona_type, rules in persona_rules.items():
+                        lines.append(f"- **{persona_type}**")
+                        if isinstance(rules, dict):
+                            for k, v in rules.items():
+                                lines.append(f"  - {k}: {v}")
+                        else:
+                            lines.append(f"  - {rules}")
+                    lines.append("")
+
+                demo = cell.get("demo_output", "")
+                if demo:
+                    lines.append("#### 示例输出")
+                    lines.append("")
+                    lines.append(demo)
+                    lines.append("")
+
+                lines.append("---")
+                lines.append("")
+
+    elif templates:
+        # Legacy: direction-based layout
         lines.append("## Prompt 模板")
         lines.append("")
 

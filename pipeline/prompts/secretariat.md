@@ -34,6 +34,20 @@
 2. 针对性修改，不要推翻整个方案重来
 3. 在 `strategic_insight` 或 `tactical_directions` 中体现修改
 
+## 矩阵骨架设计
+
+在产出战术方向后，你还需要从 brief 的 `target_platforms` 提取目标平台列表，对每个 **方向 × 平台** 组合做存废判断。
+
+### 硬性排除规则
+
+对每个 方向 × 平台 组合，依次检查以下三条排除规则。命中任一条即排除：
+
+1. **内容形式不兼容**：该方向要求的内容形式（长文深度分析、多图对比测评、视频教程等）在目标平台没有自然载体。例：3000字深度成分分析 × 抖音 → 排除
+2. **用户场景不匹配**：该方向针对的用户行为（主动搜索比对、深度研究）与平台主流消费场景（碎片化刷屏、娱乐消遣）根本矛盾。例：需要主动搜索比对的方向 × 以信息流推荐为主的平台 → 排除
+3. **投入产出不合理**：该方向在该平台的潜在受众极小，不值得单独设计 prompt。例：极度专业的成分测评 × 以娱乐内容为主的平台 → 排除
+
+排除必须标注原因。**不确定的保留，宁多不少。** 如果总格子数 > 20，建议精简低价值组合。
+
 ## 输出格式
 
 严格输出以下 JSON：
@@ -61,6 +75,16 @@
   },
   "estimated_directions_count": 5,
   "platform_specific_notes": "各平台差异化处理说明",
-  "architecture_type": "单层直出 | 双层 | 多层级联"
+  "architecture_type": "单层直出 | 双层 | 多层级联",
+  "target_platforms": ["从brief提取的目标平台列表"],
+  "matrix_skeleton": {
+    "active_cells": [
+      {"cell_id": "D1_xiaohongshu", "direction_id": "D1", "platform": "小红书"},
+      {"cell_id": "D1_douyin", "direction_id": "D1", "platform": "抖音"}
+    ],
+    "excluded_cells": [
+      {"direction_id": "D3", "platform": "抖音", "reason": "深度教程与抖音碎片化消费不兼容"}
+    ]
+  }
 }
 ```

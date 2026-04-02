@@ -70,6 +70,17 @@ class ModulePlan(BaseModel):
     authenticity_mechanism_needed: bool = True
 
 
+class PlatformDirection(BaseModel):
+    """方向 × 平台矩阵中的一个格子"""
+    model_config = ConfigDict(extra="allow")
+
+    cell_id: str                     # "D1_xiaohongshu"
+    direction_id: str                # "D1"
+    platform: str                    # "小红书"
+    platform_content_logic: str = "" # 这个方向在这个平台上的内容逻辑
+    persona_strategy_notes: str = "" # 人设选择如何影响该格子的内容策略
+
+
 class StrategicPlan(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -80,6 +91,10 @@ class StrategicPlan(BaseModel):
     estimated_directions_count: int = 5
     platform_specific_notes: str = ""
     architecture_type: str = "双层"  # 单层直出 | 双层 | 多层级联
+    # Matrix fields
+    target_platforms: list[str] = []
+    platform_direction_matrix: list[PlatformDirection] = []
+    matrix_skeleton: dict[str, Any] = {}  # active_cells + excluded_cells
 
 
 # ── 门下省 · Chancellery Review ───────────────────────────────────────────
@@ -173,11 +188,40 @@ class JusticeOutput(BaseModel):
     risk_levels: list[dict[str, Any]] = []
 
 
+class WorksPlan(BaseModel):
+    """工部规划阶段产出"""
+    model_config = ConfigDict(extra="allow")
+
+    shared_skeleton: dict[str, Any] = {}
+    cell_plans: list[dict[str, Any]] = []
+    persona_integration_strategy: str = ""
+    total_cells: int = 0
+    batch_rules: dict[str, Any] = {}
+    usage_guide: str = ""
+
+
+class PromptMatrixCell(BaseModel):
+    """矩阵中一个格子的最终 prompt"""
+    model_config = ConfigDict(extra="allow")
+
+    cell_id: str
+    direction_id: str
+    direction_name: str = ""
+    platform: str
+    system_prompt: str = ""
+    user_prompt_template: str = ""
+    variables: dict[str, Any] = {}
+    persona_adaptation_rules: dict[str, Any] = {}
+    demo_output: str = ""
+
+
 class WorksOutput(BaseModel):
     """工部 — 结构工程部 (assembles final prompt system)"""
     model_config = ConfigDict(extra="allow")
 
-    prompt_templates: list[dict[str, Any]] = []
+    prompt_templates: list[dict[str, Any]] = []  # backward compat
+    prompt_matrix: list[PromptMatrixCell] = []
+    matrix_dimensions: dict[str, list[str]] = {}
     batch_rules: dict[str, Any] = {}
     usage_guide: str = ""
     demo_outputs: list[dict[str, Any]] = []

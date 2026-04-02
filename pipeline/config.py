@@ -18,8 +18,11 @@ MODELS: dict[str, str] = {
     "ministry_rites": "claude-sonnet-4-20250514",
     "ministry_war": "claude-sonnet-4-20250514",
     "ministry_justice": "claude-sonnet-4-20250514",
-    # 工部 — assembly (Opus for complex synthesis)
+    # 工部 — planner (Opus for complex synthesis), builder (Sonnet for execution)
     "ministry_works": "claude-opus-4-20250514",
+    "ministry_works_builder": "claude-sonnet-4-20250514",
+    # 中书省矩阵填充 (Opus)
+    "secretariat_matrix": "claude-opus-4-20250514",
     # 终审
     "chancellery_final": "claude-opus-4-20250514",
 }
@@ -40,10 +43,16 @@ MAX_TOKENS_STRATEGY = 16000  # Opus stages with thinking need more headroom
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "secretariat": MAX_TOKENS_STRATEGY,
+    "secretariat_matrix": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
     "ministry_works": MAX_TOKENS_STRATEGY,
+    "ministry_works_builder": 8000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
+
+# ── Matrix Execution ─────────────────────────────────────────────────────
+MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
+MATRIX_CELLS_PER_BATCH = 2      # cells per builder call
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # Opus stages benefit from deep reasoning; Sonnet stages skip thinking for speed
@@ -77,6 +86,7 @@ PIPELINE_STAGES = [
     ("ministry_rites", "礼部", "🎭"),
     ("ministry_war", "兵部", "⚔️"),
     ("ministry_justice", "刑部", "⚖️"),
-    ("ministry_works", "工部", "🏗️"),
+    ("ministry_works", "工部·规划", "🏗️"),
+    ("ministry_works_builder", "工部·构建", "🔨"),
     ("chancellery_final", "终审", "✅"),
 ]
