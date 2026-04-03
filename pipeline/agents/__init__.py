@@ -60,9 +60,11 @@ class BaseAgent:
     def _get_client(self) -> anthropic.Anthropic:
         if not _api_config:
             init_api_config()
-        kwargs: dict[str, str] = {"api_key": _api_config["api_key"]}
+        kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
         if _api_config.get("base_url"):
             kwargs["base_url"] = _api_config["base_url"]
+        # Long timeout to avoid SDK forcing streaming for thinking models
+        kwargs["timeout"] = 1800.0  # 30 min — proxy may be slow
         return anthropic.Anthropic(**kwargs)
 
     def load_system_prompt(self) -> str:
@@ -103,7 +105,7 @@ class BaseAgent:
         if not self._use_thinking:
             kwargs["system"] = system_prompt
 
-        # Try with thinking + streaming first, fall back to plain call
+        # Try with thinking first, fall back to plain call if proxy doesn't support it
         response = None
         if self._use_thinking:
             budget = STAGE_THINKING_BUDGET.get(self.stage_name, THINKING_BUDGET_TOKENS)
@@ -112,24 +114,22 @@ class BaseAgent:
                 "thinking": {"type": "enabled", "budget_tokens": budget},
             }
             try:
-                with client.messages.stream(**thinking_kwargs) as stream:
-                    response = stream.get_final_message()
+                response = client.messages.create(**thinking_kwargs)
             except Exception as e:
-                logger.warning(
-                    f"[{self.stage_name}] thinking+streaming failed ({e}), "
-                    "falling back to plain call"
-                )
-                # Fallback: plain call without thinking, with system prompt
-                kwargs["system"] = system_prompt
-                kwargs["messages"] = [{"role": "user", "content": user_message}]
+                err_str = str(e)
+                # Only fallback for proxy-incompatibility errors, not for quota/network
+                if "构建请求" in err_str or "thinking" in err_str.lower():
+                    logger.warning(
+                        f"[{self.stage_name}] thinking call failed ({e}), "
+                        "falling back to plain call without thinking"
+                    )
+                    kwargs["system"] = system_prompt
+                    kwargs["messages"] = [{"role": "user", "content": user_message}]
+                else:
+                    raise  # re-raise quota, network, etc. errors
 
         if response is None:
-            # Use streaming for thinking models (SDK requires it for long-running ops)
-            if self._use_thinking:
-                with client.messages.stream(**kwargs) as stream:
-                    response = stream.get_final_message()
-            else:
-                response = client.messages.create(**kwargs)
+            response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
