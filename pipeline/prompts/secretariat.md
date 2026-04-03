@@ -48,6 +48,8 @@
 
 排除必须标注原因。**不确定的保留，宁多不少。** 如果总格子数 > 20，建议精简低价值组合。
 
+**输出紧凑性要求**：`tactical_directions` 每个字段控制在 1-2 句话以内。`rationale`、`target_scenario`、`content_angle` 要精炼，不要写长段落。`excluded_cells` 的 reason 控制在 10 字以内。
+
 ## 输出格式
 
 严格输出以下 JSON：

@@ -184,23 +184,30 @@ class BaseAgent:
 
     @staticmethod
     def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
-        """Attempt to repair truncated JSON by closing unclosed brackets/braces."""
-        # Track open brackets
+        """Repair truncated JSON by finding the last valid cut point and closing brackets.
+
+        Handles truncation mid-string, mid-value, or between fields.
+        """
+        # Track JSON structure and remember valid cut points
         open_braces = 0
         open_brackets = 0
         in_string = False
         escape_next = False
+        # Positions right after a complete value where we could safely cut
+        cut_points: list[int] = []
 
-        for ch in fragment:
+        for i, ch in enumerate(fragment):
             if escape_next:
                 escape_next = False
                 continue
-            if ch == "\\":
-                if in_string:
-                    escape_next = True
+            if ch == "\\" and in_string:
+                escape_next = True
                 continue
-            if ch == '"' and not escape_next:
+            if ch == '"':
                 in_string = not in_string
+                if not in_string:
+                    # Just closed a string — valid cut after this
+                    cut_points.append(i + 1)
                 continue
             if in_string:
                 continue
@@ -208,35 +215,56 @@ class BaseAgent:
                 open_braces += 1
             elif ch == "}":
                 open_braces -= 1
+                cut_points.append(i + 1)
             elif ch == "[":
                 open_brackets += 1
             elif ch == "]":
                 open_brackets -= 1
+                cut_points.append(i + 1)
+            elif ch == ",":
+                cut_points.append(i)  # cut BEFORE comma is also valid
 
         if open_braces <= 0 and open_brackets <= 0:
             return None  # Not a truncation issue
 
-        # Truncate at last complete value (last comma or colon+value)
-        # Then close all open brackets/braces
-        # Strip trailing incomplete value after last comma
-        trimmed = fragment.rstrip()
-        # Remove trailing incomplete key-value or array element
-        for end_char in (",", "[", "{", ":"):
-            idx = trimmed.rfind(end_char)
-            if idx > 0:
-                candidate = trimmed[: idx].rstrip().rstrip(",")
-                suffix = "]" * open_brackets + "}" * open_braces
-                try:
-                    return json.loads(candidate + suffix)
-                except json.JSONDecodeError:
-                    continue
+        # Try cut points from most recent to earliest (keep as much data as possible)
+        for cp in reversed(cut_points[-50:]):  # check last 50 cut points
+            candidate = fragment[:cp].rstrip().rstrip(",")
 
-        # Last resort: just close brackets
-        suffix = "]" * open_brackets + "}" * open_braces
-        try:
-            return json.loads(fragment + suffix)
-        except json.JSONDecodeError:
-            return None
+            # Recount open brackets for this candidate
+            ob, obrk, ins, esc = 0, 0, False, False
+            for ch in candidate:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\" and ins:
+                    esc = True
+                    continue
+                if ch == '"':
+                    ins = not ins
+                    continue
+                if ins:
+                    continue
+                if ch == "{": ob += 1
+                elif ch == "}": ob -= 1
+                elif ch == "[": obrk += 1
+                elif ch == "]": obrk -= 1
+
+            if ob <= 0 or ins:
+                continue  # over-closed or ended inside string
+
+            suffix = "]" * obrk + "}" * ob
+            try:
+                result = json.loads(candidate + suffix)
+                logger.info(
+                    f"Truncation repair: cut at pos {cp}/{len(fragment)}, "
+                    f"closed {ob} braces + {obrk} brackets"
+                )
+                return result
+            except json.JSONDecodeError:
+                continue
+
+        return None
 
     async def run(self, input_data: dict, run_id: str, db: SupabaseClient) -> dict:
         """Execute the agent: log → call Claude → parse → check clarification → update log."""
