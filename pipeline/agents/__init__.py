@@ -82,34 +82,48 @@ class BaseAgent:
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
         """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
 
-        Opus models use extended thinking for deeper reasoning.
+        Opus thinking models first try with extended thinking + streaming.
+        Falls back to plain call if the proxy doesn't support these features.
         """
         client = self._get_client()
+
+        # Build base kwargs
+        if self._use_thinking:
+            # Thinking mode: system prompt goes into user message
+            messages = [{"role": "user", "content": system_prompt + "\n\n---\n\n" + user_message}]
+        else:
+            messages = [{"role": "user", "content": user_message}]
 
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": [{"role": "user", "content": system_prompt + "\n\n---\n\n" + user_message}]
-            if self._use_thinking
-            else [{"role": "user", "content": user_message}],
+            "messages": messages,
         }
 
-        if self._use_thinking:
-            # Extended thinking: system prompt goes into user message (thinking doesn't support system param),
-            # and we enable the thinking block with a budget.
-            budget = STAGE_THINKING_BUDGET.get(self.stage_name, THINKING_BUDGET_TOKENS)
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": budget,
-            }
-        else:
+        if not self._use_thinking:
             kwargs["system"] = system_prompt
 
+        # Try with thinking + streaming first, fall back to plain call
+        response = None
         if self._use_thinking:
-            # Streaming required for long-running thinking requests (>10 min)
-            with client.messages.stream(**kwargs) as stream:
-                response = stream.get_final_message()
-        else:
+            budget = STAGE_THINKING_BUDGET.get(self.stage_name, THINKING_BUDGET_TOKENS)
+            thinking_kwargs = {
+                **kwargs,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+            }
+            try:
+                with client.messages.stream(**thinking_kwargs) as stream:
+                    response = stream.get_final_message()
+            except Exception as e:
+                logger.warning(
+                    f"[{self.stage_name}] thinking+streaming failed ({e}), "
+                    "falling back to plain call"
+                )
+                # Fallback: plain call without thinking, with system prompt
+                kwargs["system"] = system_prompt
+                kwargs["messages"] = [{"role": "user", "content": user_message}]
+
+        if response is None:
             response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
