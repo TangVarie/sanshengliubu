@@ -124,7 +124,12 @@ class BaseAgent:
                 kwargs["messages"] = [{"role": "user", "content": user_message}]
 
         if response is None:
-            response = client.messages.create(**kwargs)
+            # Use streaming for thinking models (SDK requires it for long-running ops)
+            if self._use_thinking:
+                with client.messages.stream(**kwargs) as stream:
+                    response = stream.get_final_message()
+            else:
+                response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
