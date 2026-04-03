@@ -283,8 +283,33 @@ class PipelineOrchestrator:
         Each batch receives shared_skeleton + ministry_outputs + its cell subset.
         """
         active_cells = plan.get("matrix_skeleton", {}).get("active_cells", [])
+
+        # Fallback: reconstruct active_cells from directions × platforms if missing
         if not active_cells:
-            logger.warning("No active_cells found in matrix_skeleton, returning empty cell_plans")
+            directions = plan.get("tactical_directions", [])
+            platforms = plan.get("target_platforms", [])
+            if directions and platforms:
+                logger.warning(
+                    "matrix_skeleton.active_cells is empty, reconstructing from "
+                    f"{len(directions)} directions × {len(platforms)} platforms"
+                )
+                for d in directions:
+                    d_id = d.get("direction_id", d) if isinstance(d, dict) else d
+                    for p in platforms:
+                        p_name = p if isinstance(p, str) else str(p)
+                        p_key = p_name.replace(" ", "").lower()
+                        active_cells.append({
+                            "cell_id": f"{d_id}_{p_key}",
+                            "direction_id": d_id,
+                            "platform": p_name,
+                        })
+
+        if not active_cells:
+            logger.error(
+                "No active_cells found and could not reconstruct. "
+                f"plan keys: {list(plan.keys())}, "
+                f"matrix_skeleton: {plan.get('matrix_skeleton', 'MISSING')}"
+            )
             return []
 
         shared_skeleton = works_arch.get("shared_skeleton", {})
@@ -339,6 +364,23 @@ class PipelineOrchestrator:
         shared_skeleton = works_plan.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
 
+        logger.info(
+            f"Works builder: {len(cell_plans)} cell_plans, "
+            f"shared_skeleton keys: {list(shared_skeleton.keys()) if shared_skeleton else 'EMPTY'}"
+        )
+
+        if not cell_plans:
+            logger.error("No cell_plans to build! works_plan keys: %s", list(works_plan.keys()))
+            return {
+                "prompt_matrix": [],
+                "prompt_templates": [],
+                "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
+                "batch_rules": works_plan.get("batch_rules", {}),
+                "usage_guide": works_plan.get("usage_guide", ""),
+                "demo_outputs": [],
+                "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
+            }
+
         # Group by platform, then split into batches of MATRIX_CELLS_PER_BATCH
         def platform_key(cell: dict) -> str:
             return cell.get("platform", cell.get("cell_id", "").split("_")[-1])
@@ -367,9 +409,14 @@ class PipelineOrchestrator:
         # Merge all batch results
         all_cells: list[dict] = []
         all_demos: list[dict] = []
-        for r in results:
-            all_cells.extend(r.get("prompt_cells", []))
-            all_demos.extend(r.get("demo_outputs", []))
+        for idx, r in enumerate(results):
+            cells = r.get("prompt_cells", [])
+            demos = r.get("demo_outputs", [])
+            logger.info(f"Builder batch {idx}: {len(cells)} prompt_cells, {len(demos)} demos, keys={list(r.keys())}")
+            all_cells.extend(cells)
+            all_demos.extend(demos)
+
+        logger.info(f"Works builder completed: {len(all_cells)} total prompt_cells, {len(all_demos)} demos")
 
         return {
             "prompt_matrix": all_cells,
