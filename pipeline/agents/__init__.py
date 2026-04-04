@@ -81,6 +81,45 @@ class BaseAgent:
     def _use_thinking(self) -> bool:
         return "opus" in self.model
 
+    @staticmethod
+    def _build_content_blocks(text: str) -> list[dict[str, Any]] | str:
+        """Convert text with [BASE64_IMAGE:...] markers into multimodal content blocks."""
+        if "[BASE64_IMAGE:" not in text:
+            return text  # plain text, no conversion needed
+
+        blocks: list[dict[str, Any]] = []
+        parts = re.split(r"\[BASE64_IMAGE:(.*?)\]", text)
+        # parts = [text_before, base64_data, text_after, base64_data, ...]
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                # Text segment
+                stripped = part.strip()
+                if stripped:
+                    blocks.append({"type": "text", "text": stripped})
+            else:
+                # Base64 image data — detect media type from header
+                b64 = part.strip()
+                if b64.startswith("/9j/"):
+                    media_type = "image/jpeg"
+                elif b64.startswith("iVBOR"):
+                    media_type = "image/png"
+                elif b64.startswith("R0lGOD"):
+                    media_type = "image/gif"
+                elif b64.startswith("UklGR"):
+                    media_type = "image/webp"
+                else:
+                    media_type = "image/png"  # default
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64,
+                    },
+                })
+
+        return blocks if blocks else text
+
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
         """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
 
@@ -89,12 +128,20 @@ class BaseAgent:
         """
         client = self._get_client()
 
+        # Build content (may include image blocks)
+        user_content = self._build_content_blocks(user_message)
+
         # Build base kwargs
         if self._use_thinking:
             # Thinking mode: system prompt goes into user message
-            messages = [{"role": "user", "content": system_prompt + "\n\n---\n\n" + user_message}]
+            if isinstance(user_content, str):
+                combined = system_prompt + "\n\n---\n\n" + user_content
+            else:
+                # Prepend system prompt as text block before image blocks
+                combined = [{"type": "text", "text": system_prompt + "\n\n---\n\n"}] + user_content
+            messages = [{"role": "user", "content": combined}]
         else:
-            messages = [{"role": "user", "content": user_message}]
+            messages = [{"role": "user", "content": user_content}]
 
         kwargs: dict[str, Any] = {
             "model": self.model,
