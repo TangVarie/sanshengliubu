@@ -179,11 +179,27 @@ class PipelineOrchestrator:
             cell_plans = await self._run_cell_planners(
                 works_arch, ministry_outputs, structured_brief, plan
             )
+
+            if not cell_plans:
+                raise RuntimeError(
+                    f"工部·格子规划产出为空，无法继续。"
+                    f"plan keys: {list(plan.keys())}, "
+                    f"matrix_skeleton: {plan.get('matrix_skeleton', 'MISSING')}, "
+                    f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
+                    f"target_platforms: {plan.get('target_platforms', [])}"
+                )
+
             # Assemble full works_plan for builder
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
             # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
             final_system = await self._run_works_builders(works_plan)
+
+            if not final_system.get("prompt_matrix"):
+                raise RuntimeError(
+                    f"工部·构建产出为空。cell_plans count: {len(cell_plans)}, "
+                    f"works_plan keys: {list(works_plan.keys())}"
+                )
 
             # 6. 门下省终审
             final_review = await self.chancellery.run_final_review(
@@ -282,6 +298,14 @@ class PipelineOrchestrator:
         Splits active_cells into batches and runs them in parallel with Sonnet.
         Each batch receives shared_skeleton + ministry_outputs + its cell subset.
         """
+        logger.info(
+            f"[cell_planners] plan keys: {list(plan.keys())}, "
+            f"matrix_skeleton type: {type(plan.get('matrix_skeleton'))}, "
+            f"active_cells: {plan.get('matrix_skeleton', {}).get('active_cells', 'MISSING')!r:.200s}, "
+            f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
+            f"target_platforms: {plan.get('target_platforms', [])}"
+        )
+
         active_cells = plan.get("matrix_skeleton", {}).get("active_cells", [])
 
         # Fallback: reconstruct active_cells from directions × platforms if missing
