@@ -89,7 +89,10 @@ STAGE_DISPLAY_NAMES = {
     "ministry_works_builder": "工部·构建",
 }
 
-needs_input_logs = [l for l in stage_logs if l.get("status") == "needs_input"]
+needs_input_logs = [
+    l for l in stage_logs
+    if l.get("status") == "needs_input" and not l.get("human_intervention")
+]
 for ni_log in needs_input_logs:
     output = ni_log.get("output_data", {})
     stage_display = STAGE_DISPLAY_NAMES.get(ni_log["stage_name"], ni_log["stage_name"])
