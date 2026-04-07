@@ -370,23 +370,31 @@ with c1:
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
 with c2:
-    if status == "failed":
-        if st.button("▶️ 继续执行", help="从失败处继续，跳过已完成的阶段"):
+    # Allow resume whenever not actively completed — covers failed, paused, and
+    # silently-hung "running" states (e.g. background thread crashed without
+    # updating the project status).
+    if status != "completed":
+        if st.button(
+            "▶️ 继续执行",
+            help="从失败/中断处继续，跳过已完成的阶段。如果流水线卡住没有进度，也可以点这个强制恢复。",
+        ):
             from pipeline.orchestrator import resume_pipeline_in_background
             from pipeline.agents import init_api_config
             init_api_config()
+            # Reset status so the orchestrator can take over again
+            db.update_project(project_id, status="running")
             resume_pipeline_in_background(project_id, run_id, db)
             st.rerun()
 with c3:
-    if status == "completed" or status == "failed":
-        if st.button("🔄 重跑流水线", help="完全从头开始"):
-            from pipeline.orchestrator import start_pipeline_in_background
-            from pipeline.agents import init_api_config
-            new_run = db.create_pipeline_run(project_id)
-            db.update_project(project_id, status="running")
-            init_api_config()
-            start_pipeline_in_background(project_id, new_run["id"], db)
-            st.rerun()
+    # Restart from scratch — always available except while a fresh run is healthy
+    if st.button("🔄 重跑流水线", help="完全从头开始（会创建新的 run）"):
+        from pipeline.orchestrator import start_pipeline_in_background
+        from pipeline.agents import init_api_config
+        new_run = db.create_pipeline_run(project_id)
+        db.update_project(project_id, status="running")
+        init_api_config()
+        start_pipeline_in_background(project_id, new_run["id"], db)
+        st.rerun()
 
 # Auto-refresh when running or paused for review (waiting for user input)
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
