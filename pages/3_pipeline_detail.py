@@ -13,6 +13,21 @@ st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wi
 show_version_badge()
 
 
+def render_stage_error(log: dict) -> None:
+    """Render an error message for a failed stage. Always shows something,
+    even if error_message is empty/missing — silent failures are the worst."""
+    msg = (log or {}).get("error_message")
+    if msg and str(msg).strip():
+        st.error(msg)
+    else:
+        st.error(
+            f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
+            f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
+            f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
+            f"stage_log id: `{(log or {}).get('id', '?')}`"
+        )
+
+
 def render_stage_output(output_data: dict):
     """Render stage output with uncertainty annotations separated out."""
     uncertainties = output_data.get("_uncertainty", [])
@@ -206,8 +221,8 @@ with tabs[0]:
         render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
-        if log.get("error_message"):
-            st.error(log["error_message"])
+        if log.get("status") == "failed":
+            render_stage_error(log)
     else:
         st.caption("等待执行...")
 
@@ -220,8 +235,10 @@ with tabs[1]:
             with st.expander(f"方案 (轮次 {sec_logs.index(sl) + 1})", expanded=(sl == sec_logs[-1])):
                 if sl.get("output_data"):
                     render_stage_output(sl["output_data"])
-                elif sl.get("error_message"):
-                    st.error(sl["error_message"])
+                elif sl.get("status") == "failed":
+                    render_stage_error(sl)
+                else:
+                    st.caption(f"状态：{sl.get('status', 'pending')}")
     else:
         st.caption("等待执行...")
 
@@ -267,8 +284,8 @@ with tabs[2]:
                                     human_intervention={"note": note},
                                 )
                                 st.success("已发送")
-                elif cl.get("error_message"):
-                    st.error(cl["error_message"])
+                elif cl.get("status") == "failed":
+                    render_stage_error(cl)
     else:
         st.caption("等待执行...")
 
@@ -279,6 +296,8 @@ with tabs[3]:
         render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
+        if log.get("status") == "failed":
+            render_stage_error(log)
     else:
         st.caption("等待执行...")
 
@@ -298,7 +317,7 @@ with tabs[4]:
             if s == "running":
                 st.info("⏳ 执行中...")
             elif s == "failed":
-                st.error(f"执行失败：{log.get('error_message', '')}")
+                render_stage_error(log)
             elif s == "skipped":
                 st.warning("⏭️ 已跳过")
             else:
@@ -319,8 +338,8 @@ with tabs[4]:
                         with st.expander(f"格子规划批次 {cell_planner_logs.index(cl) + 1}", expanded=False):
                             if cl.get("output_data"):
                                 render_stage_output(cl["output_data"])
-                            elif cl.get("error_message"):
-                                st.error(cl["error_message"])
+                            elif cl.get("status") == "failed":
+                                render_stage_error(cl)
                 builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
                 if builder_logs:
                     st.divider()
@@ -329,8 +348,8 @@ with tabs[4]:
                         with st.expander(f"构建批次 {builder_logs.index(bl) + 1}", expanded=False):
                             if bl.get("output_data"):
                                 render_stage_output(bl["output_data"])
-                            elif bl.get("error_message"):
-                                st.error(bl["error_message"])
+                            elif bl.get("status") == "failed":
+                                render_stage_error(bl)
 
 # Tab 5: Final Review
 with tabs[5]:

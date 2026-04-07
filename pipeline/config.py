@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.5.0"
+VERSION = "v0.5.1"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "全阶段 thinking + 网感味道匹配 + borderline 中间档"
+VERSION_NOTES = "诊断修复：失败阶段必显错误信息 + 模型回退兜底"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use -thinking variants. The proxy/relay routes -thinking suffixed
@@ -57,7 +57,7 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
-    "dispatcher": 12000,
+    "dispatcher": 16000,  # thinking + structured task split for 6 ministries
     # Execution ministries — Sonnet thinking + structured outputs
     "ministry_personnel": 16000,
     "ministry_revenue": 16000,

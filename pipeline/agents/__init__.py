@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -169,13 +170,24 @@ class BaseAgent:
                 with client.messages.stream(**thinking_kwargs) as stream:
                     response = stream.get_final_message()
             except Exception as e:
-                err_str = str(e)
+                err_str = str(e) or repr(e)
                 # Fallback for proxy-incompatibility errors (thinking unsupported, etc.)
-                if "构建请求" in err_str or "thinking" in err_str.lower() or "model_not_found" in err_str:
+                err_lower = err_str.lower()
+                if (
+                    "构建请求" in err_str
+                    or "thinking" in err_lower
+                    or "model_not_found" in err_lower
+                    or ("model" in err_lower and "not" in err_lower)
+                    or (not err_str.strip())  # empty body from proxy → also try fallback
+                ):
+                    # Strip -thinking suffix from model name in case the proxy doesn't
+                    # recognize it at all. Fall back to base model name + plain call.
+                    base_model = self.model.replace("-thinking", "")
                     logger.warning(
-                        f"[{self.stage_name}] thinking stream failed ({e}), "
-                        "falling back to plain call without thinking"
+                        f"[{self.stage_name}] thinking stream failed ({e!r}), "
+                        f"falling back to plain call: model {self.model} → {base_model}"
                     )
+                    kwargs["model"] = base_model
                     kwargs["system"] = system_prompt
                     kwargs["messages"] = [{"role": "user", "content": user_message}]
                 else:
@@ -400,16 +412,38 @@ class BaseAgent:
 
             except Exception as e:
                 last_error = e
+                # Capture full traceback so we never end up with an empty error_message
+                logger.exception(
+                    f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
+                )
                 if attempt < MAX_RETRIES:
                     delay = RETRY_BASE_DELAY_SECONDS * (attempt + 1)
                     await asyncio.sleep(delay)
 
-        # All retries exhausted
+        # All retries exhausted — build a robust, non-empty error message
         duration = time.time() - start_time
+        err_str = ""
+        if last_error is not None:
+            try:
+                err_str = str(last_error) or repr(last_error)
+            except Exception:
+                err_str = repr(last_error)
+            tb = traceback.format_exception(type(last_error), last_error, last_error.__traceback__)
+            err_str = (
+                f"{type(last_error).__name__}: {err_str}\n"
+                f"model={self.model} max_tokens={self.max_tokens}\n"
+                f"--- traceback ---\n{''.join(tb)}"
+            )
+        if not err_str.strip():
+            err_str = (
+                f"Stage {self.stage_name} failed after {MAX_RETRIES + 1} attempts "
+                f"but no error info was captured (last_error={last_error!r}, "
+                f"model={self.model})"
+            )
         db.update_stage_log(
             log_id,
             status="failed",
-            error_message=str(last_error),
+            error_message=err_str[:8000],  # cap to avoid blowing up the column
             tokens_used=total_input_tokens + total_output_tokens,
             duration_seconds=round(duration, 2),
         )
