@@ -220,10 +220,13 @@ if uncertainty_summary:
                 st.query_params["project_id"] = project_id
                 st.switch_page("pages/3_pipeline_detail.py")
 
-# Batch rules
+# Batch rules — these should already be baked into each cell's system_prompt.
+# Only show as a debug reference, not a primary artifact the user needs to
+# remember to load alongside the prompts.
 batch_rules = prompt_system.get("batch_rules", {})
 if batch_rules:
-    with st.expander("⚙️ 批量管理规则"):
+    with st.expander("⚙️ 批量管理规则（调试参考·已内置到每个 system_prompt）", expanded=False):
+        st.caption("这些规则已经写进上面每个格子的 system_prompt 里，你复制 system_prompt 就自动带上了。此处仅作为调试参考。")
         st.json(batch_rules)
 
 # ── Export ──────────────────────────────────────────────────────────────────

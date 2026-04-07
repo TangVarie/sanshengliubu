@@ -380,15 +380,75 @@ class PipelineOrchestrator:
                 )
 
         results = await asyncio.gather(
-            *[plan_batch(b, i) for i, b in enumerate(batches)]
+            *[plan_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
 
-        # Merge all batch cell_plans
+        # Merge all batch cell_plans, track which cells came back
         all_cell_plans: list[dict] = []
-        for r in results:
-            all_cell_plans.extend(r.get("cell_plans", []))
+        got_ids: set[str] = set()
+        for idx, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"Cell planner batch {idx} raised: {r}")
+                continue
+            plans = r.get("cell_plans", [])
+            logger.info(
+                f"Cell planner batch {idx}: {len(plans)}/{len(batches[idx])} cell_plans"
+            )
+            for p in plans:
+                cid = p.get("cell_id")
+                if cid:
+                    got_ids.add(cid)
+            all_cell_plans.extend(plans)
 
-        logger.info(f"Cell planner completed: {len(all_cell_plans)} cell_plans generated")
+        # Retry missing cells one at a time
+        expected_ids = {c.get("cell_id") for c in active_cells if c.get("cell_id")}
+        missing_ids = expected_ids - got_ids
+        if missing_ids:
+            logger.warning(
+                f"Cell planner missing {len(missing_ids)}/{len(expected_ids)} cells: "
+                f"{sorted(missing_ids)}. Retrying one per batch..."
+            )
+            missing_cells = [c for c in active_cells if c.get("cell_id") in missing_ids]
+
+            async def retry_one_plan(cell: dict) -> dict:
+                async with semaphore:
+                    try:
+                        return await self.works_cell_planner.run(
+                            {
+                                "active_cells": [cell],
+                                "shared_skeleton": shared_skeleton,
+                                "ministry_outputs": ministry_outputs,
+                                "brief": brief,
+                                "plan_summary": {
+                                    "tactical_directions": plan.get("tactical_directions", []),
+                                    "target_platforms": plan.get("target_platforms", []),
+                                },
+                            },
+                            self.run_id,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Cell planner retry for {cell.get('cell_id')} failed: {e}"
+                        )
+                        return {}
+
+            retry_results = await asyncio.gather(
+                *[retry_one_plan(c) for c in missing_cells]
+            )
+            for r in retry_results:
+                if not r:
+                    continue
+                for p in r.get("cell_plans", []):
+                    cid = p.get("cell_id")
+                    if cid and cid not in got_ids:
+                        got_ids.add(cid)
+                        all_cell_plans.append(p)
+
+        logger.info(
+            f"Cell planner completed: {len(all_cell_plans)}/{len(expected_ids)} cell_plans"
+        )
         return all_cell_plans
 
     async def _run_works_builders(self, works_plan: dict) -> dict:
@@ -441,20 +501,79 @@ class PipelineOrchestrator:
                 )
 
         results = await asyncio.gather(
-            *[build_batch(b, i) for i, b in enumerate(batches)]
+            *[build_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
 
-        # Merge all batch results
+        # Merge all batch results, tracking which cells came back
         all_cells: list[dict] = []
         all_demos: list[dict] = []
+        got_cell_ids: set[str] = set()
         for idx, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"Builder batch {idx} raised: {r}")
+                continue
             cells = r.get("prompt_cells", [])
             demos = r.get("demo_outputs", [])
-            logger.info(f"Builder batch {idx}: {len(cells)} prompt_cells, {len(demos)} demos, keys={list(r.keys())}")
+            logger.info(
+                f"Builder batch {idx}: {len(cells)}/{len(batches[idx])} prompt_cells, "
+                f"{len(demos)} demos, keys={list(r.keys())}"
+            )
+            for c in cells:
+                cid = c.get("cell_id")
+                if cid:
+                    got_cell_ids.add(cid)
             all_cells.extend(cells)
             all_demos.extend(demos)
 
-        logger.info(f"Works builder completed: {len(all_cells)} total prompt_cells, {len(all_demos)} demos")
+        # Detect missing cells and retry them one at a time (robust fallback)
+        expected_ids = {c.get("cell_id") for c in cell_plans if c.get("cell_id")}
+        missing_ids = expected_ids - got_cell_ids
+        if missing_ids:
+            logger.warning(
+                f"Works builder missing {len(missing_ids)}/{len(expected_ids)} cells: "
+                f"{sorted(missing_ids)}. Retrying one cell per batch..."
+            )
+            missing_plans = [c for c in cell_plans if c.get("cell_id") in missing_ids]
+
+            async def retry_one(plan: dict) -> dict:
+                async with semaphore:
+                    try:
+                        return await self.works_builder.run(
+                            {"cell_plans": [plan], "shared_skeleton": shared_skeleton},
+                            self.run_id,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.error(f"Retry for cell {plan.get('cell_id')} failed: {e}")
+                        return {}
+
+            retry_results = await asyncio.gather(
+                *[retry_one(p) for p in missing_plans]
+            )
+            for r in retry_results:
+                if not r:
+                    continue
+                cells = r.get("prompt_cells", [])
+                demos = r.get("demo_outputs", [])
+                for c in cells:
+                    cid = c.get("cell_id")
+                    if cid and cid not in got_cell_ids:
+                        got_cell_ids.add(cid)
+                        all_cells.append(c)
+                all_demos.extend(demos)
+
+            still_missing = expected_ids - got_cell_ids
+            if still_missing:
+                logger.error(
+                    f"Works builder STILL missing {len(still_missing)} cells after retry: "
+                    f"{sorted(still_missing)}"
+                )
+
+        logger.info(
+            f"Works builder completed: {len(all_cells)}/{len(expected_ids)} "
+            f"total prompt_cells, {len(all_demos)} demos"
+        )
 
         return {
             "prompt_matrix": all_cells,
