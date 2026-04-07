@@ -363,6 +363,7 @@ class PipelineOrchestrator:
         for d in directions:
             d_id = d.get("direction_id") if isinstance(d, dict) else d
             d_name = d.get("direction_name", "") if isinstance(d, dict) else ""
+            d_paradigm = d.get("paradigm", "A_emotional_hook") if isinstance(d, dict) else "A_emotional_hook"
             if not d_id:
                 continue
             for p in platforms:
@@ -375,6 +376,7 @@ class PipelineOrchestrator:
                     "direction_id": str(d_id),
                     "direction_name": d_name,
                     "platform": p_name,
+                    "paradigm": d_paradigm,
                 })
 
         # Decide whether to use secretariat's active_cells or our reconstruction.

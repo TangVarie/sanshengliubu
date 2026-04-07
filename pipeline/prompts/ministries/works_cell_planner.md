@@ -60,6 +60,7 @@
       "direction_id": "D1",
       "direction_name": "方向名称",
       "platform": "小红书",
+      "paradigm": "A_emotional_hook | B_meta_response",
       "platform_content_logic": "该方向在该平台的内容逻辑（具体到用户消费场景、内容形式、互动模式）",
       "persona_strategy_notes": "学生党：侧重XX，切入角度是YY；职场人：侧重AA，切入角度是BB",
       "customization_notes": "该格子与同方向其他平台、同平台其他方向的差异点",
@@ -74,3 +75,5 @@
   ]
 }
 ```
+
+**`paradigm` 字段处理**：从输入的 active_cell 里读 `paradigm` 字段（上游 secretariat 已标注），原样透传到输出。如果 active_cell 没有 paradigm 字段，写 `"A_emotional_hook"` 作为默认值，并在 `customization_notes` 里加一行注释提醒下游。**绝对不要自己重新判断范式**——上游已经决定了，你只是搬运。
