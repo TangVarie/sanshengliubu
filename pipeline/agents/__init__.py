@@ -79,7 +79,10 @@ class BaseAgent:
 
     @property
     def _use_thinking(self) -> bool:
-        return "opus" in self.model
+        # Model name is the switch: any model with "thinking" in its ID uses
+        # extended thinking. This lets config.py control thinking per-stage
+        # purely by model assignment.
+        return "thinking" in self.model
 
     @staticmethod
     def _build_content_blocks(text: str) -> list[dict[str, Any]] | str:
