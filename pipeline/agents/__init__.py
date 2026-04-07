@@ -63,8 +63,8 @@ class BaseAgent:
         kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
         if _api_config.get("base_url"):
             kwargs["base_url"] = _api_config["base_url"]
-        # Long timeout to avoid SDK forcing streaming for thinking models
-        kwargs["timeout"] = 1800.0  # 30 min — proxy may be slow
+        # Generous timeout — proxy may be slow, thinking calls use streaming
+        kwargs["timeout"] = 900.0  # 15 min
         return anthropic.Anthropic(**kwargs)
 
     def load_system_prompt(self) -> str:
@@ -161,13 +161,16 @@ class BaseAgent:
                 "thinking": {"type": "enabled", "budget_tokens": budget},
             }
             try:
-                response = client.messages.create(**thinking_kwargs)
+                # Streaming is required by SDK for long-running thinking requests (>10min).
+                # Use stream context manager and collect final message.
+                with client.messages.stream(**thinking_kwargs) as stream:
+                    response = stream.get_final_message()
             except Exception as e:
                 err_str = str(e)
-                # Only fallback for proxy-incompatibility errors, not for quota/network
-                if "构建请求" in err_str or "thinking" in err_str.lower():
+                # Fallback for proxy-incompatibility errors (thinking unsupported, etc.)
+                if "构建请求" in err_str or "thinking" in err_str.lower() or "model_not_found" in err_str:
                     logger.warning(
-                        f"[{self.stage_name}] thinking call failed ({e}), "
+                        f"[{self.stage_name}] thinking stream failed ({e}), "
                         "falling back to plain call without thinking"
                     )
                     kwargs["system"] = system_prompt
@@ -176,6 +179,8 @@ class BaseAgent:
                     raise  # re-raise quota, network, etc. errors
 
         if response is None:
+            # Non-thinking path (or thinking fallback): plain create.
+            # max_tokens is small enough that the SDK won't enforce streaming.
             response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
