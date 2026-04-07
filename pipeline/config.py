@@ -2,37 +2,40 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.5.3"
+VERSION = "v0.5.4"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "全阶段统一 opus-thinking（sonnet 退役）"
+VERSION_NOTES = "战略阶段 opus-thinking + 执行阶段 plain opus（sonnet 位置全部换成 opus）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# All stages use claude-opus-4-6-thinking. The vip group on the new-api relay
-# only has thinking channels for opus, not sonnet. Going all-opus simplifies
-# everything and ensures every stage gets extended thinking. Cost is higher
-# (opus output is 5x sonnet) but the user explicitly chose this trade-off.
+# Sonnet is fully retired (relay vip group has no sonnet channels). The
+# original 5 strategy/review stages keep opus-thinking; the previously-sonnet
+# 10 execution stages now use plain opus (no thinking) — same Opus quality,
+# without the thinking overhead.
 #
-# If the -thinking channel ever fails, _call_claude falls back to plain
-# claude-opus-4-6 (no thinking) automatically.
+# If a -thinking channel call fails, _call_claude falls back to plain
+# claude-opus-4-6 automatically.
 
 OPUS_THINKING = "claude-opus-4-6-thinking"
+OPUS_PLAIN = "claude-opus-4-6"
 
 MODELS: dict[str, str] = {
-    "crown_prince": OPUS_THINKING,
-    "secretariat": OPUS_THINKING,
-    "chancellery": OPUS_THINKING,
-    "dispatcher": OPUS_THINKING,
-    "ministry_personnel": OPUS_THINKING,
-    "ministry_revenue": OPUS_THINKING,
-    "ministry_rites": OPUS_THINKING,
-    "ministry_war": OPUS_THINKING,
-    "ministry_justice": OPUS_THINKING,
-    "ministry_works": OPUS_THINKING,
-    "ministry_works_cell_planner": OPUS_THINKING,
-    "ministry_works_builder": OPUS_THINKING,
-    "vibe_critic": OPUS_THINKING,
-    "vibe_rewriter": OPUS_THINKING,
-    "chancellery_final": OPUS_THINKING,
+    # ── Opus + thinking (strategy / review / architect) ──
+    "crown_prince": OPUS_THINKING,         # 太子 — parsing
+    "secretariat": OPUS_THINKING,          # 中书省 — strategy
+    "chancellery": OPUS_THINKING,          # 门下省 — review
+    "ministry_works": OPUS_THINKING,       # 工部架构 — global skeleton
+    "chancellery_final": OPUS_THINKING,    # 终审
+    # ── Plain opus (execution stages — replaces sonnet) ──
+    "dispatcher": OPUS_PLAIN,              # 尚书省 — task split
+    "ministry_personnel": OPUS_PLAIN,      # 吏部
+    "ministry_revenue": OPUS_PLAIN,        # 户部
+    "ministry_rites": OPUS_PLAIN,          # 礼部
+    "ministry_war": OPUS_PLAIN,            # 兵部
+    "ministry_justice": OPUS_PLAIN,        # 刑部
+    "ministry_works_cell_planner": OPUS_PLAIN,
+    "ministry_works_builder": OPUS_PLAIN,
+    "vibe_critic": OPUS_PLAIN,
+    "vibe_rewriter": OPUS_PLAIN,
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -81,29 +84,16 @@ CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
 CELL_PLANNER_CONCURRENCY = 3    # max parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# Both Opus and Sonnet stages use thinking. Sonnet gets a smaller default
-# budget since execution tasks need less deep deliberation than strategy.
-THINKING_BUDGET_TOKENS = 5000  # default budget; per-stage overrides below
+# Only the 5 opus-thinking strategy/review stages use extended thinking.
+# Plain opus execution stages skip thinking entirely (faster + cheaper).
+THINKING_BUDGET_TOKENS = 10000  # default for any thinking stage
 
-# Per-stage thinking budget overrides
 STAGE_THINKING_BUDGET: dict[str, int] = {
-    # Opus strategy/review stages — deep deliberation
     "crown_prince": 10000,
     "secretariat": 10000,
     "chancellery": 10000,
     "ministry_works": 10000,        # architect — global skeleton design
     "chancellery_final": 10000,
-    # Sonnet execution stages — moderate thinking budget
-    "dispatcher": 3000,
-    "ministry_personnel": 4000,
-    "ministry_revenue": 4000,
-    "ministry_rites": 4000,
-    "ministry_war": 4000,
-    "ministry_justice": 4000,
-    "ministry_works_cell_planner": 5000,
-    "ministry_works_builder": 6000,
-    "vibe_critic": 5000,            # taste matching needs space to compare
-    "vibe_rewriter": 6000,
 }
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
