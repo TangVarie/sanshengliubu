@@ -38,13 +38,15 @@
 
 ## 规则
 
-1. 只处理输入中的 `active_cells`，不多不少
-2. `platform_content_logic` 必须具体到该平台用户的心理状态和行为模式
-3. `persona_strategy_notes` 至少覆盖2种人设类型的差异化说明
-4. `applicable_personas` 按优先级排序：campaign_objectives 综合匹配度 > 方向匹配度 > 受众覆盖面
-5. `ministry_digest` 每个字段必须自包含——构建者只看这一个 digest 就有足够信息
-6. 每个格子的逻辑必须独立完整——读者只看这一个 cell_plan 就能理解该怎么做
-7. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
+1. **【硬契约】严格 1:1 输入输出**：输入的 `active_cells` 数组里有 N 个 cell，你的 `cell_plans` 数组里**必须有且只有 N 个 cell_plan**，每个 cell_plan 的 `cell_id` 必须严格对应输入中的某一个 `cell_id`。**禁止跳过任何 cell**，禁止合并 cell，禁止偷懒只返回第一个或几个。如果输入是 `[{"cell_id":"D1_xhs"},{"cell_id":"D2_xhs"},{"cell_id":"D3_xhs"}]`，那 cell_plans 的长度必须是 3，cell_id 必须分别是 D1_xhs / D2_xhs / D3_xhs，少一个都算失败。
+2. **完成度自检**：写完后回头数一遍——cell_plans.length 是不是和 active_cells.length 相等？输入里每个 cell_id 是不是都出现在你的输出里？如果不是，回去补齐。
+3. `platform_content_logic` 必须具体到该平台用户的心理状态和行为模式
+4. `persona_strategy_notes` 至少覆盖2种人设类型的差异化说明
+5. `applicable_personas` 按优先级排序：campaign_objectives 综合匹配度 > 方向匹配度 > 受众覆盖面
+6. `ministry_digest` 每个字段必须自包含——构建者只看这一个 digest 就有足够信息
+7. 每个格子的逻辑必须独立完整——读者只看这一个 cell_plan 就能理解该怎么做
+8. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
+9. 如果输入中包含 `_strict_contract` 字段，那是 orchestrator 给你的硬性提醒，**必须严格遵守**（特别是输入/输出数量必须 1:1）
 
 ## 输出格式
 

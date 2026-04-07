@@ -48,7 +48,18 @@
 
 排除必须标注原因。**不确定的保留，宁多不少。** 如果总格子数 > 20，建议精简低价值组合。
 
-**输出紧凑性要求**：`tactical_directions` 每个字段控制在 1-2 句话以内。`rationale`、`target_scenario`、`content_angle` 要精炼，不要写长段落。`excluded_cells` 的 reason 控制在 10 字以内。
+### ⚠️ active_cells 完备性硬要求
+
+`matrix_skeleton.active_cells` **必须穷举**所有未被排除的 (direction × platform) 组合。如果你产出了 5 个 tactical_directions 和 3 个 target_platforms，那 active_cells 应该有 15 个（减去 excluded_cells 的数量）。**禁止只写出 D1 的几个 cell 然后省略剩下的**。
+
+写完 active_cells 后，自检一遍：
+- `len(active_cells) + len(excluded_cells)` 是不是等于 `len(tactical_directions) × len(target_platforms)`？
+- 每个 direction_id（D1, D2, D3...）是不是都在 active_cells 里出现过至少一次（除非该方向的所有平台都被排除了）？
+- 每个 target_platform 是不是都在 active_cells 里出现过至少一次？
+
+如果哪个 direction 完全没出现在 active_cells 里且也不在 excluded_cells 里，那是漏写，必须补上。
+
+**输出紧凑性要求**：`tactical_directions` 每个字段控制在 1-2 句话以内。`rationale`、`target_scenario`、`content_angle` 要精炼，不要写长段落。`excluded_cells` 的 reason 控制在 10 字以内。**注意：紧凑性约束指的是单个字段简短，不是减少方向或 cell 数量**。
 
 ## 输出格式
 

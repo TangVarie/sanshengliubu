@@ -61,13 +61,15 @@
 
 ## 规则
 
-1. 严格按输入的 `cell_plans` 数量产出，不多不少
-2. 每个 system_prompt 都必须把 shared_skeleton 的合规块原文嵌入
-3. 每个 system_prompt 都必须把 ministry_digest.keywords 的具体关键词嵌入（不是"植入关键词"这种空话，要写出具体词）
-4. 每个 system_prompt 都必须包含一段"差异化生成指令"，列出差异化工具包里的至少 5 个叙事结构、5 个开头切入、5 个情绪基调，要求模型每次生成前显式选择一种组合
-5. demo_output 长度要符合该平台的真实内容长度（小红书 300-800 字、抖音脚本 30-60 秒、B站 简介 200-500 字、知乎 答案 500-1500 字、微博 150 字内）
-6. demo_output 必须有具体生活细节、具体数字、具体场景，不能停留在"它很好用""值得推荐"这种空话
-7. 不要输出额外的 persona_adaptation_rules 字段——人设规则必须写在 system_prompt 里
+1. **【硬契约】严格 1:1 输入输出**：输入的 `cell_plans` 数组里有 N 个 cell_plan，你的 `prompt_cells` 数组里**必须有且只有 N 个 prompt_cell**，每个 prompt_cell 的 `cell_id` 必须严格对应输入中的某一个 `cell_id`。**禁止跳过任何 cell**，禁止合并 cell，禁止偷懒只给前几个写完整的，剩下的省略。哪怕你写到第 3 个时已经很长了，也必须把第 4、5 个写完。如果输入有 D2_xhs / D3_xhs / D4_xhs，那 prompt_cells 必须包含这 3 个 cell_id 的 prompt_cell，少一个都算彻底失败。
+2. **完成度自检**：写完后回头数一遍——prompt_cells.length 是不是和 cell_plans.length 相等？输入里每个 cell_id 是不是都出现在你的输出里？如果不是，回去补齐。**宁可每个 system_prompt 短一点，也要把所有 cell 写完**——丢 cell 比单个 prompt 不够长严重得多。
+3. 每个 system_prompt 都必须把 shared_skeleton 的合规块原文嵌入
+4. 每个 system_prompt 都必须把 ministry_digest.keywords 的具体关键词嵌入（不是"植入关键词"这种空话，要写出具体词）
+5. 每个 system_prompt 都必须包含一段"差异化生成指令"，列出差异化工具包里的至少 5 个叙事结构、5 个开头切入、5 个情绪基调，要求模型每次生成前显式选择一种组合
+6. demo_output 长度要符合该平台的真实内容长度（小红书 300-800 字、抖音脚本 30-60 秒、B站 简介 200-500 字、知乎 答案 500-1500 字、微博 150 字内）
+7. demo_output 必须有具体生活细节、具体数字、具体场景，不能停留在"它很好用""值得推荐"这种空话
+8. 不要输出额外的 persona_adaptation_rules 字段——人设规则必须写在 system_prompt 里
+9. 如果输入中包含 `_strict_contract` 字段，那是 orchestrator 给你的硬性提醒，**必须严格遵守**（特别是输入/输出数量必须 1:1）
 
 ## 输出格式
 
