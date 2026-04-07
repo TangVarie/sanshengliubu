@@ -13,6 +13,8 @@ STATUS_EMOJI = {
     "running": "🔄",
     "completed": "✅",
     "failed": "❌",
+    "needs_revision": "📝🔁",
+    "paused_for_review": "⏸️",
 }
 
 TASK_TYPE_LABEL = {
@@ -29,16 +31,18 @@ try:
         st.info("暂无项目，点击左侧「新建项目」开始。")
     else:
         # Quick stats
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         total = len(projects)
         running = sum(1 for p in projects if p["status"] == "running")
         completed = sum(1 for p in projects if p["status"] == "completed")
+        needs_rev = sum(1 for p in projects if p["status"] == "needs_revision")
         failed = sum(1 for p in projects if p["status"] == "failed")
 
         col1.metric("总项目数", total)
         col2.metric("运行中", running)
         col3.metric("已完成", completed)
-        col4.metric("失败", failed)
+        col4.metric("待修订", needs_rev)
+        col5.metric("失败", failed)
 
         st.divider()
 

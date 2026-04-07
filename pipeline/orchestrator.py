@@ -217,14 +217,28 @@ class PipelineOrchestrator:
                 final_system, plan, structured_brief, self.run_id, self.db
             )
 
-            # 7. Save output
+            # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
+
+            # 8. Determine final status from chancellery_final verdict
+            verdict = (final_review or {}).get("verdict", "").strip().lower()
+            if verdict == "approved":
+                final_status = "completed"
+                logger.info(f"Pipeline {self.run_id} completed (终审 approved)")
+            else:
+                # revision_required / rejected / unknown — DO NOT mark as completed
+                final_status = "needs_revision"
+                logger.warning(
+                    f"Pipeline {self.run_id} 终审 verdict={verdict!r}, "
+                    f"marking as needs_revision. revision_instructions: "
+                    f"{(final_review or {}).get('revision_instructions', '')[:300]}"
+                )
             self.db.update_pipeline_run(
                 self.run_id,
-                status="completed",
+                status=final_status,
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
-            self.db.update_project(self.project_id, status="completed")
+            self.db.update_project(self.project_id, status=final_status)
 
         except Exception as e:
             logger.exception("Pipeline failed")

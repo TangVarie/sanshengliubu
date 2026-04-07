@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.5.4"
+VERSION = "v0.5.5"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "战略阶段 opus-thinking + 执行阶段 plain opus（sonnet 位置全部换成 opus）"
+VERSION_NOTES = "终审 verdict 检查 + needs_revision 状态（不再误标 completed）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The

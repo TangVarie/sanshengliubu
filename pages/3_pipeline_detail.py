@@ -70,10 +70,42 @@ except Exception as e:
 
 # ── Header ─────────────────────────────────────────────────────────────────
 
-STATUS_EMOJI = {"draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌", "paused_for_review": "⏸️"}
+STATUS_EMOJI = {
+    "draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌",
+    "paused_for_review": "⏸️", "needs_revision": "📝🔁",
+}
 status = project.get("status", "draft")
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
+
+# Banner for needs_revision: surface 终审 verdict + revision instructions immediately
+if status == "needs_revision":
+    try:
+        latest_run_id = runs[0]["id"] if runs else None
+        if latest_run_id:
+            _final_logs = [
+                l for l in db.get_stage_logs(latest_run_id)
+                if l.get("stage_name") == "chancellery_final"
+            ]
+            _final_review = (_final_logs[-1].get("output_data") if _final_logs else None) or {}
+            _verdict = _final_review.get("verdict", "unknown")
+            _instructions = _final_review.get("revision_instructions", "")
+            _revisions = _final_review.get("mandatory_revisions", []) or []
+            with st.container(border=True):
+                st.error(
+                    f"📝🔁 **终审判定：{_verdict}** — 流水线已运行完毕，但门下省终审认为产出"
+                    f"未达交付标准。下方「终审」tab 有完整审查报告。"
+                )
+                if _revisions:
+                    st.markdown("**必须修改：**")
+                    for r in _revisions:
+                        st.markdown(f"- {r}")
+                if _instructions:
+                    with st.expander("📋 修改指令", expanded=True):
+                        st.markdown(_instructions)
+                st.caption("可以点击下方「重新执行」按钮从头开始一次完整的流水线。")
+    except Exception as _e:
+        st.warning(f"无法加载终审报告：{_e}")
 
 if not runs:
     st.info("此项目尚未启动流水线。")
@@ -388,8 +420,9 @@ with col_c:
 st.divider()
 c1, c2, c3 = st.columns(3)
 with c1:
-    if status == "completed":
-        if st.button("📦 查看产出"):
+    if status in ("completed", "needs_revision"):
+        label = "📦 查看产出" if status == "completed" else "📦 查看部分产出"
+        if st.button(label):
             st.session_state["current_project_id"] = project_id
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
