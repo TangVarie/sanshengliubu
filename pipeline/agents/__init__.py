@@ -80,11 +80,11 @@ class BaseAgent:
 
     @property
     def _use_thinking(self) -> bool:
-        # Stage-level switch: any stage that has an entry in STAGE_THINKING_BUDGET
-        # uses extended thinking. The model itself is always the base name (the
-        # relay channels for -thinking suffixed names may not be provisioned),
-        # and thinking is enabled via the API `thinking` parameter.
-        return self.stage_name in STAGE_THINKING_BUDGET
+        # Model name is the switch: any model with "thinking" in its ID uses
+        # extended thinking. If the relay's -thinking channel fails, the
+        # fallback in _call_claude strips the suffix and retries with the
+        # base model name (no thinking).
+        return "thinking" in self.model
 
     @staticmethod
     def _build_content_blocks(text: str) -> list[dict[str, Any]] | str:

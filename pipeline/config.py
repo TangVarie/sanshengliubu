@@ -2,41 +2,37 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.5.2"
+VERSION = "v0.5.3"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "回到 base 模型名 + API thinking 参数（中转站无 -thinking channel）"
+VERSION_NOTES = "全阶段统一 opus-thinking（sonnet 退役）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# Use base model names. The new-api relay routes -thinking suffixed names as
-# separate channels which may not be provisioned. Thinking is enabled via
-# the API `thinking` parameter (Anthropic's official mechanism), and the
-# relay should pass it through. Per-stage thinking control is via
-# STAGE_THINKING_BUDGET below — presence of an entry == use thinking.
+# All stages use claude-opus-4-6-thinking. The vip group on the new-api relay
+# only has thinking channels for opus, not sonnet. Going all-opus simplifies
+# everything and ensures every stage gets extended thinking. Cost is higher
+# (opus output is 5x sonnet) but the user explicitly chose this trade-off.
+#
+# If the -thinking channel ever fails, _call_claude falls back to plain
+# claude-opus-4-6 (no thinking) automatically.
+
+OPUS_THINKING = "claude-opus-4-6-thinking"
 
 MODELS: dict[str, str] = {
-    # 太子 — parsing
-    "crown_prince": "claude-opus-4-6",
-    # 中书省 — strategy (needs Opus depth)
-    "secretariat": "claude-opus-4-6",
-    # 门下省 — review (needs Opus for critical analysis)
-    "chancellery": "claude-opus-4-6",
-    # 尚书省 — task splitting
-    "dispatcher": "claude-sonnet-4-6",
-    # 六部 — execution (Sonnet for parallel quality)
-    "ministry_personnel": "claude-sonnet-4-6",
-    "ministry_revenue": "claude-sonnet-4-6",
-    "ministry_rites": "claude-sonnet-4-6",
-    "ministry_war": "claude-sonnet-4-6",
-    "ministry_justice": "claude-sonnet-4-6",
-    # 工部 — architect (Opus), cell planner (Sonnet batched), builder (Sonnet batched)
-    "ministry_works": "claude-opus-4-6",
-    "ministry_works_cell_planner": "claude-sonnet-4-6",
-    "ministry_works_builder": "claude-sonnet-4-6",
-    # 网感复检循环
-    "vibe_critic": "claude-sonnet-4-6",
-    "vibe_rewriter": "claude-sonnet-4-6",
-    # 终审
-    "chancellery_final": "claude-opus-4-6",
+    "crown_prince": OPUS_THINKING,
+    "secretariat": OPUS_THINKING,
+    "chancellery": OPUS_THINKING,
+    "dispatcher": OPUS_THINKING,
+    "ministry_personnel": OPUS_THINKING,
+    "ministry_revenue": OPUS_THINKING,
+    "ministry_rites": OPUS_THINKING,
+    "ministry_war": OPUS_THINKING,
+    "ministry_justice": OPUS_THINKING,
+    "ministry_works": OPUS_THINKING,
+    "ministry_works_cell_planner": OPUS_THINKING,
+    "ministry_works_builder": OPUS_THINKING,
+    "vibe_critic": OPUS_THINKING,
+    "vibe_rewriter": OPUS_THINKING,
+    "chancellery_final": OPUS_THINKING,
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -49,38 +45,40 @@ RETRY_BASE_DELAY_SECONDS = 3  # exponential backoff: 3s, 6s
 MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
 
 # ── Token limits ───────────────────────────────────────────────────────────
-# Note: when thinking is enabled, max_tokens must accommodate
-# (thinking_budget + actual_output). All sonnet stages bumped accordingly.
+# All stages run opus-thinking now. max_tokens must accommodate
+# (thinking_budget + actual_output). Headroom kept generous because opus
+# thinking can produce long internal reasoning.
 
-MAX_TOKENS_DEFAULT = 8000
-MAX_TOKENS_STRATEGY = 32000  # Opus stages with thinking need more headroom
+MAX_TOKENS_DEFAULT = 16000
+MAX_TOKENS_STRATEGY = 32000  # strategy/review stages need most room
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
-    "dispatcher": 16000,  # thinking + structured task split for 6 ministries
-    # Execution ministries — Sonnet thinking + structured outputs
-    "ministry_personnel": 16000,
-    "ministry_revenue": 16000,
-    "ministry_rites": 16000,
-    "ministry_war": 16000,
-    "ministry_justice": 16000,
-    "ministry_works": MAX_TOKENS_STRATEGY,  # architect — Opus
-    "ministry_works_cell_planner": 16000,
-    "ministry_works_builder": 20000,  # self-contained prompts are larger
-    "vibe_critic": 16000,  # critic now richer (gut_call + taste_match + diagnostics)
-    "vibe_rewriter": 20000,
+    "dispatcher": 20000,
+    "ministry_personnel": 20000,
+    "ministry_revenue": 20000,
+    "ministry_rites": 20000,
+    "ministry_war": 20000,
+    "ministry_justice": 20000,
+    "ministry_works": MAX_TOKENS_STRATEGY,        # architect — global skeleton
+    "ministry_works_cell_planner": 20000,
+    "ministry_works_builder": 24000,              # self-contained prompts
+    "vibe_critic": 20000,
+    "vibe_rewriter": 24000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-MATRIX_BATCH_CONCURRENCY = 5    # max parallel builder calls
+# Concurrency lowered from 5 → 3 because every call is now opus-thinking,
+# which is heavy on the relay. Slower but more stable.
+MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
 MATRIX_CELLS_PER_BATCH = 3      # cells per builder call
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
-CELL_PLANNER_CONCURRENCY = 5    # max parallel cell-planner calls
+CELL_PLANNER_CONCURRENCY = 3    # max parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # Both Opus and Sonnet stages use thinking. Sonnet gets a smaller default
@@ -113,11 +111,13 @@ STAGE_THINKING_BUDGET: dict[str, int] = {
 # tokens are billed as output tokens.
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    "claude-opus-4-6-thinking": 15.0,
     "claude-opus-4-6": 15.0,
-    "claude-sonnet-4-6": 3.0,
+    "claude-sonnet-4-6": 3.0,  # legacy run logs may reference this
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-6-thinking": 75.0,
     "claude-opus-4-6": 75.0,
     "claude-sonnet-4-6": 15.0,
 }
