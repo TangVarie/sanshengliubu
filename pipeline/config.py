@@ -1,5 +1,11 @@
 """Pipeline configuration — model assignments, retry strategy, constants."""
 
+# ── Version ────────────────────────────────────────────────────────────────
+# Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
+VERSION = "v0.5.0"
+VERSION_DATE = "2026-04-07"
+VERSION_NOTES = "全阶段 thinking + 网感味道匹配 + borderline 中间档"
+
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use -thinking variants. The proxy/relay routes -thinking suffixed
 # model IDs to the extended-thinking-enabled backend. Opus for strategy/review,

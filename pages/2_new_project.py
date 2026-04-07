@@ -4,8 +4,10 @@ import base64
 import io
 
 import streamlit as st
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="新建项目", page_icon="📝", layout="wide")
+show_version_badge()
 st.title("📝 新建 Prompt 工程项目")
 
 

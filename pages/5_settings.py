@@ -1,10 +1,13 @@
 """设置 — API keys, model preferences, Supabase status."""
 
 import streamlit as st
-from pipeline.config import MODELS, PIPELINE_STAGES
+from pipeline.config import MODELS, PIPELINE_STAGES, VERSION, VERSION_DATE, VERSION_NOTES
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="设置", page_icon="⚙️")
+show_version_badge()
 st.title("⚙️ 设置")
+st.info(f"**当前版本** `{VERSION}` · {VERSION_DATE} — {VERSION_NOTES}")
 
 # ── Connection Status ──────────────────────────────────────────────────────
 

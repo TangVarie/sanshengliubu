@@ -5,8 +5,10 @@ import json
 import streamlit as st
 from db.supabase_client import SupabaseClient
 from utils.export import export_as_markdown, export_as_json
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="产出中心", page_icon="📦", layout="wide")
+show_version_badge()
 st.title("📦 产出中心")
 
 project_id = st.session_state.get("current_project_id") or st.query_params.get("project_id")

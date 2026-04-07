@@ -7,8 +7,10 @@ import time
 import streamlit as st
 from db.supabase_client import SupabaseClient
 from pipeline.config import PIPELINE_STAGES, POLL_INTERVAL_SECONDS
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
+show_version_badge()
 
 
 def render_stage_output(output_data: dict):
