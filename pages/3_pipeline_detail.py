@@ -87,6 +87,9 @@ STAGE_DISPLAY_NAMES = {
     "ministry_works": "工部·架构",
     "ministry_works_cell_planner": "工部·格子规划",
     "ministry_works_builder": "工部·构建",
+    "vibe_critic": "网感复检",
+    "vibe_rewriter": "网感重写",
+    "chancellery_final": "终审",
 }
 
 needs_input_logs = [

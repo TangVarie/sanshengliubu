@@ -67,19 +67,6 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
                         lines.append(f"- `{{{{{var_name}}}}}`: {var_desc}")
                     lines.append("")
 
-                persona_rules = cell.get("persona_adaptation_rules", {})
-                if persona_rules:
-                    lines.append("#### 人设适配规则")
-                    lines.append("")
-                    for persona_type, rules in persona_rules.items():
-                        lines.append(f"- **{persona_type}**")
-                        if isinstance(rules, dict):
-                            for k, v in rules.items():
-                                lines.append(f"  - {k}: {v}")
-                        else:
-                            lines.append(f"  - {rules}")
-                    lines.append("")
-
                 demo = cell.get("demo_output", "")
                 if demo:
                     lines.append("#### 示例输出")

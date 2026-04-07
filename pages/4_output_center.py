@@ -61,6 +61,7 @@ templates = prompt_system.get("prompt_templates", [])
 
 if matrix:
     st.subheader("Prompt 矩阵")
+    st.caption("每个格子是一个**自包含、可复制粘贴**的完整 system prompt——所有人设规则、防批量感、合规约束都已经内置。复制 system prompt 装载一次，按 user template 填变量即可。")
     platforms = list(dict.fromkeys(c.get("platform", "") for c in matrix))
     platform_tabs = st.tabs(platforms)
 
@@ -69,28 +70,27 @@ if matrix:
             cells = [c for c in matrix if c.get("platform") == platform]
             for cell in cells:
                 label = f"{cell.get('direction_id', '')}: {cell.get('direction_name', '')}"
-                with st.expander(label):
-                    with st.expander("System Prompt", expanded=True):
-                        st.code(cell.get("system_prompt", ""), language=None)
+                with st.expander(label, expanded=False):
+                    st.markdown("**📋 System Prompt**（复制即可使用）")
+                    st.code(cell.get("system_prompt", ""), language="markdown")
 
-                    with st.expander("User Prompt Template"):
-                        st.code(cell.get("user_prompt_template", ""), language=None)
+                    st.markdown("**📝 User Prompt Template**")
+                    st.code(cell.get("user_prompt_template", ""), language="markdown")
 
                     variables = cell.get("variables", {})
                     if variables:
-                        with st.expander("变量说明"):
-                            for var_name, var_desc in variables.items():
-                                st.markdown(f"- `{{{{{var_name}}}}}`: {var_desc}")
-
-                    rules = cell.get("persona_adaptation_rules", {})
-                    if rules:
-                        with st.expander("人设适配规则"):
-                            st.json(rules)
+                        st.markdown("**🔣 变量说明**")
+                        for var_name, var_desc in variables.items():
+                            st.markdown(f"- `{{{{{var_name}}}}}`: {var_desc}")
 
                     demo = cell.get("demo_output", "")
                     if demo:
-                        with st.expander("示例输出"):
-                            st.markdown(demo)
+                        st.markdown("**✨ 示例输出**")
+                        st.markdown(demo)
+
+                    rewrite_summary = cell.get("rewrite_summary")
+                    if rewrite_summary:
+                        st.info(f"🎯 网感重写：{rewrite_summary}")
 
 elif templates:
     # Legacy: direction-based display for old project data
@@ -117,6 +117,16 @@ elif templates:
             if demo:
                 with st.expander("示例输出"):
                     st.markdown(demo)
+
+# Vibe critic summary
+vibe_result = prompt_system.get("vibe_critic_result")
+if vibe_result:
+    verdict = vibe_result.get("verdict", "")
+    summary = vibe_result.get("summary", "")
+    if verdict == "all_pass":
+        st.success(f"🎯 网感复检：全部通过 — {summary}")
+    else:
+        st.warning(f"🎯 网感复检：{verdict} — {summary}")
 
 # Demo outputs section
 demos = prompt_system.get("demo_outputs", [])

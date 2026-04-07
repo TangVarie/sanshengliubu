@@ -22,6 +22,9 @@ MODELS: dict[str, str] = {
     "ministry_works": "claude-opus-4-6",
     "ministry_works_cell_planner": "claude-sonnet-4-6",
     "ministry_works_builder": "claude-sonnet-4-6",
+    # 网感复检循环
+    "vibe_critic": "claude-sonnet-4-6",
+    "vibe_rewriter": "claude-sonnet-4-6",
     # 终审
     "chancellery_final": "claude-opus-4-6",
 }
@@ -52,7 +55,9 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_justice": 8000,
     "ministry_works": 16000,  # architect only — small output, no cell_plans
     "ministry_works_cell_planner": 8000,
-    "ministry_works_builder": 8000,
+    "ministry_works_builder": 12000,  # self-contained prompts are larger
+    "vibe_critic": 8000,
+    "vibe_rewriter": 12000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
@@ -104,5 +109,6 @@ PIPELINE_STAGES = [
     ("ministry_works", "工部·架构", "🏗️"),
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
+    ("vibe_critic", "网感复检", "🎯"),
     ("chancellery_final", "终审", "✅"),
 ]

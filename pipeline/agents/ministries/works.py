@@ -19,3 +19,15 @@ class WorksBuilder(BaseAgent):
     """工部构建者 — generates actual prompts per cell batch."""
     stage_name = "ministry_works_builder"
     prompt_file = "ministries/works_builder.md"
+
+
+class VibeCritic(BaseAgent):
+    """网感复检官 — evaluates demo_outputs against per-platform vibe checklists."""
+    stage_name = "vibe_critic"
+    prompt_file = "vibe_critic.md"
+
+
+class VibeRewriter(BaseAgent):
+    """网感重写者 — rewrites system_prompt for cells that failed vibe critic."""
+    stage_name = "vibe_rewriter"
+    prompt_file = "vibe_rewriter.md"

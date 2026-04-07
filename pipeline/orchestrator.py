@@ -27,7 +27,13 @@ from pipeline.agents.ministries.revenue import Revenue
 from pipeline.agents.ministries.rites import Rites
 from pipeline.agents.ministries.war import War
 from pipeline.agents.ministries.justice import Justice
-from pipeline.agents.ministries.works import Works, WorksCellPlanner, WorksBuilder
+from pipeline.agents.ministries.works import (
+    Works,
+    WorksCellPlanner,
+    WorksBuilder,
+    VibeCritic,
+    VibeRewriter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,8 @@ class PipelineOrchestrator:
         self.works = Works()
         self.works_cell_planner = WorksCellPlanner()
         self.works_builder = WorksBuilder()
+        self.vibe_critic = VibeCritic()
+        self.vibe_rewriter = VibeRewriter()
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -201,6 +209,9 @@ class PipelineOrchestrator:
                     f"works_plan keys: {list(works_plan.keys())}"
                 )
 
+            # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
+            final_system = await self._run_vibe_loop(final_system)
+
             # 6. 门下省终审
             final_review = await self.chancellery.run_final_review(
                 final_system, plan, structured_brief, self.run_id, self.db
@@ -256,11 +267,11 @@ class PipelineOrchestrator:
     async def _run_ministries(
         self, tasks: dict, brief: dict, plan: dict, done: dict | None = None
     ) -> dict:
-        """Run first 5 ministries in parallel, skip already-completed ones."""
+        """Run first 5 ministries in parallel. Any failure aborts the pipeline."""
         task_map = tasks.get("tasks", {})
         done = done or {}
 
-        async def run_one(name: str) -> tuple[str, dict | None]:
+        async def run_one(name: str) -> tuple[str, dict]:
             # Skip if already completed in a previous run attempt
             if name in done:
                 logger.info(f"Resuming: skipping {name} (already completed)")
@@ -276,15 +287,18 @@ class PipelineOrchestrator:
             try:
                 result = await self._run_with_clarification(agent, input_data)
                 return name, result
-            except Exception:
-                logger.exception(f"Ministry {name} failed, marking as skipped")
-                return name, None
+            except Exception as e:
+                # Do NOT silently swallow — a failed ministry means the
+                # downstream output will be broken. Surface the error so the
+                # pipeline marks itself failed and the user can resume.
+                logger.exception(f"Ministry {name} failed: {e}")
+                raise RuntimeError(f"{name} 执行失败：{e}") from e
 
         results = await asyncio.gather(
             *[run_one(name) for name in self.ministries]
         )
 
-        return {name: output for name, output in results if output is not None}
+        return {name: output for name, output in results}
 
     async def _run_cell_planners(
         self,
@@ -449,8 +463,97 @@ class PipelineOrchestrator:
             "batch_rules": works_plan.get("batch_rules", {}),
             "usage_guide": works_plan.get("usage_guide", ""),
             "demo_outputs": all_demos,
+            "shared_skeleton": works_plan.get("shared_skeleton", {}),
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
         }
+
+    async def _run_vibe_loop(self, final_system: dict) -> dict:
+        """Critic → Rewriter loop. Up to 2 iterations.
+
+        网感不行 = system_prompt 设计有缺陷 → 重写 system_prompt（不是改 demo）。
+        """
+        max_iterations = 2
+        prompt_cells = final_system.get("prompt_matrix", [])
+        if not prompt_cells:
+            logger.warning("Vibe loop skipped: no prompt_cells")
+            return final_system
+
+        shared_skeleton = final_system.get("shared_skeleton", {})
+
+        for iteration in range(max_iterations):
+            logger.info(f"Vibe loop iteration {iteration + 1}/{max_iterations}")
+
+            # Critic input: only the fields critic needs
+            critic_input = {
+                "prompt_cells": [
+                    {
+                        "cell_id": c.get("cell_id"),
+                        "direction_id": c.get("direction_id"),
+                        "direction_name": c.get("direction_name"),
+                        "platform": c.get("platform"),
+                        "system_prompt": c.get("system_prompt", ""),
+                        "demo_output": c.get("demo_output", ""),
+                    }
+                    for c in prompt_cells
+                ]
+            }
+            try:
+                critic_result = await self.vibe_critic.run(
+                    critic_input, self.run_id, self.db
+                )
+            except Exception as e:
+                logger.warning(f"Vibe critic failed ({e}), proceeding without critique")
+                break
+
+            failed = critic_result.get("failed_cells", [])
+            if not failed:
+                logger.info(f"Vibe critic passed all {len(prompt_cells)} cells "
+                            f"on iteration {iteration + 1}")
+                final_system["vibe_critic_result"] = critic_result
+                return final_system
+
+            logger.warning(
+                f"Vibe critic iteration {iteration + 1}: "
+                f"{len(failed)}/{len(prompt_cells)} cells failed"
+            )
+
+            # Build rewrite input — failed cells with their original prompts + directives
+            failed_ids = {f["cell_id"] for f in failed}
+            directive_map = {f["cell_id"]: f.get("rewrite_directives", "") for f in failed}
+            failed_full_cells = [
+                {**c, "rewrite_directives": directive_map[c["cell_id"]]}
+                for c in prompt_cells
+                if c.get("cell_id") in failed_ids
+            ]
+
+            try:
+                rewritten = await self.vibe_rewriter.run(
+                    {
+                        "failed_cells": failed_full_cells,
+                        "shared_skeleton": shared_skeleton,
+                    },
+                    self.run_id,
+                    self.db,
+                )
+            except Exception as e:
+                logger.warning(f"Vibe rewriter failed ({e}), keeping original cells")
+                break
+
+            new_cells_by_id = {
+                c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
+            }
+            prompt_cells = [
+                new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
+            ]
+            final_system["prompt_matrix"] = prompt_cells
+            final_system["prompt_templates"] = prompt_cells
+
+        # Out of iterations
+        logger.warning(
+            f"Vibe loop exhausted {max_iterations} iterations, "
+            "proceeding with remaining issues"
+        )
+        return final_system
 
 
 def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
