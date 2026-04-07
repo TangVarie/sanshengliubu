@@ -80,10 +80,11 @@ class BaseAgent:
 
     @property
     def _use_thinking(self) -> bool:
-        # Model name is the switch: any model with "thinking" in its ID uses
-        # extended thinking. This lets config.py control thinking per-stage
-        # purely by model assignment.
-        return "thinking" in self.model
+        # Stage-level switch: any stage that has an entry in STAGE_THINKING_BUDGET
+        # uses extended thinking. The model itself is always the base name (the
+        # relay channels for -thinking suffixed names may not be provisioned),
+        # and thinking is enabled via the API `thinking` parameter.
+        return self.stage_name in STAGE_THINKING_BUDGET
 
     @staticmethod
     def _build_content_blocks(text: str) -> list[dict[str, Any]] | str:

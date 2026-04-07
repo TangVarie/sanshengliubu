@@ -2,39 +2,41 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.5.1"
+VERSION = "v0.5.2"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "诊断修复：失败阶段必显错误信息 + 模型回退兜底"
+VERSION_NOTES = "回到 base 模型名 + API thinking 参数（中转站无 -thinking channel）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# All stages use -thinking variants. The proxy/relay routes -thinking suffixed
-# model IDs to the extended-thinking-enabled backend. Opus for strategy/review,
-# Sonnet for execution; both with thinking on.
+# Use base model names. The new-api relay routes -thinking suffixed names as
+# separate channels which may not be provisioned. Thinking is enabled via
+# the API `thinking` parameter (Anthropic's official mechanism), and the
+# relay should pass it through. Per-stage thinking control is via
+# STAGE_THINKING_BUDGET below — presence of an entry == use thinking.
 
 MODELS: dict[str, str] = {
     # 太子 — parsing
-    "crown_prince": "claude-opus-4-6-thinking",
+    "crown_prince": "claude-opus-4-6",
     # 中书省 — strategy (needs Opus depth)
-    "secretariat": "claude-opus-4-6-thinking",
+    "secretariat": "claude-opus-4-6",
     # 门下省 — review (needs Opus for critical analysis)
-    "chancellery": "claude-opus-4-6-thinking",
+    "chancellery": "claude-opus-4-6",
     # 尚书省 — task splitting
-    "dispatcher": "claude-sonnet-4-6-thinking",
-    # 六部 — execution (Sonnet thinking for parallel quality)
-    "ministry_personnel": "claude-sonnet-4-6-thinking",
-    "ministry_revenue": "claude-sonnet-4-6-thinking",
-    "ministry_rites": "claude-sonnet-4-6-thinking",
-    "ministry_war": "claude-sonnet-4-6-thinking",
-    "ministry_justice": "claude-sonnet-4-6-thinking",
+    "dispatcher": "claude-sonnet-4-6",
+    # 六部 — execution (Sonnet for parallel quality)
+    "ministry_personnel": "claude-sonnet-4-6",
+    "ministry_revenue": "claude-sonnet-4-6",
+    "ministry_rites": "claude-sonnet-4-6",
+    "ministry_war": "claude-sonnet-4-6",
+    "ministry_justice": "claude-sonnet-4-6",
     # 工部 — architect (Opus), cell planner (Sonnet batched), builder (Sonnet batched)
-    "ministry_works": "claude-opus-4-6-thinking",
-    "ministry_works_cell_planner": "claude-sonnet-4-6-thinking",
-    "ministry_works_builder": "claude-sonnet-4-6-thinking",
+    "ministry_works": "claude-opus-4-6",
+    "ministry_works_cell_planner": "claude-sonnet-4-6",
+    "ministry_works_builder": "claude-sonnet-4-6",
     # 网感复检循环
-    "vibe_critic": "claude-sonnet-4-6-thinking",
-    "vibe_rewriter": "claude-sonnet-4-6-thinking",
+    "vibe_critic": "claude-sonnet-4-6",
+    "vibe_rewriter": "claude-sonnet-4-6",
     # 终审
-    "chancellery_final": "claude-opus-4-6-thinking",
+    "chancellery_final": "claude-opus-4-6",
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -111,16 +113,11 @@ STAGE_THINKING_BUDGET: dict[str, int] = {
 # tokens are billed as output tokens.
 
 COST_PER_1M_INPUT: dict[str, float] = {
-    "claude-opus-4-6-thinking": 15.0,
-    "claude-sonnet-4-6-thinking": 3.0,
-    # Keep base names for backward compatibility with old run logs
     "claude-opus-4-6": 15.0,
     "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
-    "claude-opus-4-6-thinking": 75.0,
-    "claude-sonnet-4-6-thinking": 15.0,
     "claude-opus-4-6": 75.0,
     "claude-sonnet-4-6": 15.0,
 }
