@@ -299,8 +299,12 @@ class BaseAgent:
             return None  # Not a truncation issue
 
         # Try cut points from most recent to earliest (keep as much data as possible)
-        for cp in reversed(cut_points[-50:]):  # check last 50 cut points
-            candidate = fragment[:cp].rstrip().rstrip(",")
+        for cp in reversed(cut_points[-200:]):  # check last 200 cut points
+            candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
+            # Strip dangling `"key":` (key with no value, left when cut mid-value)
+            candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)
+            candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)
+            candidate = candidate.rstrip().rstrip(",")
 
             # Recount open brackets for this candidate
             ob, obrk, ins, esc = 0, 0, False, False

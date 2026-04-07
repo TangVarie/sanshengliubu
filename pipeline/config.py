@@ -44,6 +44,12 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
+    # Execution ministries — Sonnet, large structured outputs
+    "ministry_personnel": 8000,
+    "ministry_revenue": 8000,
+    "ministry_rites": 8000,
+    "ministry_war": 8000,
+    "ministry_justice": 8000,
     "ministry_works": 16000,  # architect only — small output, no cell_plans
     "ministry_works_cell_planner": 8000,
     "ministry_works_builder": 8000,
