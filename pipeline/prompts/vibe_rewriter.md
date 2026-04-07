@@ -89,12 +89,34 @@ system_prompt 里必须有这段：
 
 ## 输入
 
-`failed_cells`：每个 cell 包含原 system_prompt + 原 demo_output + 复检官的 `rewrite_directives` + `issues`。
+`failed_cells`：每个 cell 包含原 system_prompt + 原 demo_output + 复检官的 `rewrite_directives` + `severity`（`borderline` 或 `fail`） + 可能的 `taste_gap`。
 `shared_skeleton`：可参考的差异化工具包等共享元素。
+
+## 严重度区分（必读）
+
+复检官给每个失败 cell 标了 `severity`，你必须按严重度采取不同的改写力度，**不要一刀切全部推倒重写**：
+
+### `severity == "borderline"` — 微调模式
+
+含义：方向对、味道接近真人爆款，但**差一截**——可能是第一句太长、缺一个具体物证、钩子太隐、反差不够狠。原 system_prompt 的整体结构是对的，**不要推倒**。
+
+操作：
+- **保留**原 system_prompt 的人设、关键词、合规、平台调性、骨架结构
+- **只针对** `taste_gap` 描述的具体差点做局部加强：可能是加一条第一句的字数限制、可能是加一条"必须出现具体物证名词"的硬约束、可能是把"分享"动词全部替换成事件触发动词
+- **重写后的 system_prompt 应当看起来和原版高度相似**，只是多了 1-3 条针对性约束
+- 重新跑 demo_output，新第一句必须能消除 `taste_gap` 描述的那个问题
+
+### `severity == "fail"` — 重写模式
+
+含义：味道完全不对，根因在 system_prompt 缺少核心机制（第一句话强制规则 / 真人参照样本 / 具体性硬指标 / 反 AI 禁用清单）。原 prompt 的脚手架坏了，需要补齐。
+
+操作：按本文档下面"重写时必须做的事"的全部 4 步执行——把第一句话规则、具体性硬指标、差异化机制、新 demo 全部补齐。
+
+---
 
 ## 重写规则
 
-1. **不要小修小补**——把 `rewrite_directives` 里所有结构性问题全部解决。如果原 prompt 缺第一句话规则，加上；缺反 AI 腔禁用清单，加上；缺差异化指令，加上。
+1. **按 `severity` 决定改写力度**——`borderline` 微调，`fail` 重写。不要把 borderline 当 fail 处理，那会破坏原本就对的方向；也不要把 fail 当 borderline 处理，那会留下根因。
 2. **业务核心内容必须延续**——合规规则、关键词、人设设定、平台调性这些不能删，只是增加和强化。
 3. **保留原始字段不动**：cell_id、direction_id、direction_name、platform、user_prompt_template、variables 都不动，只重写 system_prompt 和 demo_output。
 4. **重写后必须自检一遍**：用新 system_prompt 跑出的 demo，第一句话能不能让你停下手指？不能 → 重写。
@@ -115,7 +137,8 @@ system_prompt 里必须有这段：
       "user_prompt_template": "（保留原值）",
       "variables": { "（保留原值）": "..." },
       "demo_output": "（用新 system_prompt 跑出的、明显有网感的新示例。第一句必须命中六大驱动之一）",
-      "rewrite_summary": "本次重写解决的核心根因：1) 原 prompt 没有第一句话规则 → 已硬塞 2) 缺具体性硬指标 → 已加 3) 差异化指令太弱 → 重写为可执行机制"
+      "rewrite_mode": "borderline_tweak | full_rewrite",
+      "rewrite_summary": "本次改写解决的具体问题：(borderline) 只加了第一句字数限制 + 强制物证名词 / (full_rewrite) 补齐了第一句强制规则 + 真人参照样本 + 具体性硬指标 + 反 AI 禁用清单"
     }
   ]
 }

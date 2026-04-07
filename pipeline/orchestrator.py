@@ -517,11 +517,16 @@ class PipelineOrchestrator:
                 f"{len(failed)}/{len(prompt_cells)} cells failed"
             )
 
-            # Build rewrite input — failed cells with their original prompts + directives
+            # Build rewrite input — failed cells with their original prompts + critic feedback
             failed_ids = {f["cell_id"] for f in failed}
-            directive_map = {f["cell_id"]: f.get("rewrite_directives", "") for f in failed}
+            critic_map = {f["cell_id"]: f for f in failed}
             failed_full_cells = [
-                {**c, "rewrite_directives": directive_map[c["cell_id"]]}
+                {
+                    **c,
+                    "rewrite_directives": critic_map[c["cell_id"]].get("rewrite_directives", ""),
+                    "severity": critic_map[c["cell_id"]].get("severity", "fail"),
+                    "taste_gap": critic_map[c["cell_id"]].get("taste_gap", ""),
+                }
                 for c in prompt_cells
                 if c.get("cell_id") in failed_ids
             ]
