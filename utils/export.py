@@ -20,9 +20,10 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
         lines.append(guide)
         lines.append("")
 
-    # Prompt matrix (platform → direction) or legacy templates
-    matrix = prompt_system.get("prompt_matrix", [])
-    templates = prompt_system.get("prompt_templates", [])
+    # Prompt matrix (platform → direction). Old runs may have only
+    # `prompt_templates` (now removed in v0.6.1) — fall back for legacy data.
+    matrix = prompt_system.get("prompt_matrix", []) or prompt_system.get("prompt_templates", [])
+    templates = prompt_system.get("prompt_templates", []) if not matrix else []
 
     if matrix:
         # Group by platform

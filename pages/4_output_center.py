@@ -57,9 +57,11 @@ if final_review:
     else:
         st.warning(f"⚠️ 终审状态：{verdict}")
 
-# Display prompt matrix (platform → direction) or legacy templates
-matrix = prompt_system.get("prompt_matrix", [])
-templates = prompt_system.get("prompt_templates", [])
+# Display prompt matrix (platform → direction).
+# Old runs (pre-v0.6.1) had a duplicate `prompt_templates` field that was
+# identical to `prompt_matrix` — fall back to it for backwards compatibility.
+matrix = prompt_system.get("prompt_matrix", []) or prompt_system.get("prompt_templates", [])
+templates = prompt_system.get("prompt_templates", []) if not matrix else []
 
 if matrix:
     st.subheader("Prompt 矩阵")

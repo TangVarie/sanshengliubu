@@ -420,8 +420,57 @@ class PipelineOrchestrator:
             f"(size={CELL_PLANNER_BATCH_SIZE}, concurrency={CELL_PLANNER_CONCURRENCY})"
         )
 
+        async def plan_single_cell(cell: dict, parent_batch_idx: int) -> dict | None:
+            """Cell-level retry: run cell_planner with a single cell as input.
+            Returns the cell_plan dict on success, None on failure.
+            """
+            cid = cell.get("cell_id")
+            try:
+                single_input = {
+                    "active_cells": [cell],
+                    "shared_skeleton": shared_skeleton,
+                    "ministry_outputs": ministry_outputs,
+                    "brief": brief,
+                    "plan_summary": {
+                        "tactical_directions": plan.get("tactical_directions", []),
+                        "target_platforms": plan.get("target_platforms", []),
+                    },
+                    "_strict_contract": (
+                        f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
+                        f"现在只给你一个 cell，你必须完整输出它的 cell_plan。"
+                        f"输出的 cell_plans 数组长度必须是 1，cell_id 必须是 '{cid}'。"
+                    ),
+                }
+                result = await self.works_cell_planner.run(
+                    single_input, self.run_id, self.db
+                )
+                plans = result.get("cell_plans", []) or []
+                for p in plans:
+                    if isinstance(p, dict) and p.get("cell_id") == cid:
+                        logger.info(f"[cell_planner cell-retry] recovered {cid}")
+                        return p
+                # Got a response but the right cell_id wasn't there — accept first
+                # plan if we got one, with cell_id corrected
+                if plans and isinstance(plans[0], dict):
+                    plans[0]["cell_id"] = cid
+                    plans[0]["direction_id"] = cell.get("direction_id", plans[0].get("direction_id", ""))
+                    plans[0]["platform"] = cell.get("platform", plans[0].get("platform", ""))
+                    logger.warning(
+                        f"[cell_planner cell-retry] {cid} returned with wrong cell_id, "
+                        f"forcing correction"
+                    )
+                    return plans[0]
+                logger.error(f"[cell_planner cell-retry] {cid} returned empty plans")
+                return None
+            except Exception as e:
+                logger.error(f"[cell_planner cell-retry] {cid} failed: {e!r}")
+                return None
+
         async def plan_batch(batch: list, batch_idx: int) -> list[dict]:
-            """Run one batch and validate output count. Retry once if short."""
+            """Run one batch and validate output count.
+            Strategy: batch call → batch retry → per-cell retries → hard fail.
+            No more silent stubs.
+            """
             async with semaphore:
                 expected_ids = [c.get("cell_id") for c in batch]
                 expected_n = len(batch)
@@ -449,76 +498,69 @@ class PipelineOrchestrator:
                         batch_input, self.run_id, self.db
                     )
 
+                # Round 1: batch call
                 result = await _call()
                 returned = result.get("cell_plans", []) or []
-                returned_ids = {p.get("cell_id") for p in returned if isinstance(p, dict)}
-                missing_ids = [cid for cid in expected_ids if cid not in returned_ids]
+                merged_by_id: dict[str, dict] = {
+                    p["cell_id"]: p for p in returned
+                    if isinstance(p, dict) and p.get("cell_id") in expected_ids
+                }
+                missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
+                # Round 2: batch retry (only if anything missing)
                 if missing_ids:
                     logger.warning(
                         f"[cell_planner batch {batch_idx}] short return: "
                         f"expected {expected_n} ({expected_ids}), "
-                        f"got {len(returned)} ({sorted(returned_ids)}). "
-                        f"Missing: {missing_ids}. Retrying with explicit list..."
+                        f"got {sorted(merged_by_id.keys())}. "
+                        f"Missing: {missing_ids}. Round 2: batch retry..."
                     )
                     try:
                         retry_result = await _call(
-                            f"上一次只返回了 {sorted(returned_ids)}，"
+                            f"上一次只返回了 {sorted(merged_by_id.keys())}，"
                             f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。"
                         )
-                        retry_plans = retry_result.get("cell_plans", []) or []
-                        retry_ids = {p.get("cell_id") for p in retry_plans if isinstance(p, dict)}
-                        # Merge: prefer retry version, fall back to first attempt
-                        merged_by_id: dict[str, dict] = {}
-                        for p in returned:
-                            if isinstance(p, dict) and p.get("cell_id"):
+                        for p in retry_result.get("cell_plans", []) or []:
+                            if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                                 merged_by_id[p["cell_id"]] = p
-                        for p in retry_plans:
-                            if isinstance(p, dict) and p.get("cell_id"):
-                                merged_by_id[p["cell_id"]] = p
-                        returned = list(merged_by_id.values())
-                        returned_ids = set(merged_by_id.keys())
-                        missing_ids = [cid for cid in expected_ids if cid not in returned_ids]
-                        if missing_ids:
-                            logger.error(
-                                f"[cell_planner batch {batch_idx}] still missing after retry: "
-                                f"{missing_ids}. Falling back to stub plans for these."
-                            )
+                        missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
                     except Exception as e:
                         logger.error(
-                            f"[cell_planner batch {batch_idx}] retry failed: {e!r}. "
-                            f"Falling back to stubs for missing cells."
+                            f"[cell_planner batch {batch_idx}] batch retry exception: {e!r}"
                         )
 
-                # Stub-fill any still-missing cells so downstream stages don't lose them.
-                # Stubs are minimal but contain the cell metadata so the builder can at
-                # least produce something for that direction × platform.
+                # Round 3: per-cell retry for stubborn missing cells
                 if missing_ids:
+                    logger.warning(
+                        f"[cell_planner batch {batch_idx}] Round 3: per-cell retry for "
+                        f"{missing_ids}"
+                    )
                     by_id = {c.get("cell_id"): c for c in batch}
-                    stub_skeleton = shared_skeleton or {}
-                    for cid in missing_ids:
-                        src = by_id.get(cid, {})
-                        returned.append({
-                            "cell_id": cid,
-                            "direction_id": src.get("direction_id", ""),
-                            "direction_name": src.get("direction_name", ""),
-                            "platform": src.get("platform", ""),
-                            "platform_content_logic": (
-                                f"⚠️ 自动 stub：cell_planner 未返回此 cell。"
-                                f"按 {src.get('platform', '该平台')} 的通用内容逻辑处理。"
-                            ),
-                            "persona_strategy_notes": "（自动 stub — 使用通用人设差异化）",
-                            "applicable_personas": [],
-                            "ministry_digest": {
-                                "keywords": "（自动 stub — 使用 brief 关键词）",
-                                "tone": "（自动 stub — 使用平台通用调性）",
-                                "competition": "（自动 stub）",
-                                "personas": "（自动 stub）",
-                            },
-                            "_stub": True,
-                        })
+                    cell_retry_tasks = [
+                        plan_single_cell(by_id[cid], batch_idx)
+                        for cid in missing_ids
+                        if cid in by_id
+                    ]
+                    cell_retry_results = await asyncio.gather(*cell_retry_tasks)
+                    for cid, single_plan in zip(missing_ids, cell_retry_results):
+                        if single_plan is not None:
+                            merged_by_id[cid] = single_plan
+                    missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
-                return returned
+                if missing_ids:
+                    # All three rounds failed — surface a clear error.
+                    # We deliberately do NOT stub-fill anymore: stubs were creating
+                    # garbage that downstream stages couldn't distinguish from real
+                    # output, and final review correctly rejected them as incomplete.
+                    raise RuntimeError(
+                        f"[cell_planner batch {batch_idx}] cell_planner 三轮尝试后仍缺失 "
+                        f"{missing_ids}（batch 调用 → batch 重试 → 单 cell 重试都失败）。"
+                        f"已成功的 cell: {sorted(merged_by_id.keys())}。"
+                        f"请检查 stage_logs 看每次调用的实际返回。"
+                    )
+
+                # Return in the same order as expected_ids
+                return [merged_by_id[cid] for cid in expected_ids]
 
         results = await asyncio.gather(
             *[plan_batch(b, i) for i, b in enumerate(batches)]
@@ -530,17 +572,14 @@ class PipelineOrchestrator:
             all_cell_plans.extend(r)
 
         logger.info(
-            f"Cell planner completed: {len(all_cell_plans)}/{len(active_cells)} cell_plans "
-            f"({sum(1 for p in all_cell_plans if p.get('_stub'))} stubs)"
+            f"Cell planner completed: {len(all_cell_plans)}/{len(active_cells)} cell_plans"
         )
 
-        # Hard fail if we lost more than half the cells (something is very broken)
-        if len(all_cell_plans) < len(active_cells) * 0.5:
+        # Sanity check (should never fire now that stubs are gone — batches hard fail)
+        if len(all_cell_plans) != len(active_cells):
             raise RuntimeError(
-                f"工部·格子规划严重缺失：期望 {len(active_cells)} 个 cell_plans，"
-                f"实际只产出 {len(all_cell_plans)} 个。中书省的 tactical_directions 是"
-                f"{[d.get('direction_id') for d in directions if isinstance(d, dict)]}，"
-                f"目标平台 {platforms}。请检查 secretariat 和 works_cell_planner stage_logs。"
+                f"工部·格子规划数量不匹配：期望 {len(active_cells)} 个，"
+                f"实际产出 {len(all_cell_plans)} 个。这是 orchestrator 内部 bug。"
             )
 
         return all_cell_plans
@@ -565,7 +604,6 @@ class PipelineOrchestrator:
             logger.error("No cell_plans to build! works_plan keys: %s", list(works_plan.keys()))
             return {
                 "prompt_matrix": [],
-                "prompt_templates": [],
                 "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
                 "batch_rules": works_plan.get("batch_rules", {}),
                 "usage_guide": works_plan.get("usage_guide", ""),
@@ -584,8 +622,48 @@ class PipelineOrchestrator:
             for i in range(0, len(platform_cells), MATRIX_CELLS_PER_BATCH):
                 batches.append(platform_cells[i : i + MATRIX_CELLS_PER_BATCH])
 
+        async def build_single_cell(cell_plan: dict, parent_batch_idx: int) -> tuple[dict | None, list[dict]]:
+            """Cell-level retry: build a single cell with focused input."""
+            cid = cell_plan.get("cell_id")
+            try:
+                single_input = {
+                    "cell_plans": [cell_plan],
+                    "shared_skeleton": shared_skeleton,
+                    "_strict_contract": (
+                        f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
+                        f"现在只给你一个 cell_plan，你必须完整输出它的 prompt_cell + demo_output。"
+                        f"输出的 prompt_cells 数组长度必须是 1，cell_id 必须是 '{cid}'。"
+                    ),
+                }
+                result = await self.works_builder.run(
+                    single_input, self.run_id, self.db
+                )
+                cells = result.get("prompt_cells", []) or []
+                demos = result.get("demo_outputs", []) or []
+                for p in cells:
+                    if isinstance(p, dict) and p.get("cell_id") == cid:
+                        logger.info(f"[builder cell-retry] recovered {cid}")
+                        return p, demos
+                # Wrong cell_id but got something — accept first and force-correct
+                if cells and isinstance(cells[0], dict):
+                    cells[0]["cell_id"] = cid
+                    cells[0]["direction_id"] = cell_plan.get("direction_id", cells[0].get("direction_id", ""))
+                    cells[0]["platform"] = cell_plan.get("platform", cells[0].get("platform", ""))
+                    logger.warning(
+                        f"[builder cell-retry] {cid} returned with wrong cell_id, forcing correction"
+                    )
+                    return cells[0], demos
+                logger.error(f"[builder cell-retry] {cid} returned empty prompt_cells")
+                return None, demos
+            except Exception as e:
+                logger.error(f"[builder cell-retry] {cid} failed: {e!r}")
+                return None, []
+
         async def build_batch(batch: list[dict], batch_idx: int) -> tuple[list[dict], list[dict]]:
-            """Run one builder batch, validate count, retry once if short, stub-fill rest."""
+            """Run one builder batch.
+            Strategy: batch call → batch retry → per-cell retries → hard fail.
+            No more silent stubs.
+            """
             async with semaphore:
                 expected_ids = [c.get("cell_id") for c in batch]
                 expected_n = len(batch)
@@ -607,70 +685,66 @@ class PipelineOrchestrator:
                         builder_input, self.run_id, self.db
                     )
 
+                # Round 1: batch call
                 result = await _call()
-                returned = result.get("prompt_cells", []) or []
-                returned_ids = {p.get("cell_id") for p in returned if isinstance(p, dict)}
-                missing_ids = [cid for cid in expected_ids if cid not in returned_ids]
+                merged_by_id: dict[str, dict] = {}
+                for p in result.get("prompt_cells", []) or []:
+                    if isinstance(p, dict) and p.get("cell_id") in expected_ids:
+                        merged_by_id[p["cell_id"]] = p
+                merged_demos: list[dict] = list(result.get("demo_outputs", []) or [])
+                missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
+                # Round 2: batch retry
                 if missing_ids:
                     logger.warning(
                         f"[builder batch {batch_idx}] short return: "
                         f"expected {expected_n} ({expected_ids}), "
-                        f"got {len(returned)} ({sorted(returned_ids)}). "
-                        f"Missing: {missing_ids}. Retrying..."
+                        f"got {sorted(merged_by_id.keys())}. "
+                        f"Missing: {missing_ids}. Round 2: batch retry..."
                     )
                     try:
                         retry_result = await _call(
-                            f"上一次只返回了 {sorted(returned_ids)}，"
+                            f"上一次只返回了 {sorted(merged_by_id.keys())}，"
                             f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。"
                         )
-                        retry_cells = retry_result.get("prompt_cells", []) or []
-                        merged_by_id: dict[str, dict] = {}
-                        for p in returned:
-                            if isinstance(p, dict) and p.get("cell_id"):
+                        for p in retry_result.get("prompt_cells", []) or []:
+                            if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                                 merged_by_id[p["cell_id"]] = p
-                        for p in retry_cells:
-                            if isinstance(p, dict) and p.get("cell_id"):
-                                merged_by_id[p["cell_id"]] = p
-                        returned = list(merged_by_id.values())
-                        returned_ids = set(merged_by_id.keys())
-                        missing_ids = [cid for cid in expected_ids if cid not in returned_ids]
-                        # Also merge demo_outputs from retry
-                        retry_demos = retry_result.get("demo_outputs", []) or []
-                        result_demos = result.get("demo_outputs", []) or []
-                        result["demo_outputs"] = result_demos + retry_demos
-                        if missing_ids:
-                            logger.error(
-                                f"[builder batch {batch_idx}] still missing after retry: "
-                                f"{missing_ids}. Falling back to stub prompt_cells."
-                            )
+                        merged_demos.extend(retry_result.get("demo_outputs", []) or [])
+                        missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
                     except Exception as e:
                         logger.error(
-                            f"[builder batch {batch_idx}] retry failed: {e!r}. "
-                            f"Falling back to stubs for missing cells."
+                            f"[builder batch {batch_idx}] batch retry exception: {e!r}"
                         )
 
-                # Stub-fill missing cells so the matrix isn't silently truncated.
+                # Round 3: per-cell retry
                 if missing_ids:
+                    logger.warning(
+                        f"[builder batch {batch_idx}] Round 3: per-cell retry for {missing_ids}"
+                    )
                     by_id = {c.get("cell_id"): c for c in batch}
-                    for cid in missing_ids:
-                        src = by_id.get(cid, {})
-                        returned.append({
-                            "cell_id": cid,
-                            "direction_id": src.get("direction_id", ""),
-                            "direction_name": src.get("direction_name", ""),
-                            "platform": src.get("platform", ""),
-                            "system_prompt": (
-                                f"⚠️ 自动 stub — works_builder 未返回此 cell。\n\n"
-                                f"原 cell_plan:\n{json.dumps(src, ensure_ascii=False, indent=2)}"
-                            ),
-                            "user_prompt_template": "（自动 stub — 请人工补充）",
-                            "variables": {},
-                            "demo_output": "（自动 stub — works_builder 未生成 demo）",
-                            "_stub": True,
-                        })
+                    cell_retry_tasks = [
+                        build_single_cell(by_id[cid], batch_idx)
+                        for cid in missing_ids
+                        if cid in by_id
+                    ]
+                    cell_retry_results = await asyncio.gather(*cell_retry_tasks)
+                    for cid, (single_cell, single_demos) in zip(missing_ids, cell_retry_results):
+                        if single_cell is not None:
+                            merged_by_id[cid] = single_cell
+                        merged_demos.extend(single_demos)
+                    missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
-                return returned, result.get("demo_outputs", []) or []
+                if missing_ids:
+                    raise RuntimeError(
+                        f"[builder batch {batch_idx}] works_builder 三轮尝试后仍缺失 "
+                        f"{missing_ids}（batch 调用 → batch 重试 → 单 cell 重试都失败）。"
+                        f"已成功的 cell: {sorted(merged_by_id.keys())}。"
+                        f"请检查 stage_logs 看每次调用的实际返回。"
+                    )
+
+                # Return in expected order
+                return [merged_by_id[cid] for cid in expected_ids], merged_demos
 
         results = await asyncio.gather(
             *[build_batch(b, i) for i, b in enumerate(batches)]
@@ -680,31 +754,26 @@ class PipelineOrchestrator:
         all_cells: list[dict] = []
         all_demos: list[dict] = []
         for idx, (cells, demos) in enumerate(results):
-            stub_count = sum(1 for c in cells if c.get("_stub"))
             logger.info(
-                f"Builder batch {idx}: {len(cells)} prompt_cells "
-                f"({stub_count} stubs), {len(demos)} demos"
+                f"Builder batch {idx}: {len(cells)} prompt_cells, {len(demos)} demos"
             )
             all_cells.extend(cells)
             all_demos.extend(demos)
 
-        total_stubs = sum(1 for c in all_cells if c.get("_stub"))
         logger.info(
-            f"Works builder completed: {len(all_cells)}/{len(cell_plans)} total prompt_cells "
-            f"({total_stubs} stubs), {len(all_demos)} demos"
+            f"Works builder completed: {len(all_cells)}/{len(cell_plans)} total prompt_cells, "
+            f"{len(all_demos)} demos"
         )
 
-        # Hard fail on severe loss
-        if len(all_cells) < len(cell_plans) * 0.5:
+        # Sanity check (should never fire — batches hard fail above)
+        if len(all_cells) != len(cell_plans):
             raise RuntimeError(
-                f"工部·构建严重缺失：期望 {len(cell_plans)} 个 prompt_cells，"
-                f"实际只产出 {len(all_cells)} 个（{total_stubs} 个 stub）。"
-                f"请检查 works_builder stage_logs 看每个批次的实际返回。"
+                f"工部·构建数量不匹配：期望 {len(cell_plans)} 个，实际产出 {len(all_cells)} 个。"
+                f"这是 orchestrator 内部 bug。"
             )
 
         return {
             "prompt_matrix": all_cells,
-            "prompt_templates": all_cells,  # backward compatibility
             "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
             "batch_rules": works_plan.get("batch_rules", {}),
             "usage_guide": works_plan.get("usage_guide", ""),
@@ -797,7 +866,6 @@ class PipelineOrchestrator:
                 new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
             ]
             final_system["prompt_matrix"] = prompt_cells
-            final_system["prompt_templates"] = prompt_cells
 
         # Out of iterations
         logger.warning(
