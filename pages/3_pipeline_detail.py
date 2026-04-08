@@ -453,7 +453,11 @@ with c2:
     if status != "completed":
         if st.button(
             "▶️ 继续执行",
-            help="从失败/中断处继续，跳过已完成的阶段。如果流水线卡住没有进度，也可以点这个强制恢复。",
+            help=(
+                "从失败/中断处继续。已完成的 stage 直接跳过；工部的格子规划和构建"
+                "还会做 cell 级 resume——扫描之前成功的批次，只重跑真正还没成功的"
+                "cell，不会让已经花过 token 的产出白白重算。"
+            ),
         ):
             from pipeline.orchestrator import resume_pipeline_in_background
             from pipeline.agents import init_api_config

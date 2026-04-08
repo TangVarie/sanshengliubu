@@ -77,6 +77,38 @@ class PipelineOrchestrator:
             if log.get("status") == "completed" and log.get("output_data")
         }
 
+    def _recover_completed_cells(
+        self, stage_name: str, field: str
+    ) -> tuple[dict[str, dict], list[dict]]:
+        """Scan stage_logs for all successful batches of the given stage_name
+        in this run, and collect every {cell_id: cell_dict} that was produced.
+
+        Used for cell-level resume: when the pipeline failed mid-batch, we
+        don't want to re-run the batches that already succeeded. This walks
+        every successful ministry_works_builder (or cell_planner) stage_log,
+        extracts the cells from output_data[field], and de-duplicates by
+        cell_id (later successful log wins).
+
+        Returns: (recovered_cells_by_id, recovered_demo_outputs)
+        """
+        logs = self.db.get_stage_logs(self.run_id)
+        recovered: dict[str, dict] = {}
+        demo_outputs: list[dict] = []
+        for log in logs:
+            if log.get("stage_name") != stage_name:
+                continue
+            if log.get("status") != "completed":
+                continue
+            output = log.get("output_data") or {}
+            for item in output.get(field, []) or []:
+                if isinstance(item, dict) and item.get("cell_id"):
+                    recovered[item["cell_id"]] = item
+            # demo_outputs is builder-specific but harmless to collect for planner too
+            for d in output.get("demo_outputs", []) or []:
+                if isinstance(d, dict):
+                    demo_outputs.append(d)
+        return recovered, demo_outputs
+
     # ── Clarification handling ─────────────────────────────────────────
 
     async def _wait_for_clarification(self, log_id: str) -> dict:
@@ -410,6 +442,38 @@ class PipelineOrchestrator:
         shared_skeleton = works_arch.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(CELL_PLANNER_CONCURRENCY)
 
+        # Cell-level resume: scan this run's stage_logs for any cell_plans that
+        # already completed successfully, so a resume doesn't re-run batches
+        # that already burned tokens producing good output.
+        original_expected_order = list(active_cells)
+        recovered_plans, _ = self._recover_completed_cells(
+            "ministry_works_cell_planner", "cell_plans"
+        )
+        # Keep only recoveries whose cell_id is still in our expected set
+        expected_ids_set = {c.get("cell_id") for c in active_cells}
+        recovered_plans = {
+            cid: plan for cid, plan in recovered_plans.items()
+            if cid in expected_ids_set
+        }
+        if recovered_plans:
+            logger.info(
+                f"[cell_planner resume] recovered {len(recovered_plans)}/{len(active_cells)} "
+                f"cell_plans from prior successful batches: {sorted(recovered_plans.keys())}"
+            )
+            active_cells = [
+                c for c in active_cells
+                if c.get("cell_id") not in recovered_plans
+            ]
+            if not active_cells:
+                logger.info(
+                    "[cell_planner resume] all cells already done, skipping entirely"
+                )
+                return [
+                    recovered_plans[c.get("cell_id")]
+                    for c in original_expected_order
+                    if c.get("cell_id") in recovered_plans
+                ]
+
         # Split into batches
         batches: list[list] = []
         for i in range(0, len(active_cells), CELL_PLANNER_BATCH_SIZE):
@@ -579,20 +643,38 @@ class PipelineOrchestrator:
             *[plan_batch(b, i) for i, b in enumerate(batches)]
         )
 
-        # Merge all batch cell_plans
-        all_cell_plans: list[dict] = []
+        # Merge newly-generated batches
+        new_plans_by_id: dict[str, dict] = {}
         for r in results:
-            all_cell_plans.extend(r)
+            for p in r:
+                if isinstance(p, dict) and p.get("cell_id"):
+                    new_plans_by_id[p["cell_id"]] = p
+
+        # Combine recovered (from prior successful batches) + newly-generated,
+        # preserving the original expected order.
+        all_cell_plans: list[dict] = []
+        for c in original_expected_order:
+            cid = c.get("cell_id")
+            if cid in recovered_plans:
+                all_cell_plans.append(recovered_plans[cid])
+            elif cid in new_plans_by_id:
+                all_cell_plans.append(new_plans_by_id[cid])
 
         logger.info(
-            f"Cell planner completed: {len(all_cell_plans)}/{len(active_cells)} cell_plans"
+            f"Cell planner completed: {len(all_cell_plans)}/{len(original_expected_order)} "
+            f"cell_plans (recovered: {len(recovered_plans)}, new: {len(new_plans_by_id)})"
         )
 
-        # Sanity check (should never fire now that stubs are gone — batches hard fail)
-        if len(all_cell_plans) != len(active_cells):
+        # Sanity check (should never fire — batches hard fail on missing)
+        if len(all_cell_plans) != len(original_expected_order):
+            missing = [
+                c.get("cell_id") for c in original_expected_order
+                if c.get("cell_id") not in recovered_plans
+                and c.get("cell_id") not in new_plans_by_id
+            ]
             raise RuntimeError(
-                f"工部·格子规划数量不匹配：期望 {len(active_cells)} 个，"
-                f"实际产出 {len(all_cell_plans)} 个。这是 orchestrator 内部 bug。"
+                f"工部·格子规划数量不匹配：期望 {len(original_expected_order)} 个，"
+                f"实际产出 {len(all_cell_plans)} 个。缺失 cell_id: {missing}。"
             )
 
         return all_cell_plans
@@ -623,6 +705,45 @@ class PipelineOrchestrator:
                 "demo_outputs": [],
                 "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
             }
+
+        # Cell-level resume: scan prior successful builder batches for cells
+        # that already completed, so we don't re-run them.
+        original_expected_order = list(cell_plans)
+        expected_ids_set = {c.get("cell_id") for c in cell_plans}
+        recovered_cells, recovered_demos = self._recover_completed_cells(
+            "ministry_works_builder", "prompt_cells"
+        )
+        recovered_cells = {
+            cid: cell for cid, cell in recovered_cells.items()
+            if cid in expected_ids_set
+        }
+        if recovered_cells:
+            logger.info(
+                f"[builder resume] recovered {len(recovered_cells)}/{len(cell_plans)} "
+                f"prompt_cells from prior successful batches: {sorted(recovered_cells.keys())}"
+            )
+            cell_plans = [
+                c for c in cell_plans
+                if c.get("cell_id") not in recovered_cells
+            ]
+            if not cell_plans:
+                logger.info(
+                    "[builder resume] all cells already done, skipping entirely"
+                )
+                all_cells_ordered = [
+                    recovered_cells[c.get("cell_id")]
+                    for c in original_expected_order
+                    if c.get("cell_id") in recovered_cells
+                ]
+                return {
+                    "prompt_matrix": all_cells_ordered,
+                    "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
+                    "batch_rules": works_plan.get("batch_rules", {}),
+                    "usage_guide": works_plan.get("usage_guide", ""),
+                    "demo_outputs": recovered_demos,
+                    "shared_skeleton": works_plan.get("shared_skeleton", {}),
+                    "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
+                }
 
         # Group by platform, then split into batches of MATRIX_CELLS_PER_BATCH
         def platform_key(cell: dict) -> str:
@@ -776,26 +897,46 @@ class PipelineOrchestrator:
             *[build_batch(b, i) for i, b in enumerate(batches)]
         )
 
-        # Merge all batch results
-        all_cells: list[dict] = []
-        all_demos: list[dict] = []
+        # Collect newly-generated cells/demos from this run
+        new_cells_by_id: dict[str, dict] = {}
+        new_demos: list[dict] = []
         for idx, (cells, demos) in enumerate(results):
             logger.info(
                 f"Builder batch {idx}: {len(cells)} prompt_cells, {len(demos)} demos"
             )
-            all_cells.extend(cells)
-            all_demos.extend(demos)
+            for c in cells:
+                if isinstance(c, dict) and c.get("cell_id"):
+                    new_cells_by_id[c["cell_id"]] = c
+            new_demos.extend(demos)
+
+        # Merge recovered (from prior successful batches) + newly-generated,
+        # preserving the original expected order.
+        all_cells: list[dict] = []
+        for c in original_expected_order:
+            cid = c.get("cell_id")
+            if cid in recovered_cells:
+                all_cells.append(recovered_cells[cid])
+            elif cid in new_cells_by_id:
+                all_cells.append(new_cells_by_id[cid])
+
+        all_demos = recovered_demos + new_demos
 
         logger.info(
-            f"Works builder completed: {len(all_cells)}/{len(cell_plans)} total prompt_cells, "
+            f"Works builder completed: {len(all_cells)}/{len(original_expected_order)} "
+            f"total prompt_cells (recovered: {len(recovered_cells)}, new: {len(new_cells_by_id)}), "
             f"{len(all_demos)} demos"
         )
 
         # Sanity check (should never fire — batches hard fail above)
-        if len(all_cells) != len(cell_plans):
+        if len(all_cells) != len(original_expected_order):
+            missing = [
+                c.get("cell_id") for c in original_expected_order
+                if c.get("cell_id") not in recovered_cells
+                and c.get("cell_id") not in new_cells_by_id
+            ]
             raise RuntimeError(
-                f"工部·构建数量不匹配：期望 {len(cell_plans)} 个，实际产出 {len(all_cells)} 个。"
-                f"这是 orchestrator 内部 bug。"
+                f"工部·构建数量不匹配：期望 {len(original_expected_order)} 个，"
+                f"实际产出 {len(all_cells)} 个。缺失 cell_id: {missing}。"
             )
 
         return {
