@@ -47,6 +47,7 @@
 7. 每个格子的逻辑必须独立完整——读者只看这一个 cell_plan 就能理解该怎么做
 8. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
 9. 如果输入中包含 `_strict_contract` 字段，那是 orchestrator 给你的硬性提醒，**必须严格遵守**（特别是输入/输出数量必须 1:1）
+9.1 如果输入中包含 `_revision_directives` 字段，说明上一版被终审驳回。把 mandatory_revisions 里与 cell 规划相关的问题（比如"某方向缺人设引用"、"某方向 ministry_digest 关键词错"）反映到你输出的 cell_plan 里，让下游 builder 拿到正确的输入。架构师上一步可能已经更新了 shared_skeleton（如新增 persona_library / title_rules），你要在 ministry_digest 里**引用**这些新模块。
 10. **JSON 卫生（关键）**：所有字符串值中的换行必须用 `\n` 转义符，禁止直接写入真换行符。**字符串内部禁止使用 ASCII 双引号 `"`**——必须改用中文全角引号 `"` `"` 或 `「」`（这些在 JSON 里不需要转义）。所有需要引号的地方（引用、强调、专业术语、商品名）统统用 `「」`。写完脑内过一遍：能不能直接 `json.loads()` 一次通过？
 
 ## 输出格式

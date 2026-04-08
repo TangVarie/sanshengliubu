@@ -123,6 +123,16 @@
 7. demo_output 必须有具体生活细节、具体数字、具体场景，不能停留在"它很好用""值得推荐"这种空话
 8. 不要输出额外的 persona_adaptation_rules 字段——人设规则必须写在 system_prompt 里
 9. 如果输入中包含 `_strict_contract` 字段，那是 orchestrator 给你的硬性提醒，**必须严格遵守**（特别是输入/输出数量必须 1:1）
+
+9.1 **修订模式（最高优先级）**：如果输入中包含 `_revision_directives` 字段，说明上一版整套产出被门下省终审驳回，你必须**针对每个 cell 逐条修复**：
+   - `_revision_directives.mandatory_revisions`：终审给出的必修问题清单。每一条都要在你的新 system_prompt / demo_output 里有明确响应。
+   - `_revision_directives.revision_instructions`：终审写给你的具体修改指令全文。
+   - 修订时必须把 mandatory_revisions 里**与本批次相关的每一条**都解决掉。判断相关性：
+     - 涉及"D2"/"D3"/某个具体方向的：只在该方向的 cell 里修
+     - 涉及"所有 cell"/"全局规则"的：在每个 cell 里都修
+     - 涉及人设/术语/合规/字数的：所有 cell 都遵守新规则
+   - **不能视而不见**：哪怕某条 mandatory_revision 看起来不属于你的范围（比如属于架构师的 persona_library），你也要在 system_prompt 里**引用** shared_skeleton 中新加的对应模块（架构师上一步已经加好了）
+   - 在每个 prompt_cell 输出里加 `_revision_response` 字段，列出你针对哪些 mandatory_revisions 做了什么修改
 10. **输出长度控制（避免被截断）**：
     - 单个 `system_prompt` 控制在 **1500-2500 字符**之间，不要膨胀到 3000+。写法：每个必嵌段落用一行凝练的指令 + 一个具体例子，不要写长段落说明原理。差异化池每项用 5-10 字关键词，不要写完整解释。真人参照样本写 5 条就够，不要超过 8 条。
     - `demo_output` 严格按平台长度（小红书 300-800 字 / 抖音脚本 30-60 秒 / B站简介 200-500 字 / 知乎 500-1500 字 / 微博 ≤150 字），**绝对不要超**。

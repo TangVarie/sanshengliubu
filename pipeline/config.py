@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.6.5"
+VERSION = "v0.7.0"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "cell 级 resume：扫描之前成功的批次，只重跑漏掉的 cell"
+VERSION_NOTES = "终审修订循环：mandatory_revisions 反喂工部，针对性修复后再审"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The

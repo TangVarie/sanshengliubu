@@ -36,6 +36,37 @@
 2. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
 3. 差异化工具包的每个池至少包含 5 个可选项
 4. persona_integration_strategy 必须覆盖所有在吏部输出中出现的人设类型
+5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language），下游 cell 才有人设可用
+6. **shared_skeleton 必须有 title_rules 子模块**——全局标题规则（竖线 `|` 禁令、字数范围、蓝词植入原则、口语化要求），各方向 system_prompt 引用此模块，避免每个方向各写一套互相矛盾
+
+## 修订模式（接收终审驳回反馈时必读）
+
+如果输入中包含 `_revision_directives` 字段，说明上一版产出被门下省终审驳回，你必须**针对性修复**：
+
+- `_revision_directives.mandatory_revisions` 是终审给出的必修问题清单，每一条都必须在你的新输出里有明确响应
+- `_revision_directives.revision_instructions` 是终审写给你的具体修改指令
+- `_revision_directives.review_dimensions` 是终审给的各维度评分
+
+修订时的硬要求：
+1. **逐条对照清单**：mandatory_revisions 里的每一条问题，你在新 shared_skeleton / persona_integration_strategy 里都必须解决，不允许漏掉任何一条。如果某条不属于架构师能解决的（比如 cell 级的 demo 字数），可以在 batch_rules 里加约束让下游 builder 处理。
+2. **持续业务正确**：所有原本对的设计（合规、关键词、人设方法论）保留下来，只针对终审指出的问题做加法或修正，不要推翻整个架构重来。
+3. **架构师能解决的问题清单**（这些必须由你在新版本里直接解决）：
+   - persona_library 缺失 / 不完整 → 在 shared_skeleton 里补齐 P01-PNN 全部人设
+   - title_rules 不统一 / 缺失 / 矛盾 → 在 shared_skeleton 里加全局 title_rules 模块
+   - 跨方向规则冲突 → 在 shared_skeleton 里加全局裁定规则
+   - 差异化工具包不够丰富 → 扩充 narrative_structures / opening_angles / emotion_baselines
+4. **写一个 `_revision_response` 字段**到输出里，列出你针对每条 mandatory_revision 做了什么修改：
+
+```json
+"_revision_response": {
+  "addressed": [
+    {"revision": "原 mandatory_revision 第 N 条原文摘要", "fix": "你做的具体修改"}
+  ],
+  "deferred_to_builder": [
+    {"revision": "属于 cell 级的修改", "directive_for_builder": "下游 builder 应该怎么改"}
+  ]
+}
+```
 
 ## 不确定性传递
 
@@ -60,10 +91,33 @@
     "compliance_block": "刑部合规规则（硬编码进所有 prompt）",
     "keyword_integration_rules": "户部关键词植入通用规则",
     "competition_strategy_block": "兵部竞争策略通用部分",
+    "title_rules": {
+      "forbid_chars": ["|"],
+      "char_range": "标题字数范围（如 12-20 字）",
+      "blue_word_principle": "蓝词植入原则",
+      "tone": "口语化要求"
+    },
+    "persona_library": {
+      "P01": {
+        "name": "人设名（如 北漂小陈）",
+        "age": "28",
+        "occupation": "互联网产品",
+        "city": "北京",
+        "life_scenario": "异地寄送给倔强老爸",
+        "language_style": "克制、轻自嘲、有职场用语痕迹",
+        "personality_tags": ["INFJ", "省钱", "孝顺嘴硬"],
+        "product_relationship": "刚开始用 X，被同事种草",
+        "brand_awareness_level": "中—认知核心卖点但不会熟练复述",
+        "temporal_language": "三月初/上周二/这两天"
+      },
+      "P02": "...（每个人设都要按上面字段写齐）"
+    },
     "differentiation_toolkit": {
       "narrative_structures": ["叙事结构1", "叙事结构2", "...至少5个"],
       "opening_angles": ["切入视角1", "切入视角2", "...至少5个"],
-      "emotion_baselines": ["情绪基调1", "情绪基调2", "...至少5个"]
+      "emotion_baselines": ["情绪基调1", "情绪基调2", "...至少5个"],
+      "closing_styles": ["结尾方式1", "...至少5个"],
+      "information_densities": ["信息密度档1", "...至少5个"]
     }
   },
   "persona_integration_strategy": "人设不是变量替换，是内容策略调整。说明每种人设类型对内容的影响维度",

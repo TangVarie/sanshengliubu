@@ -103,7 +103,38 @@ if status == "needs_revision":
                 if _instructions:
                     with st.expander("📋 修改指令", expanded=True):
                         st.markdown(_instructions)
-                st.caption("可以点击下方「重新执行」按钮从头开始一次完整的流水线。")
+
+                # ── Apply revision button ─────────────────────────────────
+                st.markdown("---")
+                st.markdown(
+                    "**应用修订**：把上面的 mandatory_revisions 反喂给工部，"
+                    "只重跑 工部架构 → 格子规划 → 构建 → 网感复检 → 终审，"
+                    "保留前面已完成的太子/中书省/尚书省/五部，不浪费 token。"
+                )
+                if st.button(
+                    "✅ 应用修订意见并重跑工部",
+                    type="primary",
+                    key="apply_revision_btn",
+                    help="读取终审的 mandatory_revisions 和 revision_instructions，"
+                         "存到 project.brief._revision_context，删除 ministry_works/"
+                         "cell_planner/builder/vibe_critic/vibe_rewriter/chancellery_final 的 "
+                         "stage_logs，然后触发 resume — 工部会拿到修订指令做针对性修复。",
+                ):
+                    from pipeline.orchestrator import revise_and_resume_pipeline_in_background
+                    from pipeline.agents import init_api_config
+                    init_api_config()
+                    try:
+                        revise_and_resume_pipeline_in_background(
+                            project_id, latest_run_id, db
+                        )
+                        st.success(
+                            "✅ 已触发修订流程。修订指令已存入 project.brief，"
+                            "工部相关 stage_logs 已清除，流水线将从工部重跑并把"
+                            "修订意见作为 _revision_directives 注入到工部各 agent。"
+                        )
+                        st.rerun()
+                    except Exception as _err:
+                        st.error(f"应用修订失败：{_err}")
     except Exception as _e:
         st.warning(f"无法加载终审报告：{_e}")
 

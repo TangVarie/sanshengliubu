@@ -143,6 +143,20 @@ class SupabaseClient:
         )
         return resp.data[0] if resp.data else None
 
+    def delete_stage_logs_by_names(self, run_id: str, stage_names: list[str]) -> int:
+        """Delete stage_logs matching any of the given stage_names in this run.
+        Used by the revision flow to force-rerun specific stages."""
+        if not stage_names:
+            return 0
+        resp = (
+            self.client.table("stage_logs")
+            .delete()
+            .eq("run_id", run_id)
+            .in_("stage_name", stage_names)
+            .execute()
+        )
+        return len(resp.data or [])
+
     # ── Outputs ────────────────────────────────────────────────────────
 
     def save_output(self, run_id: str, prompt_system: dict, final_review: dict, version: int = 1) -> dict:

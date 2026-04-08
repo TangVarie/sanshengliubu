@@ -170,6 +170,20 @@ class PipelineOrchestrator:
 
             done = self._load_completed_stages()
 
+            # Revision mode: if chancellery_final rejected this run and the user
+            # clicked "应用修订意见并重跑", revise_and_resume_pipeline_in_background
+            # stored the review feedback in project.brief._revision_context and
+            # deleted the downstream stage_logs. Load it here so we can inject
+            # it into the works agents' inputs.
+            _project_brief = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+            self._revision_context: dict | None = _project_brief.get("_revision_context")
+            if self._revision_context:
+                logger.info(
+                    f"[revise] revision mode active, "
+                    f"{len(self._revision_context.get('mandatory_revisions', []))} "
+                    f"mandatory_revisions to address"
+                )
+
             # 1. 太子 — parse brief
             if "crown_prince" in done:
                 logger.info("Resuming: skipping crown_prince (already completed)")
@@ -212,6 +226,8 @@ class PipelineOrchestrator:
                     "plan": plan,
                     "tasks": tasks.get("tasks", {}).get("ministry_works", {}),
                 }
+                if self._revision_context:
+                    works_planner_input["_revision_directives"] = self._revision_context
                 works_arch = await self._run_with_clarification(
                     self.works, works_planner_input
                 )
@@ -258,6 +274,14 @@ class PipelineOrchestrator:
             if verdict == "approved":
                 final_status = "completed"
                 logger.info(f"Pipeline {self.run_id} completed (终审 approved)")
+                # Clear stale revision_context from project.brief so next run is clean
+                if self._revision_context:
+                    project = self.db.get_project(self.project_id) or {}
+                    brief = project.get("brief") or {}
+                    if "_revision_context" in brief:
+                        brief.pop("_revision_context", None)
+                        self.db.update_project(self.project_id, brief=brief)
+                        logger.info("[revise] cleared _revision_context after approval")
             else:
                 # revision_required / rejected / unknown — DO NOT mark as completed
                 final_status = "needs_revision"
@@ -505,6 +529,8 @@ class PipelineOrchestrator:
                         "parent_batch": parent_batch_idx,
                         "cell_ids": [cid],
                     },
+                    **({"_revision_directives": self._revision_context}
+                       if self._revision_context else {}),
                     "_strict_contract": (
                         f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
                         f"现在只给你一个 cell，你必须完整输出它的 cell_plan。"
@@ -570,6 +596,8 @@ class PipelineOrchestrator:
                             + (f" 注意：{extra_directive}" if extra_directive else "")
                         ),
                     }
+                    if self._revision_context:
+                        batch_input["_revision_directives"] = self._revision_context
                     return await self.works_cell_planner.run(
                         batch_input, self.run_id, self.db
                     )
@@ -769,6 +797,8 @@ class PipelineOrchestrator:
                         "parent_batch": parent_batch_idx,
                         "cell_ids": [cid],
                     },
+                    **({"_revision_directives": self._revision_context}
+                       if self._revision_context else {}),
                     "_strict_contract": (
                         f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
                         f"现在只给你一个 cell_plan，你必须完整输出它的 prompt_cell + demo_output。"
@@ -827,6 +857,8 @@ class PipelineOrchestrator:
                             + (f" 注意：{extra_directive}" if extra_directive else "")
                         ),
                     }
+                    if self._revision_context:
+                        builder_input["_revision_directives"] = self._revision_context
                     return await self.works_builder.run(
                         builder_input, self.run_id, self.db
                     )
@@ -1065,4 +1097,74 @@ def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClie
     """Resume a failed pipeline run — reuses existing run_id and skips completed stages."""
     # Reset run status so UI shows it as running again
     db.update_pipeline_run(run_id, status="running", completed_at=None)
+    return start_pipeline_in_background(project_id, run_id, db)
+
+
+def revise_and_resume_pipeline_in_background(
+    project_id: str, run_id: str, db: SupabaseClient
+):
+    """Apply chancellery_final's revision_instructions and re-run the downstream.
+
+    This is the proper fix for the needs_revision → "rerun from scratch" dead end.
+    When 终审 rejects a run with mandatory_revisions:
+      1. Load the latest chancellery_final output from stage_logs
+      2. Store its revision_instructions + mandatory_revisions into project.brief
+         under _revision_context (orchestrator.run() reads this and injects it
+         into the works agents' inputs as _revision_directives)
+      3. Delete all downstream stage_logs (works_arch + cell_planner + builder
+         + vibe_critic + vibe_rewriter + chancellery_final) so resume re-runs them
+      4. Trigger the normal resume path
+
+    Preserves: crown_prince, secretariat, chancellery_*, dispatcher, 五部.
+    These are upstream of works and don't need to re-run.
+    """
+    # 1. Load the latest chancellery_final output
+    logs = db.get_stage_logs(run_id)
+    final_logs = [
+        l for l in logs
+        if l.get("stage_name") == "chancellery_final"
+        and l.get("status") == "completed"
+    ]
+    if not final_logs:
+        raise ValueError(
+            "找不到已完成的 chancellery_final stage_log，无法提取修订意见。"
+            "可能该 run 还没跑到终审，或终审本身失败了。"
+        )
+    # Use the latest one (later wins if there were prior revision rounds)
+    final_review = final_logs[-1].get("output_data") or {}
+    revision_context = {
+        "prior_verdict": final_review.get("verdict", "unknown"),
+        "mandatory_revisions": final_review.get("mandatory_revisions", []),
+        "revision_instructions": final_review.get("revision_instructions", ""),
+        "review_dimensions": final_review.get("review_dimensions", {}),
+        "suggestions": final_review.get("suggestions", []),
+    }
+    logger.info(
+        f"[revise] Loaded revision_context with "
+        f"{len(revision_context['mandatory_revisions'])} mandatory_revisions"
+    )
+
+    # 2. Store revision_context in project.brief so orchestrator.run() can read it
+    project = db.get_project(project_id)
+    brief = project.get("brief") or {}
+    brief["_revision_context"] = revision_context
+    db.update_project(project_id, brief=brief)
+
+    # 3. Delete downstream stage_logs so resume re-runs them
+    stages_to_redo = [
+        "ministry_works",
+        "ministry_works_cell_planner",
+        "ministry_works_builder",
+        "vibe_critic",
+        "vibe_rewriter",
+        "chancellery_final",
+    ]
+    deleted = db.delete_stage_logs_by_names(run_id, stages_to_redo)
+    logger.info(
+        f"[revise] Deleted {deleted} stage_logs for re-execution: {stages_to_redo}"
+    )
+
+    # 4. Reset status and trigger resume
+    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    db.update_project(project_id, status="running")
     return start_pipeline_in_background(project_id, run_id, db)
