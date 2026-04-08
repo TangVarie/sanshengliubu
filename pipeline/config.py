@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.6.1"
+VERSION = "v0.6.2"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "cell 级 retry + 去 stub + 5 池强制 + media_brief/comment_seeds + 血糖合规"
+VERSION_NOTES = "JSON 容错解析 (strict=False) + 每批 cell 数 3→2 + JSON 卫生 prompt 提示"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The
@@ -74,10 +74,13 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-# Concurrency lowered from 5 → 3 because every call is now opus-thinking,
-# which is heavy on the relay. Slower but more stable.
+# Concurrency kept at 3 (opus-thinking is heavy on the relay).
+# Cells-per-batch lowered to 2: with 5 required differentiation pools + full
+# self-contained system_prompt + media_brief + comment_seeds, a single cell
+# output is already 2-3K tokens. Batching 3 together pushes the model into
+# JSON malformation territory (unescaped newlines, truncation-like failures).
 MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
-MATRIX_CELLS_PER_BATCH = 3      # cells per builder call
+MATRIX_CELLS_PER_BATCH = 2      # cells per builder call
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call

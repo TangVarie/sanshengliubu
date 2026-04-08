@@ -221,36 +221,63 @@ class BaseAgent:
         return text, input_tokens, output_tokens
 
     @staticmethod
+    def _lenient_json_loads(text: str) -> dict[str, Any]:
+        """Parse JSON tolerantly: allow control chars in strings, normalize smart quotes.
+
+        LLMs frequently emit multi-line content inside JSON string values without
+        escaping the newlines/tabs. Python's strict=False decoder accepts these.
+        Also normalizes smart/chinese quotes to ASCII equivalents before parsing.
+        """
+        # Normalize common non-ASCII quote variants that LLMs sometimes produce
+        # around JSON keys or values. We only touch quotes; Chinese punctuation
+        # inside string VALUES is fine and gets preserved naturally.
+        normalized = (
+            text
+            .replace("\u201c", '"')  # left double quote
+            .replace("\u201d", '"')  # right double quote
+            .replace("\u2018", "'")  # left single quote
+            .replace("\u2019", "'")  # right single quote
+        )
+        return json.JSONDecoder(strict=False).decode(normalized)
+
+    @staticmethod
     def _extract_json(response_text: str) -> dict[str, Any]:
-        """Extract JSON from Claude response, handling markdown code blocks and truncation."""
+        """Extract JSON from Claude response.
+
+        Handles: markdown code blocks, outermost braces, unescaped control chars
+        inside strings (common LLM mistake with multi-line system_prompt values),
+        smart quotes, and truncation.
+        """
+        loads = BaseAgent._lenient_json_loads
+
         # Try direct parse
         try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
+            return loads(response_text)
+        except (json.JSONDecodeError, ValueError):
             pass
 
         # Try ```json ... ``` block
         match = re.search(r"```json\s*\n?(.*?)\n?\s*```", response_text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
+                return loads(match.group(1))
+            except (json.JSONDecodeError, ValueError):
                 pass
 
         # Try any ``` ... ``` block
         match = re.search(r"```\s*\n?(.*?)\n?\s*```", response_text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
+                return loads(match.group(1))
+            except (json.JSONDecodeError, ValueError):
                 pass
 
         # Try outermost braces
         match = re.search(r"\{.*\}", response_text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
+                return loads(match.group(0))
+            except (json.JSONDecodeError, ValueError):
                 pass
 
         # Try to repair truncated JSON (response cut off by max_tokens)
@@ -346,13 +373,13 @@ class BaseAgent:
 
             suffix = "]" * obrk + "}" * ob
             try:
-                result = json.loads(candidate + suffix)
+                result = BaseAgent._lenient_json_loads(candidate + suffix)
                 logger.info(
                     f"Truncation repair: cut at pos {cp}/{len(fragment)}, "
                     f"closed {ob} braces + {obrk} brackets"
                 )
                 return result
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 continue
 
         return None
