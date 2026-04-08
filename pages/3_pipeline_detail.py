@@ -362,12 +362,32 @@ with tabs[4]:
             _render_stage_log(mk)
             # Works tab also shows cell planner + builder logs
             if mk == "ministry_works":
+                def _batch_label(log: dict, fallback_prefix: str, idx: int) -> str:
+                    """Read _batch_info from log.input_data for human-friendly label.
+                    Falls back to legacy sequential numbering."""
+                    input_data = log.get("input_data") or {}
+                    info = input_data.get("_batch_info") or {}
+                    label = info.get("label")
+                    cell_ids = info.get("cell_ids") or []
+                    status = log.get("status", "pending")
+                    status_tag = ""
+                    if status == "failed":
+                        status_tag = " ❌"
+                    elif status == "completed":
+                        status_tag = " ✅"
+                    elif status == "running":
+                        status_tag = " ⏳"
+                    if label:
+                        cells_str = f" [{', '.join(cell_ids)}]" if cell_ids else ""
+                        return f"{label}{cells_str}{status_tag}"
+                    return f"{fallback_prefix} {idx + 1}{status_tag}"
+
                 cell_planner_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_cell_planner"]
                 if cell_planner_logs:
                     st.divider()
-                    st.markdown("**工部·格子规划（分批执行）**")
-                    for cl in cell_planner_logs:
-                        with st.expander(f"格子规划批次 {cell_planner_logs.index(cl) + 1}", expanded=False):
+                    st.markdown(f"**工部·格子规划**（共 {len(cell_planner_logs)} 次调用，含 batch/cell 重试）")
+                    for idx, cl in enumerate(cell_planner_logs):
+                        with st.expander(_batch_label(cl, "格子规划批次", idx), expanded=False):
                             if cl.get("output_data"):
                                 render_stage_output(cl["output_data"])
                             elif cl.get("status") == "failed":
@@ -375,9 +395,9 @@ with tabs[4]:
                 builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
                 if builder_logs:
                     st.divider()
-                    st.markdown("**工部·构建（分批执行）**")
-                    for bl in builder_logs:
-                        with st.expander(f"构建批次 {builder_logs.index(bl) + 1}", expanded=False):
+                    st.markdown(f"**工部·构建**（共 {len(builder_logs)} 次调用，含 batch/cell 重试）")
+                    for idx, bl in enumerate(builder_logs):
+                        with st.expander(_batch_label(bl, "构建批次", idx), expanded=False):
                             if bl.get("output_data"):
                                 render_stage_output(bl["output_data"])
                             elif bl.get("status") == "failed":

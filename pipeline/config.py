@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.6.2"
+VERSION = "v0.6.3"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "JSON 容错解析 (strict=False) + 每批 cell 数 3→2 + JSON 卫生 prompt 提示"
+VERSION_NOTES = "禁 ASCII 内嵌引号 + 批次 2→1 + 批次 UI 透明化（显示 round + cell_ids）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The
@@ -75,12 +75,14 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
 # Concurrency kept at 3 (opus-thinking is heavy on the relay).
-# Cells-per-batch lowered to 2: with 5 required differentiation pools + full
-# self-contained system_prompt + media_brief + comment_seeds, a single cell
-# output is already 2-3K tokens. Batching 3 together pushes the model into
-# JSON malformation territory (unescaped newlines, truncation-like failures).
+# Cells-per-batch = 1: each cell's system_prompt is already 2-4K tokens with
+# all 5 differentiation pools + personas + compliance + real-person samples +
+# media_brief + comment_seeds + demo_output. Batching multiple cells per call
+# causes JSON malformation (unescaped inner quotes, truncation). Single-cell
+# batches give the simplest possible JSON structure and isolate any failure
+# to exactly one cell (which Round 3 cell-retry will recover anyway).
 MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
-MATRIX_CELLS_PER_BATCH = 2      # cells per builder call
+MATRIX_CELLS_PER_BATCH = 1      # cells per builder call
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call

@@ -435,6 +435,12 @@ class PipelineOrchestrator:
                         "tactical_directions": plan.get("tactical_directions", []),
                         "target_platforms": plan.get("target_platforms", []),
                     },
+                    "_batch_info": {
+                        "label": f"单cell修复 {cid}",
+                        "round": "cell-retry",
+                        "parent_batch": parent_batch_idx,
+                        "cell_ids": [cid],
+                    },
                     "_strict_contract": (
                         f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
                         f"现在只给你一个 cell，你必须完整输出它的 cell_plan。"
@@ -475,7 +481,7 @@ class PipelineOrchestrator:
                 expected_ids = [c.get("cell_id") for c in batch]
                 expected_n = len(batch)
 
-                async def _call(extra_directive: str = "") -> dict:
+                async def _call(extra_directive: str = "", round_label: str = "initial") -> dict:
                     batch_input = {
                         "active_cells": batch,
                         "shared_skeleton": shared_skeleton,
@@ -484,6 +490,12 @@ class PipelineOrchestrator:
                         "plan_summary": {
                             "tactical_directions": plan.get("tactical_directions", []),
                             "target_platforms": plan.get("target_platforms", []),
+                        },
+                        "_batch_info": {
+                            "label": f"批次 {batch_idx + 1} · {round_label}",
+                            "round": round_label,
+                            "batch_idx": batch_idx,
+                            "cell_ids": expected_ids,
                         },
                         "_strict_contract": (
                             f"你必须为输入中的每一个 active_cell 都返回一个对应的 cell_plan。"
@@ -518,7 +530,8 @@ class PipelineOrchestrator:
                     try:
                         retry_result = await _call(
                             f"上一次只返回了 {sorted(merged_by_id.keys())}，"
-                            f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。"
+                            f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。",
+                            round_label="batch-retry",
                         )
                         for p in retry_result.get("cell_plans", []) or []:
                             if isinstance(p, dict) and p.get("cell_id") in expected_ids:
@@ -629,6 +642,12 @@ class PipelineOrchestrator:
                 single_input = {
                     "cell_plans": [cell_plan],
                     "shared_skeleton": shared_skeleton,
+                    "_batch_info": {
+                        "label": f"单cell修复 {cid}",
+                        "round": "cell-retry",
+                        "parent_batch": parent_batch_idx,
+                        "cell_ids": [cid],
+                    },
                     "_strict_contract": (
                         f"【单 cell 修复模式】上一批次 ({parent_batch_idx}) 漏掉了 cell {cid}。"
                         f"现在只给你一个 cell_plan，你必须完整输出它的 prompt_cell + demo_output。"
@@ -668,10 +687,16 @@ class PipelineOrchestrator:
                 expected_ids = [c.get("cell_id") for c in batch]
                 expected_n = len(batch)
 
-                async def _call(extra_directive: str = "") -> dict:
+                async def _call(extra_directive: str = "", round_label: str = "initial") -> dict:
                     builder_input = {
                         "cell_plans": batch,
                         "shared_skeleton": shared_skeleton,
+                        "_batch_info": {
+                            "label": f"批次 {batch_idx + 1} · {round_label}",
+                            "round": round_label,
+                            "batch_idx": batch_idx,
+                            "cell_ids": expected_ids,
+                        },
                         "_strict_contract": (
                             f"你必须为输入中的每一个 cell_plan 都返回一个对应的 prompt_cell。"
                             f"输入了 {expected_n} 个 cell_plans: {expected_ids}。"
@@ -705,7 +730,8 @@ class PipelineOrchestrator:
                     try:
                         retry_result = await _call(
                             f"上一次只返回了 {sorted(merged_by_id.keys())}，"
-                            f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。"
+                            f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。",
+                            round_label="batch-retry",
                         )
                         for p in retry_result.get("prompt_cells", []) or []:
                             if isinstance(p, dict) and p.get("cell_id") in expected_ids:
