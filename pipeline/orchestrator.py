@@ -275,41 +275,19 @@ class PipelineOrchestrator:
                 _existing_revs = (final_review or {}).get("mandatory_revisions", []) or []
                 _existing_instr = (final_review or {}).get("revision_instructions", "") or ""
                 if not _existing_revs or not _existing_instr:
-                    synthetic_revs: list[str] = list(_existing_revs)
-                    synthetic_instr_parts: list[str] = []
-                    dims = (final_review or {}).get("review_dimensions", {}) or {}
-                    for dim_name, dim_data in dims.items():
-                        if not isinstance(dim_data, dict):
-                            continue
-                        score = dim_data.get("score", 5)
-                        issues = (dim_data.get("issues") or "").strip()
-                        if issues and score < 5:
-                            synth = (
-                                f"【来自 review_dimensions.{dim_name} 的 {score}/5 分问题】{issues}"
-                            )
-                            synthetic_revs.append(synth)
-                            synthetic_instr_parts.append(f"- {dim_name}: {issues}")
-                    # Also include suggestions as soft hints
-                    for s in (final_review or {}).get("suggestions", []) or []:
-                        if isinstance(s, str) and s.strip():
-                            synthetic_instr_parts.append(f"- 建议: {s.strip()}")
-
-                    if synthetic_revs and not _existing_revs:
-                        final_review["mandatory_revisions"] = synthetic_revs
+                    synth_revs, synth_instr = _synthesize_revisions_from_review(final_review)
+                    if synth_revs and not _existing_revs:
+                        final_review["mandatory_revisions"] = synth_revs
                         logger.warning(
-                            f"[chancellery_final] synthesized {len(synthetic_revs)} "
+                            f"[chancellery_final] synthesized {len(synth_revs)} "
                             f"mandatory_revisions from review_dimensions because model "
                             f"returned empty list alongside verdict={_v!r}"
                         )
-                    if synthetic_instr_parts and not _existing_instr:
-                        final_review["revision_instructions"] = (
-                            "（下列修订由 orchestrator 从 review_dimensions 自动合成——"
-                            "chancellery 返回 verdict=" + _v + " 但未填写 revision_instructions）\n\n"
-                            + "\n".join(synthetic_instr_parts)
-                        )
+                    if synth_instr and not _existing_instr:
+                        final_review["revision_instructions"] = synth_instr
                         logger.warning(
                             "[chancellery_final] synthesized revision_instructions "
-                            "from review_dimensions"
+                            "from review_dimensions + suggestions"
                         )
 
             # 7. Save output (always — user wants to see partial output even on revision_required)
@@ -909,32 +887,53 @@ class PipelineOrchestrator:
                         builder_input, self.run_id, self.db
                     )
 
+                def _filter_truncated(candidates: dict[str, dict]) -> dict[str, dict]:
+                    """Drop any cell from the merged dict that looks truncated,
+                    so it gets treated as missing and retried."""
+                    out: dict[str, dict] = {}
+                    for cid, cell in candidates.items():
+                        bad, reason = _prompt_cell_looks_truncated(cell)
+                        if bad:
+                            logger.warning(
+                                f"[builder batch {batch_idx}] cell {cid} looks truncated: "
+                                f"{reason} — treating as missing to trigger retry"
+                            )
+                        else:
+                            out[cid] = cell
+                    return out
+
                 # Round 1: batch call
                 result = await _call()
                 merged_by_id: dict[str, dict] = {}
                 for p in result.get("prompt_cells", []) or []:
                     if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                         merged_by_id[p["cell_id"]] = p
+                merged_by_id = _filter_truncated(merged_by_id)
                 merged_demos: list[dict] = list(result.get("demo_outputs", []) or [])
                 missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
                 # Round 2: batch retry
                 if missing_ids:
                     logger.warning(
-                        f"[builder batch {batch_idx}] short return: "
+                        f"[builder batch {batch_idx}] short/truncated return: "
                         f"expected {expected_n} ({expected_ids}), "
                         f"got {sorted(merged_by_id.keys())}. "
-                        f"Missing: {missing_ids}. Round 2: batch retry..."
+                        f"Missing/truncated: {missing_ids}. Round 2: batch retry..."
                     )
                     try:
                         retry_result = await _call(
                             f"上一次只返回了 {sorted(merged_by_id.keys())}，"
-                            f"漏了 {missing_ids}，必须把所有 {expected_n} 个都返回。",
+                            f"漏了 {missing_ids}（包括截断不完整的 cell）。必须把所有 "
+                            f"{expected_n} 个 cell 都完整返回，每个 cell 的 system_prompt "
+                            f"必须以完整句子结尾（。！？」）。",
                             round_label="batch-retry",
                         )
+                        new_candidates: dict[str, dict] = {}
                         for p in retry_result.get("prompt_cells", []) or []:
                             if isinstance(p, dict) and p.get("cell_id") in expected_ids:
-                                merged_by_id[p["cell_id"]] = p
+                                new_candidates[p["cell_id"]] = p
+                        new_candidates = _filter_truncated(new_candidates)
+                        merged_by_id.update(new_candidates)
                         merged_demos.extend(retry_result.get("demo_outputs", []) or [])
                         missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
                     except Exception as e:
@@ -956,6 +955,12 @@ class PipelineOrchestrator:
                     cell_retry_results = await asyncio.gather(*cell_retry_tasks)
                     for cid, (single_cell, single_demos) in zip(missing_ids, cell_retry_results):
                         if single_cell is not None:
+                            bad, reason = _prompt_cell_looks_truncated(single_cell)
+                            if bad:
+                                logger.warning(
+                                    f"[builder cell-retry] {cid} still looks truncated after "
+                                    f"single-cell call: {reason} — accepting anyway (best effort)"
+                                )
                             merged_by_id[cid] = single_cell
                         merged_demos.extend(single_demos)
                     missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
@@ -1139,6 +1144,84 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     return thread
 
 
+def _prompt_cell_looks_truncated(cell: dict) -> tuple[bool, str]:
+    """Heuristically detect whether a works_builder prompt_cell is truncated.
+
+    When the relay cuts responses at ~8K chars, the JSON truncation repair can
+    still produce a structurally-valid cell dict where one field (usually
+    system_prompt) is chopped mid-sentence. The cell count check would pass
+    but the content is unusable. Chancellery_final will then complain.
+
+    Returns (is_truncated, reason). Empty reason means not truncated.
+    """
+    if not isinstance(cell, dict):
+        return True, "cell 不是 dict"
+
+    sp = (cell.get("system_prompt") or "").strip()
+    if not sp:
+        return True, "system_prompt 为空"
+    if len(sp) < 500:
+        return True, f"system_prompt 过短（{len(sp)} 字符 < 500 最低门槛）"
+
+    # Clean sentence terminators we'll accept at the end
+    clean_endings = (
+        "。", "！", "？", "」", "』", "}", "】", "）", ")",
+        ".", "!", "?", "\"", "'", "\u201d", "\u2019",
+    )
+    if not sp.endswith(clean_endings):
+        # Grab last 40 chars for context
+        tail = sp[-40:].replace("\n", " ")
+        return True, f"system_prompt 结尾不完整（末尾: ...{tail!r}）"
+
+    demo = (cell.get("demo_output") or "").strip()
+    if demo and len(demo) < 50:
+        return True, f"demo_output 过短（{len(demo)} 字符）"
+    if demo and not demo.endswith(clean_endings):
+        tail = demo[-40:].replace("\n", " ")
+        return True, f"demo_output 结尾不完整（末尾: ...{tail!r}）"
+
+    return False, ""
+
+
+def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], str]:
+    """Synthesize (mandatory_revisions, revision_instructions) from a chancellery_final
+    output when the model returned them empty. Used both by orchestrator.run() step 6.5
+    (live synthesis right after chancellery runs) and by revise_and_resume_pipeline
+    (retroactive synthesis when the user clicks 应用修订 on an already-stored review).
+
+    Pulls from review_dimensions (low-scoring ones) + suggestions.
+    Returns ([], "") if nothing can be synthesized.
+    """
+    synthetic_revs: list[str] = []
+    synthetic_instr_parts: list[str] = []
+
+    dims = (final_review or {}).get("review_dimensions", {}) or {}
+    for dim_name, dim_data in dims.items():
+        if not isinstance(dim_data, dict):
+            continue
+        score = dim_data.get("score", 5)
+        issues = (dim_data.get("issues") or "").strip()
+        if issues and score < 5:
+            synthetic_revs.append(
+                f"【来自 review_dimensions.{dim_name} 的 {score}/5 分问题】{issues}"
+            )
+            synthetic_instr_parts.append(f"- {dim_name} ({score}/5): {issues}")
+
+    for s in (final_review or {}).get("suggestions", []) or []:
+        if isinstance(s, str) and s.strip():
+            synthetic_instr_parts.append(f"- 建议: {s.strip()}")
+
+    synthetic_instr = ""
+    if synthetic_instr_parts:
+        synthetic_instr = (
+            "（下列修订由 orchestrator 从 review_dimensions + suggestions 自动合成——"
+            "chancellery 返回时未填写具体的 mandatory_revisions / revision_instructions）\n\n"
+            + "\n".join(synthetic_instr_parts)
+        )
+
+    return synthetic_revs, synthetic_instr
+
+
 def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
     """Resume a failed pipeline run — reuses existing run_id and skips completed stages."""
     # Reset run status so UI shows it as running again
@@ -1178,10 +1261,37 @@ def revise_and_resume_pipeline_in_background(
         )
     # Use the latest one (later wins if there were prior revision rounds)
     final_review = final_logs[-1].get("output_data") or {}
+    stored_revs = final_review.get("mandatory_revisions", []) or []
+    stored_instr = final_review.get("revision_instructions", "") or ""
+
+    # Retroactive synthesis: if chancellery returned empty revisions (common
+    # when its own output got truncated), synthesize from review_dimensions
+    # + suggestions on the fly so the revision loop has something to inject.
+    if not stored_revs or not stored_instr:
+        synth_revs, synth_instr = _synthesize_revisions_from_review(final_review)
+        if synth_revs and not stored_revs:
+            stored_revs = synth_revs
+            logger.warning(
+                f"[revise] synthesized {len(synth_revs)} mandatory_revisions "
+                f"from review_dimensions (chancellery had left them empty)"
+            )
+        if synth_instr and not stored_instr:
+            stored_instr = synth_instr
+            logger.warning(
+                "[revise] synthesized revision_instructions from review_dimensions"
+            )
+
+    if not stored_revs and not stored_instr:
+        raise ValueError(
+            "chancellery_final 既没填 mandatory_revisions 也没填 revision_instructions，"
+            "而且 review_dimensions 里也没有低分维度可以合成。无法触发修订流程——"
+            "请直接点「重跑流水线」创建新 run。"
+        )
+
     revision_context = {
         "prior_verdict": final_review.get("verdict", "unknown"),
-        "mandatory_revisions": final_review.get("mandatory_revisions", []),
-        "revision_instructions": final_review.get("revision_instructions", ""),
+        "mandatory_revisions": stored_revs,
+        "revision_instructions": stored_instr,
         "review_dimensions": final_review.get("review_dimensions", {}),
         "suggestions": final_review.get("suggestions", []),
     }
