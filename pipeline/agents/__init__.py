@@ -297,14 +297,15 @@ class BaseAgent:
         )
 
     @staticmethod
+    @staticmethod
     def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
-        """Repair truncated JSON by finding the last valid cut point and closing brackets.
+        """Repair truncated JSON by finding the last valid cut point and closing
+        open containers in proper nesting order.
 
-        Handles truncation mid-string, mid-value, or between fields.
+        Handles truncation mid-string, mid-value, or between fields. Uses a
+        real stack (not counts) so nested structures like {[{[...]}]} close
+        correctly as ]}]} instead of the buggy ]]}}.
         """
-        # Track JSON structure and remember valid cut points
-        open_braces = 0
-        open_brackets = 0
         in_string = False
         escape_next = False
         # Positions right after a complete value where we could safely cut
@@ -320,37 +321,29 @@ class BaseAgent:
             if ch == '"':
                 in_string = not in_string
                 if not in_string:
-                    # Just closed a string — valid cut after this
                     cut_points.append(i + 1)
                 continue
             if in_string:
                 continue
-            if ch == "{":
-                open_braces += 1
-            elif ch == "}":
-                open_braces -= 1
-                cut_points.append(i + 1)
-            elif ch == "[":
-                open_brackets += 1
-            elif ch == "]":
-                open_brackets -= 1
+            if ch in "{[":
+                pass  # container open — don't add cut here
+            elif ch in "}]":
                 cut_points.append(i + 1)
             elif ch == ",":
                 cut_points.append(i)  # cut BEFORE comma is also valid
 
-        if open_braces <= 0 and open_brackets <= 0:
-            return None  # Not a truncation issue
-
         # Try cut points from most recent to earliest (keep as much data as possible)
-        for cp in reversed(cut_points[-200:]):  # check last 200 cut points
+        for cp in reversed(cut_points[-300:]):
             candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
             # Strip dangling `"key":` (key with no value, left when cut mid-value)
             candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)
             candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)
             candidate = candidate.rstrip().rstrip(",")
 
-            # Recount open brackets for this candidate
-            ob, obrk, ins, esc = 0, 0, False, False
+            # Re-scan candidate with a real stack
+            stack: list[str] = []
+            ins = False
+            esc = False
             for ch in candidate:
                 if esc:
                     esc = False
@@ -363,20 +356,45 @@ class BaseAgent:
                     continue
                 if ins:
                     continue
-                if ch == "{": ob += 1
-                elif ch == "}": ob -= 1
-                elif ch == "[": obrk += 1
-                elif ch == "]": obrk -= 1
+                if ch == "{":
+                    stack.append("{")
+                elif ch == "}":
+                    if stack and stack[-1] == "{":
+                        stack.pop()
+                    else:
+                        # Unmatched close — this candidate is malformed
+                        stack = ["__BAD__"]
+                        break
+                elif ch == "[":
+                    stack.append("[")
+                elif ch == "]":
+                    if stack and stack[-1] == "[":
+                        stack.pop()
+                    else:
+                        stack = ["__BAD__"]
+                        break
 
-            if ob <= 0 or ins:
-                continue  # over-closed or ended inside string
+            if stack == ["__BAD__"] or ins:
+                continue  # malformed or ended inside string
+            if not stack:
+                # Already balanced — try parsing as-is
+                try:
+                    result = BaseAgent._lenient_json_loads(candidate)
+                    logger.info(
+                        f"Truncation repair: cut at pos {cp}/{len(fragment)}, "
+                        f"already balanced"
+                    )
+                    return result
+                except (json.JSONDecodeError, ValueError):
+                    continue
 
-            suffix = "]" * obrk + "}" * ob
+            # Build proper close suffix: reverse stack, flip { → } and [ → ]
+            suffix = "".join("}" if c == "{" else "]" for c in reversed(stack))
             try:
                 result = BaseAgent._lenient_json_loads(candidate + suffix)
                 logger.info(
                     f"Truncation repair: cut at pos {cp}/{len(fragment)}, "
-                    f"closed {ob} braces + {obrk} brackets"
+                    f"closed stack {stack} → suffix {suffix!r}"
                 )
                 return result
             except (json.JSONDecodeError, ValueError):

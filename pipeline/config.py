@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.6.3"
+VERSION = "v0.6.4"
 VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "禁 ASCII 内嵌引号 + 批次 2→1 + 批次 UI 透明化（显示 round + cell_ids）"
+VERSION_NOTES = "栈式截断修复 + 产出长度控制 (≤4500 char/cell) + works_builder max_tokens 32k"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The
@@ -67,7 +67,7 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_justice": 20000,
     "ministry_works": MAX_TOKENS_STRATEGY,        # architect — global skeleton
     "ministry_works_cell_planner": 20000,
-    "ministry_works_builder": 24000,              # self-contained prompts
+    "ministry_works_builder": 32000,              # self-contained prompts
     "vibe_critic": 20000,
     "vibe_rewriter": 24000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
