@@ -266,6 +266,52 @@ class PipelineOrchestrator:
                 final_system, plan, structured_brief, self.run_id, self.db
             )
 
+            # 6.5 Safety: if chancellery flagged revision_required but didn't
+            # populate mandatory_revisions / revision_instructions, synthesize
+            # fallback content from review_dimensions so the revision loop has
+            # something actionable to feed back into the works agents.
+            _v = (final_review or {}).get("verdict", "").strip().lower()
+            if _v in ("revision_required", "rejected"):
+                _existing_revs = (final_review or {}).get("mandatory_revisions", []) or []
+                _existing_instr = (final_review or {}).get("revision_instructions", "") or ""
+                if not _existing_revs or not _existing_instr:
+                    synthetic_revs: list[str] = list(_existing_revs)
+                    synthetic_instr_parts: list[str] = []
+                    dims = (final_review or {}).get("review_dimensions", {}) or {}
+                    for dim_name, dim_data in dims.items():
+                        if not isinstance(dim_data, dict):
+                            continue
+                        score = dim_data.get("score", 5)
+                        issues = (dim_data.get("issues") or "").strip()
+                        if issues and score < 5:
+                            synth = (
+                                f"【来自 review_dimensions.{dim_name} 的 {score}/5 分问题】{issues}"
+                            )
+                            synthetic_revs.append(synth)
+                            synthetic_instr_parts.append(f"- {dim_name}: {issues}")
+                    # Also include suggestions as soft hints
+                    for s in (final_review or {}).get("suggestions", []) or []:
+                        if isinstance(s, str) and s.strip():
+                            synthetic_instr_parts.append(f"- 建议: {s.strip()}")
+
+                    if synthetic_revs and not _existing_revs:
+                        final_review["mandatory_revisions"] = synthetic_revs
+                        logger.warning(
+                            f"[chancellery_final] synthesized {len(synthetic_revs)} "
+                            f"mandatory_revisions from review_dimensions because model "
+                            f"returned empty list alongside verdict={_v!r}"
+                        )
+                    if synthetic_instr_parts and not _existing_instr:
+                        final_review["revision_instructions"] = (
+                            "（下列修订由 orchestrator 从 review_dimensions 自动合成——"
+                            "chancellery 返回 verdict=" + _v + " 但未填写 revision_instructions）\n\n"
+                            + "\n".join(synthetic_instr_parts)
+                        )
+                        logger.warning(
+                            "[chancellery_final] synthesized revision_instructions "
+                            "from review_dimensions"
+                        )
+
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
 

@@ -91,6 +91,8 @@ if status == "needs_revision":
             _verdict = _final_review.get("verdict", "unknown")
             _instructions = _final_review.get("revision_instructions", "")
             _revisions = _final_review.get("mandatory_revisions", []) or []
+            _dimensions = _final_review.get("review_dimensions", {}) or {}
+            _suggestions = _final_review.get("suggestions", []) or []
             with st.container(border=True):
                 st.error(
                     f"📝🔁 **终审判定：{_verdict}** — 流水线已运行完毕，但门下省终审认为产出"
@@ -103,6 +105,39 @@ if status == "needs_revision":
                 if _instructions:
                     with st.expander("📋 修改指令", expanded=True):
                         st.markdown(_instructions)
+
+                # If chancellery flagged revision_required but didn't populate
+                # mandatory_revisions / revision_instructions, surface whatever
+                # it DID return so the user isn't stuck with an empty banner.
+                if not _revisions and not _instructions:
+                    st.warning(
+                        "⚠️ 终审标记为 revision_required 但 `mandatory_revisions` 和 "
+                        "`revision_instructions` 两个字段都是空的。下面展开可以看到终审"
+                        "的完整原始输出——可能问题写在 `review_dimensions.issues` 或 "
+                        "`suggestions` 里，也可能是模型没填好。"
+                    )
+                    if _dimensions:
+                        dim_issues = []
+                        for dim_name, dim_data in _dimensions.items():
+                            if isinstance(dim_data, dict):
+                                score = dim_data.get("score", 0)
+                                issues = dim_data.get("issues", "")
+                                if issues and score < 5:
+                                    dim_issues.append(
+                                        f"**{dim_name}** ({score}/5): {issues}"
+                                    )
+                        if dim_issues:
+                            st.markdown("**审查维度中发现的问题：**")
+                            for di in dim_issues:
+                                st.markdown(f"- {di}")
+                    if _suggestions:
+                        st.markdown("**终审建议（非强制）：**")
+                        for s in _suggestions:
+                            st.markdown(f"- {s}")
+                    with st.expander(
+                        "🔍 终审 stage_log 完整原始输出（调试用）", expanded=False
+                    ):
+                        st.json(_final_review)
 
                 # ── Apply revision button ─────────────────────────────────
                 st.markdown("---")

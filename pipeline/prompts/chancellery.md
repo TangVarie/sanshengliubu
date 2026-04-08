@@ -37,6 +37,20 @@
 - mandatory_revisions 必须具体、可执行
 - 不要给面子分，严格按标准打分
 
+## 硬契约：verdict 与 revisions 的一致性
+
+**如果 verdict == "approved"**：
+- `mandatory_revisions` 可以是空数组 `[]`
+- `revision_instructions` 可以是空字符串 `""`
+- 但 `suggestions` 里仍可以给非强制的优化建议
+
+**如果 verdict == "revision_required" 或 "rejected"**：
+- **`mandatory_revisions` 必须非空**——至少列出 1 条必修问题，用完整中文句子描述"发现了什么问题 + 必须改成什么样"
+- **`revision_instructions` 必须非空**——用自然语言段落给下游工部写一份修改指令，不少于 100 字
+- 空的 revisions 会让下游工部拿不到任何反馈，导致修订循环无意义空转。**严禁空返回**
+
+如果你真的觉得没什么大问题，但又有些小瑕疵，那 verdict 就应该是 `approved` + `suggestions` 里放建议，**不要**用 `revision_required` 加空 revisions 来"委婉表达"。
+
 ## 审查中的方法论校验
 
 在审查方案和终审产出时，额外关注底层方法论的落地情况：
