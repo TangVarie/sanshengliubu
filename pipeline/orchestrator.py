@@ -769,9 +769,38 @@ class PipelineOrchestrator:
             cid: cell for cid, cell in recovered_cells.items()
             if cid in expected_ids_set
         }
+
+        # Revision-aware recovery: if a revision cycle is active, exclude cells
+        # whose direction_id was called out in mandatory_revisions. These need
+        # to be re-built even though they have prior successful stage_logs.
+        revision_ctx = getattr(self, "_revision_context", None) or {}
+        affected_dirs = set(revision_ctx.get("affected_direction_ids", []))
+        is_global = revision_ctx.get("is_global_revision", False)
+
+        if is_global and recovered_cells:
+            logger.info(
+                "[builder resume] global revision active → discarding all "
+                f"{len(recovered_cells)} recovered cells, re-building everything"
+            )
+            recovered_cells = {}
+            recovered_demos = []
+        elif affected_dirs and recovered_cells:
+            before_count = len(recovered_cells)
+            recovered_cells = {
+                cid: cell for cid, cell in recovered_cells.items()
+                if not any(cid.startswith(f"{d}_") for d in affected_dirs)
+            }
+            dropped = before_count - len(recovered_cells)
+            if dropped:
+                logger.info(
+                    f"[builder resume] revision targets directions {sorted(affected_dirs)} "
+                    f"→ dropped {dropped} recovered cells that need re-building, "
+                    f"keeping {len(recovered_cells)} unaffected cells"
+                )
+
         if recovered_cells:
             logger.info(
-                f"[builder resume] recovered {len(recovered_cells)}/{len(cell_plans)} "
+                f"[builder resume] recovered {len(recovered_cells)}/{len(original_expected_order)} "
                 f"prompt_cells from prior successful batches: {sorted(recovered_cells.keys())}"
             )
             cell_plans = [
@@ -1288,12 +1317,35 @@ def revise_and_resume_pipeline_in_background(
             "请直接点「重跑流水线」创建新 run。"
         )
 
+    # 1.5 Determine WHICH cells are affected vs which can be reused.
+    # Scan revisions for D\d+ direction IDs and global-concern keywords.
+    all_revision_text = " ".join(
+        [r for r in stored_revs if isinstance(r, str)] + [stored_instr]
+    )
+    affected_direction_ids = sorted(set(re.findall(r"D\d+", all_revision_text)))
+
+    global_keywords = [
+        "shared_skeleton", "batch_rules", "persona_library", "title_rules",
+        "usage_guide", "全局", "所有方向", "所有cell", "全部cell", "每个方向",
+        "每个cell", "统一", "全部方向",
+    ]
+    is_global_revision = any(
+        kw in all_revision_text.lower() or kw in all_revision_text
+        for kw in global_keywords
+    )
+    logger.info(
+        f"[revise] affected_direction_ids={affected_direction_ids}, "
+        f"is_global_revision={is_global_revision}"
+    )
+
     revision_context = {
         "prior_verdict": final_review.get("verdict", "unknown"),
         "mandatory_revisions": stored_revs,
         "revision_instructions": stored_instr,
         "review_dimensions": final_review.get("review_dimensions", {}),
         "suggestions": final_review.get("suggestions", []),
+        "affected_direction_ids": affected_direction_ids,
+        "is_global_revision": is_global_revision,
     }
     logger.info(
         f"[revise] Loaded revision_context with "
@@ -1306,18 +1358,34 @@ def revise_and_resume_pipeline_in_background(
     brief["_revision_context"] = revision_context
     db.update_project(project_id, brief=brief)
 
-    # 3. Delete downstream stage_logs so resume re-runs them
-    stages_to_redo = [
-        "ministry_works",
-        "ministry_works_cell_planner",
-        "ministry_works_builder",
-        "vibe_critic",
-        "vibe_rewriter",
-        "chancellery_final",
-    ]
+    # 3. Selective deletion: only re-run what's actually needed.
+    # Always re-run: vibe loop + chancellery_final (they evaluate the full matrix)
+    stages_to_redo = ["vibe_critic", "vibe_rewriter", "chancellery_final"]
+
+    if is_global_revision:
+        # Global concern (persona_library / title_rules / batch_rules etc.)
+        # → must re-run architect + all cell_planner + all builder
+        stages_to_redo += [
+            "ministry_works",
+            "ministry_works_cell_planner",
+            "ministry_works_builder",
+        ]
+        logger.info(
+            "[revise] global revision → deleting ALL works stages + vibe + final"
+        )
+    else:
+        # Cell-specific revision → keep builder stage_logs intact.
+        # Cell-level resume will skip recovered cells; affected cells
+        # (matching affected_direction_ids) will be excluded from recovery
+        # and forced to re-build.
+        logger.info(
+            f"[revise] cell-specific revision → keeping builder stage_logs, "
+            f"only D{'/D'.join(affected_direction_ids)} will be re-built"
+        )
+
     deleted = db.delete_stage_logs_by_names(run_id, stages_to_redo)
     logger.info(
-        f"[revise] Deleted {deleted} stage_logs for re-execution: {stages_to_redo}"
+        f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"
     )
 
     # 4. Reset status and trigger resume
