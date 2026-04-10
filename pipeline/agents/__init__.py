@@ -68,14 +68,47 @@ class BaseAgent:
         kwargs["timeout"] = 900.0  # 15 min
         return anthropic.Anthropic(**kwargs)
 
+    # Agents that need strategy-level methodology (差异化/真实感/平台感知)
+    _STRATEGY_STAGES = frozenset({
+        "secretariat", "chancellery", "chancellery_final",
+        "ministry_works", "ministry_works_cell_planner",
+    })
+    # Agents that need execution-level methodology (网感/钩子/范式) —
+    # NOTE: works_builder and vibe agents already have full execution
+    # knowledge hardcoded in their own prompt files. Appending foundation's
+    # §2 网感 chapter would duplicate ~9.6KB of content they already have.
+    # So execution agents get NO extra foundation beyond common.
+    # Strategy agents get the lighter strategy foundation.
+    # All agents get the common foundation (请旨协议).
+
     def load_system_prompt(self) -> str:
-        """Load agent-specific prompt + append shared foundation knowledge."""
+        """Load agent-specific prompt + append relevant foundation knowledge.
+
+        Before v0.7.5, the FULL foundation.md (16KB, including 9.6KB of 网感
+        rules) was appended to every single agent — 14 agents × 16KB = 224KB
+        of redundant input tokens per pipeline run. Most agents don't need
+        execution-level content rules (hooks, paradigms, real-person samples).
+
+        Now segmented:
+        - foundation_common.md (请旨协议): ALL agents
+        - foundation_strategy.md (差异化/真实感/平台感知): strategy agents only
+        - §2 网感 (9.6KB): NOT appended — already hardcoded in works_builder.md
+          and vibe_critic.md
+        """
         path = PROMPTS_DIR / self.prompt_file
         prompt = path.read_text(encoding="utf-8")
-        # Inject foundation methodology knowledge
-        foundation_path = PROMPTS_DIR / "foundation.md"
-        if foundation_path.exists():
-            prompt += "\n\n---\n\n" + foundation_path.read_text(encoding="utf-8")
+
+        # Always append common foundation (请旨协议)
+        common_path = PROMPTS_DIR / "foundation_common.md"
+        if common_path.exists():
+            prompt += "\n\n---\n\n" + common_path.read_text(encoding="utf-8")
+
+        # Strategy agents also get strategy methodology
+        if self.stage_name in self._STRATEGY_STAGES:
+            strategy_path = PROMPTS_DIR / "foundation_strategy.md"
+            if strategy_path.exists():
+                prompt += "\n\n---\n\n" + strategy_path.read_text(encoding="utf-8")
+
         return prompt
 
     @property

@@ -1065,6 +1065,7 @@ class PipelineOrchestrator:
         """Critic → Rewriter loop. Up to 2 iterations.
 
         网感不行 = system_prompt 设计有缺陷 → 重写 system_prompt（不是改 demo）。
+        Round 2+ only re-evaluates cells that were rewritten, not the entire matrix.
         """
         max_iterations = 2
         prompt_cells = final_system.get("prompt_matrix", [])
@@ -1073,11 +1074,29 @@ class PipelineOrchestrator:
             return final_system
 
         shared_skeleton = final_system.get("shared_skeleton", {})
+        # Track which cell_ids were rewritten so round 2 only re-evaluates those
+        rewritten_ids: set[str] = set()
 
         for iteration in range(max_iterations):
             logger.info(f"Vibe loop iteration {iteration + 1}/{max_iterations}")
 
-            # Critic input: only the fields critic needs
+            # Round 1: evaluate ALL cells. Round 2+: only evaluate rewritten cells.
+            if iteration == 0:
+                cells_to_critique = prompt_cells
+            else:
+                cells_to_critique = [
+                    c for c in prompt_cells
+                    if c.get("cell_id") in rewritten_ids
+                ]
+                if not cells_to_critique:
+                    logger.info("Vibe loop: no rewritten cells to re-evaluate, done")
+                    break
+                logger.info(
+                    f"Vibe loop round {iteration + 1}: only re-evaluating "
+                    f"{len(cells_to_critique)} rewritten cells "
+                    f"(skipping {len(prompt_cells) - len(cells_to_critique)} unchanged)"
+                )
+
             critic_input = {
                 "prompt_cells": [
                     {
@@ -1088,7 +1107,7 @@ class PipelineOrchestrator:
                         "system_prompt": c.get("system_prompt", ""),
                         "demo_output": c.get("demo_output", ""),
                     }
-                    for c in prompt_cells
+                    for c in cells_to_critique
                 ]
             }
             try:
@@ -1141,6 +1160,11 @@ class PipelineOrchestrator:
             new_cells_by_id = {
                 c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
             }
+            rewritten_ids = set(new_cells_by_id.keys())
+            logger.info(
+                f"Vibe rewriter rewrote {len(rewritten_ids)} cells: "
+                f"{sorted(rewritten_ids)}"
+            )
             prompt_cells = [
                 new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
             ]

@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.7.4"
+VERSION = "v0.7.5"
 VERSION_DATE = "2026-04-10"
-VERSION_NOTES = "精准修订：只重跑终审点名的 cell，其余复用已有产出"
+VERSION_NOTES = "foundation.md 拆分（省 60% 输入 token）+ vibe critic 只评失败 cell"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The
