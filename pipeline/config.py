@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.7.2"
-VERSION_DATE = "2026-04-07"
-VERSION_NOTES = "cell 截断检测 + 修订合成回溯 + 终审输出长度硬上限"
+VERSION = "v0.7.3"
+VERSION_DATE = "2026-04-10"
+VERSION_NOTES = "修复 Supabase 查询超时：stage_logs 不再拉 input_data（省 90% payload）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Sonnet is fully retired (relay vip group has no sonnet channels). The

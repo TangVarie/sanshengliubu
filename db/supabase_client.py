@@ -120,9 +120,21 @@ class SupabaseClient:
         return resp.data[0]
 
     def get_stage_logs(self, run_id: str) -> list[dict]:
+        """Load stage_logs for a run, EXCLUDING input_data to keep payload small.
+
+        input_data contains the full shared_skeleton + ministry_outputs +
+        cell_plans for every builder/cell_planner call — easily 50-100KB per
+        entry. With dozens of retries, total payload exceeds Supabase free
+        tier connection limits (httpx.ReadError). output_data (which has the
+        agent's response) is much smaller and sufficient for UI rendering.
+        """
         resp = (
             self.client.table("stage_logs")
-            .select("*")
+            .select(
+                "id, run_id, stage_name, status, output_data, error_message, "
+                "model_used, tokens_used, duration_seconds, human_intervention, "
+                "created_at, updated_at"
+            )
             .eq("run_id", run_id)
             .order("created_at")
             .execute()
