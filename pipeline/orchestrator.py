@@ -917,18 +917,26 @@ class PipelineOrchestrator:
                         builder_input, self.run_id, self.db
                     )
 
-                def _filter_truncated(candidates: dict[str, dict]) -> dict[str, dict]:
-                    """Drop any cell from the merged dict that looks truncated,
+                def _filter_invalid(candidates: dict[str, dict]) -> dict[str, dict]:
+                    """Drop any cell that fails quality validation,
                     so it gets treated as missing and retried."""
                     out: dict[str, dict] = {}
                     for cid, cell in candidates.items():
-                        bad, reason = _prompt_cell_looks_truncated(cell)
-                        if bad:
+                        is_valid, cell_issues = _validate_prompt_cell(cell)
+                        if not is_valid:
                             logger.warning(
-                                f"[builder batch {batch_idx}] cell {cid} looks truncated: "
-                                f"{reason} — treating as missing to trigger retry"
+                                f"[builder batch {batch_idx}] cell {cid} failed validation "
+                                f"({len(cell_issues)} issues) — treating as missing to "
+                                f"trigger retry. Issues: {cell_issues[:3]}"
                             )
                         else:
+                            if cell_issues:
+                                # Soft issues: log but keep the cell
+                                logger.info(
+                                    f"[builder batch {batch_idx}] cell {cid} has "
+                                    f"{len(cell_issues)} soft issues (keeping): "
+                                    f"{cell_issues[:3]}"
+                                )
                             out[cid] = cell
                     return out
 
@@ -938,7 +946,7 @@ class PipelineOrchestrator:
                 for p in result.get("prompt_cells", []) or []:
                     if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                         merged_by_id[p["cell_id"]] = p
-                merged_by_id = _filter_truncated(merged_by_id)
+                merged_by_id = _filter_invalid(merged_by_id)
                 merged_demos: list[dict] = list(result.get("demo_outputs", []) or [])
                 missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
 
@@ -962,7 +970,7 @@ class PipelineOrchestrator:
                         for p in retry_result.get("prompt_cells", []) or []:
                             if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                                 new_candidates[p["cell_id"]] = p
-                        new_candidates = _filter_truncated(new_candidates)
+                        new_candidates = _filter_invalid(new_candidates)
                         merged_by_id.update(new_candidates)
                         merged_demos.extend(retry_result.get("demo_outputs", []) or [])
                         missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
@@ -985,11 +993,11 @@ class PipelineOrchestrator:
                     cell_retry_results = await asyncio.gather(*cell_retry_tasks)
                     for cid, (single_cell, single_demos) in zip(missing_ids, cell_retry_results):
                         if single_cell is not None:
-                            bad, reason = _prompt_cell_looks_truncated(single_cell)
-                            if bad:
+                            is_valid, cell_issues = _validate_prompt_cell(single_cell)
+                            if not is_valid:
                                 logger.warning(
-                                    f"[builder cell-retry] {cid} still looks truncated after "
-                                    f"single-cell call: {reason} — accepting anyway (best effort)"
+                                    f"[builder cell-retry] {cid} still has issues after "
+                                    f"single-cell call: {cell_issues[:3]} — accepting anyway (best effort)"
                                 )
                             merged_by_id[cid] = single_cell
                         merged_demos.extend(single_demos)
@@ -1198,43 +1206,122 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     return thread
 
 
-def _prompt_cell_looks_truncated(cell: dict) -> tuple[bool, str]:
-    """Heuristically detect whether a works_builder prompt_cell is truncated.
+def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
+    """Validate a works_builder prompt_cell for quality issues that would
+    otherwise only be caught by chancellery_final — shifting quality checks
+    LEFT to catch problems at the cell level immediately after building.
 
-    When the relay cuts responses at ~8K chars, the JSON truncation repair can
-    still produce a structurally-valid cell dict where one field (usually
-    system_prompt) is chopped mid-sentence. The cell count check would pass
-    but the content is unusable. Chancellery_final will then complain.
+    Checks performed (zero LLM cost, pure logic):
+    1. Required fields present and non-empty
+    2. system_prompt not truncated (length + ending heuristic)
+    3. system_prompt contains essential sections (compliance, keywords, differentiation)
+    4. demo_output within platform length bounds
+    5. media_brief and comment_seeds present
 
-    Returns (is_truncated, reason). Empty reason means not truncated.
+    Returns (is_valid, list_of_issues). Empty issues = valid.
     """
+    issues: list[str] = []
     if not isinstance(cell, dict):
-        return True, "cell 不是 dict"
+        return False, ["cell 不是 dict"]
 
+    cid = cell.get("cell_id", "?")
+    platform = (cell.get("platform") or "").lower()
+
+    # ── 1. Required fields ─────────────────────────────────────────────
+    required_fields = [
+        "cell_id", "direction_id", "platform",
+        "system_prompt", "user_prompt_template", "demo_output",
+    ]
+    for field in required_fields:
+        val = cell.get(field)
+        if not val or (isinstance(val, str) and not val.strip()):
+            issues.append(f"{cid}: 必填字段 {field} 为空")
+
+    # media_brief and comment_seeds: warn if missing but don't hard-fail
+    # (some older prompts may not produce them)
+    if not cell.get("media_brief"):
+        issues.append(f"{cid}: media_brief 缺失")
+    if not cell.get("comment_seeds"):
+        issues.append(f"{cid}: comment_seeds 缺失")
+
+    # ── 2. system_prompt truncation + minimum length ───────────────────
     sp = (cell.get("system_prompt") or "").strip()
-    if not sp:
-        return True, "system_prompt 为空"
-    if len(sp) < 500:
-        return True, f"system_prompt 过短（{len(sp)} 字符 < 500 最低门槛）"
+    if sp:
+        if len(sp) < 500:
+            issues.append(f"{cid}: system_prompt 过短（{len(sp)} 字符 < 500）")
 
-    # Clean sentence terminators we'll accept at the end
-    clean_endings = (
-        "。", "！", "？", "」", "』", "}", "】", "）", ")",
-        ".", "!", "?", "\"", "'", "\u201d", "\u2019",
-    )
-    if not sp.endswith(clean_endings):
-        # Grab last 40 chars for context
-        tail = sp[-40:].replace("\n", " ")
-        return True, f"system_prompt 结尾不完整（末尾: ...{tail!r}）"
+        clean_endings = (
+            "。", "！", "？", "」", "』", "}", "】", "）", ")",
+            ".", "!", "?", "\"", "'", "\u201d", "\u2019",
+        )
+        if not sp.endswith(clean_endings):
+            tail = sp[-40:].replace("\n", " ")
+            issues.append(f"{cid}: system_prompt 结尾不完整（末尾: ...{tail!r}）")
 
+    # ── 3. system_prompt must contain essential sections ────────────────
+    if sp:
+        essential_keywords = {
+            "合规": "合规/compliance 规则",
+            "关键词": "关键词植入指令",
+            "禁止": "反 AI 腔禁用清单",
+        }
+        for keyword, description in essential_keywords.items():
+            if keyword not in sp:
+                issues.append(f"{cid}: system_prompt 缺少「{description}」（找不到 '{keyword}'）")
+
+        # Check differentiation pools — at least mention narrative/opening/emotion
+        pool_keywords = ["叙事", "开头", "情绪"]
+        pool_missing = [kw for kw in pool_keywords if kw not in sp]
+        if len(pool_missing) >= 2:
+            issues.append(
+                f"{cid}: system_prompt 差异化池不完整（缺少: {'/'.join(pool_missing)}）"
+            )
+
+    # ── 4. demo_output platform-specific length check ──────────────────
     demo = (cell.get("demo_output") or "").strip()
-    if demo and len(demo) < 50:
-        return True, f"demo_output 过短（{len(demo)} 字符）"
-    if demo and not demo.endswith(clean_endings):
-        tail = demo[-40:].replace("\n", " ")
-        return True, f"demo_output 结尾不完整（末尾: ...{tail!r}）"
+    if demo:
+        # Platform length ranges (chars, approximate)
+        platform_ranges = {
+            "小红书": (200, 1000),
+            "xiaohongshu": (200, 1000),
+            "抖音": (50, 500),
+            "douyin": (50, 500),
+            "b站": (150, 600),
+            "bilibili": (150, 600),
+            "知乎": (300, 2000),
+            "zhihu": (300, 2000),
+            "微博": (20, 200),
+            "weibo": (20, 200),
+        }
+        min_len, max_len = 50, 2000  # defaults
+        for plat_key, (pmin, pmax) in platform_ranges.items():
+            if plat_key in platform:
+                min_len, max_len = pmin, pmax
+                break
 
-    return False, ""
+        if len(demo) < min_len:
+            issues.append(
+                f"{cid}: demo_output 过短（{len(demo)} 字符 < {min_len} 平台下限）"
+            )
+        if len(demo) > max_len * 1.5:  # 50% tolerance
+            issues.append(
+                f"{cid}: demo_output 超长（{len(demo)} 字符 > {int(max_len * 1.5)} 平台上限×1.5）"
+            )
+
+        # demo truncation check
+        if len(demo) > 50 and not demo.endswith(clean_endings):
+            tail = demo[-40:].replace("\n", " ")
+            issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
+
+    # Classify: hard issues (must retry) vs soft issues (warn only)
+    hard_issues = [
+        i for i in issues
+        if any(kw in i for kw in ["为空", "过短", "结尾不完整", "过长", "差异化池不完整"])
+    ]
+    soft_issues = [i for i in issues if i not in hard_issues]
+
+    is_valid = len(hard_issues) == 0
+    return is_valid, issues
 
 
 def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], str]:
