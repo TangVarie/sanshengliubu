@@ -30,18 +30,35 @@ def init_api_config():
     """Call from Streamlit main thread to cache API secrets for background use.
 
     Supports two modes (auto-detected from secrets.toml):
-    - Vertex AI:  GCP_PROJECT_ID + GCP_REGION  → AnthropicVertex client
-    - Relay/Direct: ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) → Anthropic client
+    - Vertex AI:  GCP_PROJECT_ID + GCP_REGION (+ optional gcp_service_account section)
+    - Relay/Direct: ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL)
     """
     # Vertex AI mode
     if st.secrets.get("GCP_PROJECT_ID"):
         _api_config["mode"] = "vertex"
         _api_config["project_id"] = st.secrets["GCP_PROJECT_ID"]
         _api_config["region"] = st.secrets.get("GCP_REGION", "us-east5")
-        logger.info(
-            f"[init_api_config] Vertex AI mode: project={_api_config['project_id']}, "
-            f"region={_api_config['region']}"
-        )
+
+        # Build credentials from service account JSON in secrets (for Streamlit Cloud)
+        if "gcp_service_account" in st.secrets:
+            from google.oauth2 import service_account
+            sa_info = dict(st.secrets["gcp_service_account"])
+            credentials = service_account.Credentials.from_service_account_info(
+                sa_info,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            _api_config["credentials"] = credentials
+            logger.info(
+                f"[init_api_config] Vertex AI mode (Service Account): "
+                f"project={_api_config['project_id']}, region={_api_config['region']}, "
+                f"sa={sa_info.get('client_email', '?')}"
+            )
+        else:
+            # No service account in secrets → rely on ADC (gcloud auth / env var)
+            logger.info(
+                f"[init_api_config] Vertex AI mode (ADC): "
+                f"project={_api_config['project_id']}, region={_api_config['region']}"
+            )
     else:
         # Legacy relay / direct Anthropic mode
         _api_config["mode"] = "direct"
@@ -83,13 +100,16 @@ class BaseAgent:
             init_api_config()
 
         if _api_config.get("mode") == "vertex":
-            # Vertex AI — uses Google Cloud ADC, no API key needed
             from anthropic import AnthropicVertex
-            return AnthropicVertex(
-                project_id=_api_config["project_id"],
-                region=_api_config["region"],
-                timeout=900.0,
-            )
+            vertex_kwargs: dict[str, Any] = {
+                "project_id": _api_config["project_id"],
+                "region": _api_config["region"],
+                "timeout": 900.0,
+            }
+            # Pass explicit credentials if service account JSON was in secrets
+            if "credentials" in _api_config:
+                vertex_kwargs["credentials"] = _api_config["credentials"]
+            return AnthropicVertex(**vertex_kwargs)
         else:
             # Direct Anthropic / relay proxy
             kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
