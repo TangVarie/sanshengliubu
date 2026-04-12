@@ -2,34 +2,37 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.8.2"
+VERSION = "v0.8.3"
 VERSION_DATE = "2026-04-12"
-VERSION_NOTES = "Vertex Opus 4.1 · thinking 关闭 · 调用间限速 15s · 适配 15K TPM"
+VERSION_NOTES = "切回中转站 · opus-4-6-thinking + plain opus · 恢复并发/thinking/max_tokens"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# Using Opus 4.1 on Vertex AI (only model with available quota).
-# Opus 4.1 does NOT support adaptive thinking — must use budget_tokens.
+# Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
+# Execution stages use plain opus (no thinking, faster).
+# When switching to Vertex: change both to "claude-opus-4-6" (Vertex doesn't
+# use -thinking suffix, thinking is controlled by THINKING_STAGES).
 
-MODEL = "claude-opus-4-1"
+OPUS_THINKING = "claude-opus-4-6-thinking"
+OPUS_PLAIN = "claude-opus-4-6"
 
 MODELS: dict[str, str] = {
-    # ── Strategy / review / architect (thinking enabled) ──
-    "crown_prince": MODEL,
-    "secretariat": MODEL,
-    "chancellery": MODEL,
-    "ministry_works": MODEL,
-    "chancellery_final": MODEL,
-    # ── Execution stages (thinking disabled for speed) ──
-    "dispatcher": MODEL,
-    "ministry_personnel": MODEL,
-    "ministry_revenue": MODEL,
-    "ministry_rites": MODEL,
-    "ministry_war": MODEL,
-    "ministry_justice": MODEL,
-    "ministry_works_cell_planner": MODEL,
-    "ministry_works_builder": MODEL,
-    "vibe_critic": MODEL,
-    "vibe_rewriter": MODEL,
+    # ── Opus + thinking (strategy / review / architect) ──
+    "crown_prince": OPUS_THINKING,
+    "secretariat": OPUS_THINKING,
+    "chancellery": OPUS_THINKING,
+    "ministry_works": OPUS_THINKING,
+    "chancellery_final": OPUS_THINKING,
+    # ── Plain opus (execution stages) ──
+    "dispatcher": OPUS_PLAIN,
+    "ministry_personnel": OPUS_PLAIN,
+    "ministry_revenue": OPUS_PLAIN,
+    "ministry_rites": OPUS_PLAIN,
+    "ministry_war": OPUS_PLAIN,
+    "ministry_justice": OPUS_PLAIN,
+    "ministry_works_cell_planner": OPUS_PLAIN,
+    "ministry_works_builder": OPUS_PLAIN,
+    "vibe_critic": OPUS_PLAIN,
+    "vibe_rewriter": OPUS_PLAIN,
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -42,72 +45,69 @@ RETRY_BASE_DELAY_SECONDS = 3  # exponential backoff: 3s, 6s
 MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
 
 # ── Token limits ───────────────────────────────────────────────────────────
-# All stages run opus-thinking now. max_tokens must accommodate
-# (thinking_budget + actual_output). Headroom kept generous because opus
-# thinking can produce long internal reasoning.
+# max_tokens must accommodate (thinking_budget + actual_output) for thinking stages.
 
-MAX_TOKENS_DEFAULT = 8192
-MAX_TOKENS_STRATEGY = 16000  # strategy/review stages
+MAX_TOKENS_DEFAULT = 16000
+MAX_TOKENS_STRATEGY = 32000  # strategy/review stages need most room
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
-    "dispatcher": 8192,
-    "ministry_personnel": 8192,
-    "ministry_revenue": 8192,
-    "ministry_rites": 8192,
-    "ministry_war": 8192,
-    "ministry_justice": 8192,
-    "ministry_works": MAX_TOKENS_STRATEGY,        # architect — global skeleton
-    "ministry_works_cell_planner": 8192,
-    "ministry_works_builder": 16000,              # self-contained prompts need more
-    "vibe_critic": 8192,
-    "vibe_rewriter": 12000,
+    "dispatcher": 20000,
+    "ministry_personnel": 20000,
+    "ministry_revenue": 20000,
+    "ministry_rites": 20000,
+    "ministry_war": 20000,
+    "ministry_justice": 20000,
+    "ministry_works": MAX_TOKENS_STRATEGY,
+    "ministry_works_cell_planner": 20000,
+    "ministry_works_builder": 32000,
+    "vibe_critic": 20000,
+    "vibe_rewriter": 24000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-# Concurrency = 1: Vertex AI quota is only 15K input tokens/min for Opus 4.1.
-# Each call uses 3-10K input tokens, so we can only do ~1-2 calls per minute.
-# Serial execution prevents quota exhaustion.
-MATRIX_BATCH_CONCURRENCY = 1    # serial — one builder call at a time
-MATRIX_CELLS_PER_BATCH = 1      # one cell per call (simplest JSON structure)
+MATRIX_BATCH_CONCURRENCY = 3    # parallel builder calls
+MATRIX_CELLS_PER_BATCH = 1      # one cell per call (safest for JSON structure)
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
-CELL_PLANNER_CONCURRENCY = 1    # serial — one planner call at a time
+CELL_PLANNER_CONCURRENCY = 3    # parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# DISABLED: 15K TPM quota is too tight for thinking overhead.
-# Each thinking call roughly doubles token usage (thinking output counts
-# toward billing). With serial execution and 15K/min, we can't afford it.
-# Re-enable when quota increases.
+# 5 strategy/review stages use extended thinking (budget_tokens on relay,
+# adaptive on Vertex 4.6). Execution stages skip thinking for speed.
 
-THINKING_STAGES: frozenset[str] = frozenset()  # empty = no stage uses thinking
+THINKING_STAGES: frozenset[str] = frozenset({
+    "crown_prince",
+    "secretariat",
+    "chancellery",
+    "ministry_works",
+    "chancellery_final",
+})
 
-THINKING_BUDGET_TOKENS = 4096  # unused while THINKING_STAGES is empty
+THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────
-# Minimum seconds between API calls. With 15K TPM and ~3-5K input per call,
-# we need to spread calls across time to avoid 429.
-MIN_SECONDS_BETWEEN_CALLS = 15  # ~4 calls/min × 4K avg = 16K ≈ safe under 15K
+# Set to 0 for relay/direct (no rate limit needed). Increase for Vertex if
+# quota is tight.
+MIN_SECONDS_BETWEEN_CALLS = 0
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
-# Vertex AI pricing: Opus 4.6 input $5, output $25 (direct Anthropic is same).
-# Thinking tokens count as output tokens.
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    "claude-opus-4-6": 15.0,
+    "claude-opus-4-6-thinking": 15.0,
     "claude-opus-4-1": 5.0,
-    "claude-opus-4-6": 5.0,
-    "claude-opus-4-6-thinking": 5.0,
     "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-6": 75.0,
+    "claude-opus-4-6-thinking": 75.0,
     "claude-opus-4-1": 25.0,
-    "claude-opus-4-6": 25.0,
-    "claude-opus-4-6-thinking": 25.0,
     "claude-sonnet-4-6": 15.0,
 }
 
