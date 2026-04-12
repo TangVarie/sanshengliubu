@@ -127,19 +127,40 @@ class SupabaseClient:
         entry. With dozens of retries, total payload exceeds Supabase free
         tier connection limits (httpx.ReadError). output_data (which has the
         agent's response) is much smaller and sufficient for UI rendering.
+
+        Falls back to a lighter query (no output_data) if the first attempt
+        fails due to connection issues — at least the UI can show status.
         """
-        resp = (
-            self.client.table("stage_logs")
-            .select(
-                "id, run_id, stage_name, status, output_data, error_message, "
-                "model_used, tokens_used, duration_seconds, human_intervention, "
-                "created_at, updated_at"
-            )
-            .eq("run_id", run_id)
-            .order("created_at")
-            .execute()
+        select_full = (
+            "id, run_id, stage_name, status, output_data, error_message, "
+            "model_used, tokens_used, duration_seconds, human_intervention, "
+            "created_at, updated_at"
         )
-        return resp.data
+        select_light = (
+            "id, run_id, stage_name, status, error_message, "
+            "model_used, tokens_used, duration_seconds, "
+            "created_at, updated_at"
+        )
+        for attempt, columns in enumerate([select_full, select_light]):
+            try:
+                resp = (
+                    self.client.table("stage_logs")
+                    .select(columns)
+                    .eq("run_id", run_id)
+                    .order("created_at")
+                    .execute()
+                )
+                if attempt > 0:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "get_stage_logs: full query failed, using lightweight "
+                        "fallback (no output_data). Stage outputs won't render."
+                    )
+                return resp.data
+            except Exception:
+                if attempt == 0:
+                    continue  # try lighter query
+                raise  # both failed
 
     def get_stage_log_by_id(self, log_id: str) -> dict | None:
         resp = self.client.table("stage_logs").select("*").eq("id", log_id).execute()
