@@ -2,40 +2,35 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.7.6"
-VERSION_DATE = "2026-04-10"
-VERSION_NOTES = "cell 即时质量校验：字段/截断/字数/必含内容，不合格当场 retry，不进终审"
+VERSION = "v0.8.0"
+VERSION_DATE = "2026-04-12"
+VERSION_NOTES = "Vertex AI 支持 + adaptive thinking（告别中转站 8K 截断）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# Sonnet is fully retired (relay vip group has no sonnet channels). The
-# original 5 strategy/review stages keep opus-thinking; the previously-sonnet
-# 10 execution stages now use plain opus (no thinking) — same Opus quality,
-# without the thinking overhead.
-#
-# If a -thinking channel call fails, _call_claude falls back to plain
-# claude-opus-4-6 automatically.
+# All stages use the same base model. On Vertex AI, thinking is controlled
+# by _use_thinking (adaptive thinking) not model name suffix. On legacy relay,
+# the -thinking suffix may still be appended at runtime by _call_claude.
 
-OPUS_THINKING = "claude-opus-4-6-thinking"
-OPUS_PLAIN = "claude-opus-4-6"
+MODEL = "claude-opus-4-6"
 
 MODELS: dict[str, str] = {
-    # ── Opus + thinking (strategy / review / architect) ──
-    "crown_prince": OPUS_THINKING,         # 太子 — parsing
-    "secretariat": OPUS_THINKING,          # 中书省 — strategy
-    "chancellery": OPUS_THINKING,          # 门下省 — review
-    "ministry_works": OPUS_THINKING,       # 工部架构 — global skeleton
-    "chancellery_final": OPUS_THINKING,    # 终审
-    # ── Plain opus (execution stages — replaces sonnet) ──
-    "dispatcher": OPUS_PLAIN,              # 尚书省 — task split
-    "ministry_personnel": OPUS_PLAIN,      # 吏部
-    "ministry_revenue": OPUS_PLAIN,        # 户部
-    "ministry_rites": OPUS_PLAIN,          # 礼部
-    "ministry_war": OPUS_PLAIN,            # 兵部
-    "ministry_justice": OPUS_PLAIN,        # 刑部
-    "ministry_works_cell_planner": OPUS_PLAIN,
-    "ministry_works_builder": OPUS_PLAIN,
-    "vibe_critic": OPUS_PLAIN,
-    "vibe_rewriter": OPUS_PLAIN,
+    # ── Strategy / review / architect (thinking enabled) ──
+    "crown_prince": MODEL,
+    "secretariat": MODEL,
+    "chancellery": MODEL,
+    "ministry_works": MODEL,
+    "chancellery_final": MODEL,
+    # ── Execution stages (thinking disabled for speed) ──
+    "dispatcher": MODEL,
+    "ministry_personnel": MODEL,
+    "ministry_revenue": MODEL,
+    "ministry_rites": MODEL,
+    "ministry_war": MODEL,
+    "ministry_justice": MODEL,
+    "ministry_works_cell_planner": MODEL,
+    "ministry_works_builder": MODEL,
+    "vibe_critic": MODEL,
+    "vibe_rewriter": MODEL,
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -89,31 +84,32 @@ CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
 CELL_PLANNER_CONCURRENCY = 3    # max parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# Only the 5 opus-thinking strategy/review stages use extended thinking.
-# Plain opus execution stages skip thinking entirely (faster + cheaper).
-THINKING_BUDGET_TOKENS = 10000  # default for any thinking stage
+# On Vertex AI: uses adaptive thinking (model decides when/how much to think).
+# On legacy relay: uses budget_tokens=10000 as fallback.
+# Thinking is enabled for the 5 strategy/review stages listed in
+# _THINKING_STAGES below. Execution stages skip thinking for speed.
 
-STAGE_THINKING_BUDGET: dict[str, int] = {
-    "crown_prince": 10000,
-    "secretariat": 10000,
-    "chancellery": 10000,
-    "ministry_works": 10000,        # architect — global skeleton design
-    "chancellery_final": 10000,
-}
+THINKING_STAGES: frozenset[str] = frozenset({
+    "crown_prince",
+    "secretariat",
+    "chancellery",
+    "ministry_works",
+    "chancellery_final",
+})
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
-# Thinking variants cost the same as base models on the relay; thinking
-# tokens are billed as output tokens.
+# Vertex AI pricing: Opus 4.6 input $5, output $25 (direct Anthropic is same).
+# Thinking tokens count as output tokens.
 
 COST_PER_1M_INPUT: dict[str, float] = {
-    "claude-opus-4-6-thinking": 15.0,
-    "claude-opus-4-6": 15.0,
-    "claude-sonnet-4-6": 3.0,  # legacy run logs may reference this
+    "claude-opus-4-6": 5.0,
+    "claude-opus-4-6-thinking": 5.0,  # legacy relay logs
+    "claude-sonnet-4-6": 3.0,         # legacy logs
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
-    "claude-opus-4-6-thinking": 75.0,
-    "claude-opus-4-6": 75.0,
+    "claude-opus-4-6": 25.0,
+    "claude-opus-4-6-thinking": 25.0,
     "claude-sonnet-4-6": 15.0,
 }
 

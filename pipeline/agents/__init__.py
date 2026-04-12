@@ -18,7 +18,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_BUDGET_TOKENS, STAGE_THINKING_BUDGET
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -27,13 +27,33 @@ _api_config: dict[str, str] = {}
 
 
 def init_api_config():
-    """Call from Streamlit main thread to cache API secrets for background use."""
-    _api_config["api_key"] = st.secrets["ANTHROPIC_API_KEY"]
-    base_url = st.secrets.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-    # SDK auto-appends /v1, strip if user already included it
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
-    _api_config["base_url"] = base_url
+    """Call from Streamlit main thread to cache API secrets for background use.
+
+    Supports two modes (auto-detected from secrets.toml):
+    - Vertex AI:  GCP_PROJECT_ID + GCP_REGION  → AnthropicVertex client
+    - Relay/Direct: ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) → Anthropic client
+    """
+    # Vertex AI mode
+    if st.secrets.get("GCP_PROJECT_ID"):
+        _api_config["mode"] = "vertex"
+        _api_config["project_id"] = st.secrets["GCP_PROJECT_ID"]
+        _api_config["region"] = st.secrets.get("GCP_REGION", "us-east5")
+        logger.info(
+            f"[init_api_config] Vertex AI mode: project={_api_config['project_id']}, "
+            f"region={_api_config['region']}"
+        )
+    else:
+        # Legacy relay / direct Anthropic mode
+        _api_config["mode"] = "direct"
+        _api_config["api_key"] = st.secrets["ANTHROPIC_API_KEY"]
+        base_url = st.secrets.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        _api_config["base_url"] = base_url
+        logger.info(
+            f"[init_api_config] Direct/relay mode: "
+            f"base_url={'(default)' if not base_url else base_url}"
+        )
 
 
 class ClarificationNeeded(Exception):
@@ -61,12 +81,22 @@ class BaseAgent:
     def _get_client(self) -> anthropic.Anthropic:
         if not _api_config:
             init_api_config()
-        kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
-        if _api_config.get("base_url"):
-            kwargs["base_url"] = _api_config["base_url"]
-        # Generous timeout — proxy may be slow, thinking calls use streaming
-        kwargs["timeout"] = 900.0  # 15 min
-        return anthropic.Anthropic(**kwargs)
+
+        if _api_config.get("mode") == "vertex":
+            # Vertex AI — uses Google Cloud ADC, no API key needed
+            from anthropic import AnthropicVertex
+            return AnthropicVertex(
+                project_id=_api_config["project_id"],
+                region=_api_config["region"],
+                timeout=900.0,
+            )
+        else:
+            # Direct Anthropic / relay proxy
+            kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
+            if _api_config.get("base_url"):
+                kwargs["base_url"] = _api_config["base_url"]
+            kwargs["timeout"] = 900.0  # 15 min
+            return anthropic.Anthropic(**kwargs)
 
     # Agents that need strategy-level methodology (差异化/真实感/平台感知)
     _STRATEGY_STAGES = frozenset({
@@ -113,11 +143,10 @@ class BaseAgent:
 
     @property
     def _use_thinking(self) -> bool:
-        # Model name is the switch: any model with "thinking" in its ID uses
-        # extended thinking. If the relay's -thinking channel fails, the
-        # fallback in _call_claude strips the suffix and retries with the
-        # base model name (no thinking).
-        return "thinking" in self.model
+        # Thinking is enabled for specific strategic stages, not tied to model name.
+        # On Vertex: uses adaptive thinking (model decides depth).
+        # On relay: uses budget_tokens=10000 as fallback.
+        return self.stage_name in THINKING_STAGES
 
     @staticmethod
     def _build_content_blocks(text: str) -> list[dict[str, Any]] | str:
@@ -161,76 +190,73 @@ class BaseAgent:
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
         """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
 
-        Opus thinking models first try with extended thinking + streaming.
-        Falls back to plain call if the proxy doesn't support these features.
+        Two modes:
+        - Vertex AI: uses adaptive thinking (no budget_tokens), system= works normally.
+        - Relay/direct: legacy path with budget_tokens thinking + proxy fallbacks.
         """
         client = self._get_client()
+        is_vertex = _api_config.get("mode") == "vertex"
 
         # Build content (may include image blocks)
         user_content = self._build_content_blocks(user_message)
-
-        # Build base kwargs
-        if self._use_thinking:
-            # Thinking mode: system prompt goes into user message
-            if isinstance(user_content, str):
-                combined = system_prompt + "\n\n---\n\n" + user_content
-            else:
-                # Prepend system prompt as text block before image blocks
-                combined = [{"type": "text", "text": system_prompt + "\n\n---\n\n"}] + user_content
-            messages = [{"role": "user", "content": combined}]
-        else:
-            messages = [{"role": "user", "content": user_content}]
+        messages = [{"role": "user", "content": user_content}]
 
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
+            "system": system_prompt,
             "messages": messages,
         }
 
-        if not self._use_thinking:
-            kwargs["system"] = system_prompt
+        # ── Vertex AI path: clean, no workarounds ────────────────────────
+        if is_vertex:
+            if self._use_thinking:
+                kwargs["thinking"] = {"type": "adaptive"}
+            # Always stream on Vertex (avoids timeout for large outputs)
+            with client.messages.stream(**kwargs) as stream:
+                response = stream.get_final_message()
 
-        # Try with thinking first, fall back to plain call if proxy doesn't support it
-        response = None
-        if self._use_thinking:
-            budget = STAGE_THINKING_BUDGET.get(self.stage_name, THINKING_BUDGET_TOKENS)
-            thinking_kwargs = {
-                **kwargs,
-                "thinking": {"type": "enabled", "budget_tokens": budget},
-            }
-            try:
-                # Streaming is required by SDK for long-running thinking requests (>10min).
-                # Use stream context manager and collect final message.
-                with client.messages.stream(**thinking_kwargs) as stream:
-                    response = stream.get_final_message()
-            except Exception as e:
-                err_str = str(e) or repr(e)
-                # Fallback for proxy-incompatibility errors (thinking unsupported, etc.)
-                err_lower = err_str.lower()
-                if (
-                    "构建请求" in err_str
-                    or "thinking" in err_lower
-                    or "model_not_found" in err_lower
-                    or ("model" in err_lower and "not" in err_lower)
-                    or (not err_str.strip())  # empty body from proxy → also try fallback
-                ):
-                    # Strip -thinking suffix from model name in case the proxy doesn't
-                    # recognize it at all. Fall back to base model name + plain call.
-                    base_model = self.model.replace("-thinking", "")
-                    logger.warning(
-                        f"[{self.stage_name}] thinking stream failed ({e!r}), "
-                        f"falling back to plain call: model {self.model} → {base_model}"
-                    )
-                    kwargs["model"] = base_model
-                    kwargs["system"] = system_prompt
-                    kwargs["messages"] = [{"role": "user", "content": user_message}]
+        # ── Relay / direct path: legacy workarounds ──────────────────────
+        else:
+            response = None
+            if self._use_thinking:
+                # Relay workaround: system prompt goes into user message
+                # (some relays don't pass system= with thinking enabled)
+                if isinstance(user_content, str):
+                    combined = system_prompt + "\n\n---\n\n" + user_content
                 else:
-                    raise  # re-raise quota, network, etc. errors
+                    combined = [{"type": "text", "text": system_prompt + "\n\n---\n\n"}] + user_content
+                thinking_kwargs = {
+                    "model": self.model,
+                    "max_tokens": self.max_tokens,
+                    "messages": [{"role": "user", "content": combined}],
+                    "thinking": {"type": "enabled", "budget_tokens": 10000},
+                }
+                try:
+                    with client.messages.stream(**thinking_kwargs) as stream:
+                        response = stream.get_final_message()
+                except Exception as e:
+                    err_str = str(e) or repr(e)
+                    err_lower = err_str.lower()
+                    if (
+                        "构建请求" in err_str
+                        or "thinking" in err_lower
+                        or "model_not_found" in err_lower
+                        or ("model" in err_lower and "not" in err_lower)
+                        or (not err_str.strip())
+                    ):
+                        base_model = self.model.replace("-thinking", "")
+                        logger.warning(
+                            f"[{self.stage_name}] thinking stream failed ({e!r}), "
+                            f"falling back to plain call: {self.model} → {base_model}"
+                        )
+                        kwargs["model"] = base_model
+                        kwargs["messages"] = [{"role": "user", "content": user_message}]
+                    else:
+                        raise
 
-        if response is None:
-            # Non-thinking path (or thinking fallback): plain create.
-            # max_tokens is small enough that the SDK won't enforce streaming.
-            response = client.messages.create(**kwargs)
+            if response is None:
+                response = client.messages.create(**kwargs)
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
@@ -244,9 +270,9 @@ class BaseAgent:
 
         if self._use_thinking:
             logger.info(
-                f"[{self.stage_name}] thinking enabled={self._use_thinking}, "
-                f"response has thinking block={has_thinking}, "
-                f"content block types={[b.type for b in response.content]}"
+                f"[{self.stage_name}] thinking={has_thinking}, "
+                f"blocks={[b.type for b in response.content]}, "
+                f"mode={'vertex' if is_vertex else 'relay'}"
             )
 
         input_tokens = response.usage.input_tokens
