@@ -79,19 +79,19 @@ CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
 CELL_PLANNER_CONCURRENCY = 1    # serial — one planner call at a time
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# Opus 4.1 does NOT support adaptive thinking — must use budget_tokens.
-# With 15K TPM quota, thinking budget kept small (4096) to conserve tokens.
-# Execution stages skip thinking entirely.
+# DISABLED: 15K TPM quota is too tight for thinking overhead.
+# Each thinking call roughly doubles token usage (thinking output counts
+# toward billing). With serial execution and 15K/min, we can't afford it.
+# Re-enable when quota increases.
 
-THINKING_STAGES: frozenset[str] = frozenset({
-    "crown_prince",
-    "secretariat",
-    "chancellery",
-    "ministry_works",
-    "chancellery_final",
-})
+THINKING_STAGES: frozenset[str] = frozenset()  # empty = no stage uses thinking
 
-THINKING_BUDGET_TOKENS = 4096  # small to stay within 15K TPM quota
+THINKING_BUDGET_TOKENS = 4096  # unused while THINKING_STAGES is empty
+
+# ── Rate Limiting ─────────────────────────────────────────────────────────
+# Minimum seconds between API calls. With 15K TPM and ~3-5K input per call,
+# we need to spread calls across time to avoid 429.
+MIN_SECONDS_BETWEEN_CALLS = 15  # ~4 calls/min × 4K avg = 16K ≈ safe under 15K
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 # Vertex AI pricing: Opus 4.6 input $5, output $25 (direct Anthropic is same).

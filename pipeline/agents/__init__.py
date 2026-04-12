@@ -18,7 +18,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES, THINKING_BUDGET_TOKENS
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES, THINKING_BUDGET_TOKENS, MIN_SECONDS_BETWEEN_CALLS
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -207,13 +207,25 @@ class BaseAgent:
 
         return blocks if blocks else text
 
+    # Class-level timestamp for rate limiting across all agents
+    _last_call_time: float = 0.0
+
     def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
         """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
 
         Two modes:
-        - Vertex AI: uses adaptive thinking (no budget_tokens), system= works normally.
+        - Vertex AI: uses adaptive/budget thinking, system= works normally.
         - Relay/direct: legacy path with budget_tokens thinking + proxy fallbacks.
         """
+        # Rate limiting: ensure minimum gap between API calls (Vertex 15K TPM)
+        if MIN_SECONDS_BETWEEN_CALLS > 0:
+            elapsed = time.time() - BaseAgent._last_call_time
+            if elapsed < MIN_SECONDS_BETWEEN_CALLS:
+                wait = MIN_SECONDS_BETWEEN_CALLS - elapsed
+                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.1f}s")
+                time.sleep(wait)
+            BaseAgent._last_call_time = time.time()
+
         client = self._get_client()
         is_vertex = _api_config.get("mode") == "vertex"
 
