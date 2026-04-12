@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.8.1"
+VERSION = "v0.8.2"
 VERSION_DATE = "2026-04-12"
-VERSION_NOTES = "Vertex AI Opus 4.1 (us-east5, 15K TPM quota) + 低并发适配"
+VERSION_NOTES = "Vertex Opus 4.1 · thinking 关闭 · 调用间限速 15s · 适配 15K TPM"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Using Opus 4.1 on Vertex AI (only model with available quota).
