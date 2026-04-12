@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.8.4"
+VERSION = "v0.8.5"
 VERSION_DATE = "2026-04-12"
-VERSION_NOTES = "统一 base 模型名 claude-opus-4-6（中转站 -thinking channel 疑似下线）"
+VERSION_NOTES = "修复中转站调用：删掉 thinking API 参数（中转站靠模型名路由 thinking）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -12,15 +12,28 @@ VERSION_NOTES = "统一 base 模型名 claude-opus-4-6（中转站 -thinking cha
 # When switching to Vertex: change both to "claude-opus-4-6" (Vertex doesn't
 # use -thinking suffix, thinking is controlled by THINKING_STAGES).
 
-MODEL = "claude-opus-4-6"
+OPUS_THINKING = "claude-opus-4-6-thinking"
+OPUS_PLAIN = "claude-opus-4-6"
 
-MODELS: dict[str, str] = {k: MODEL for k in [
-    "crown_prince", "secretariat", "chancellery", "ministry_works",
-    "chancellery_final", "dispatcher", "ministry_personnel",
-    "ministry_revenue", "ministry_rites", "ministry_war",
-    "ministry_justice", "ministry_works_cell_planner",
-    "ministry_works_builder", "vibe_critic", "vibe_rewriter",
-]}
+MODELS: dict[str, str] = {
+    # Thinking stages: relay routes -thinking suffix to thinking backend
+    "crown_prince": OPUS_THINKING,
+    "secretariat": OPUS_THINKING,
+    "chancellery": OPUS_THINKING,
+    "ministry_works": OPUS_THINKING,
+    "chancellery_final": OPUS_THINKING,
+    # Execution stages: plain opus, no thinking
+    "dispatcher": OPUS_PLAIN,
+    "ministry_personnel": OPUS_PLAIN,
+    "ministry_revenue": OPUS_PLAIN,
+    "ministry_rites": OPUS_PLAIN,
+    "ministry_war": OPUS_PLAIN,
+    "ministry_justice": OPUS_PLAIN,
+    "ministry_works_cell_planner": OPUS_PLAIN,
+    "ministry_works_builder": OPUS_PLAIN,
+    "vibe_critic": OPUS_PLAIN,
+    "vibe_rewriter": OPUS_PLAIN,
+}
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
 

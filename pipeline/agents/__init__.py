@@ -255,47 +255,15 @@ class BaseAgent:
             with client.messages.stream(**kwargs) as stream:
                 response = stream.get_final_message()
 
-        # ── Relay / direct path: legacy workarounds ──────────────────────
+        # ── Relay / direct path ────────────────────────────────────────────
+        # IMPORTANT: relay does NOT support the `thinking` API parameter.
+        # Thinking is controlled by model NAME: relay routes "-thinking"
+        # suffix to a thinking-enabled backend. DO NOT pass `thinking={...}`
+        # — the relay returns garbage (a canned help message) when it sees it.
+        # Just use system= and messages= normally. Stream for timeout safety.
         else:
-            response = None
-            if self._use_thinking:
-                # Relay workaround: system prompt goes into user message
-                # (some relays don't pass system= with thinking enabled)
-                if isinstance(user_content, str):
-                    combined = system_prompt + "\n\n---\n\n" + user_content
-                else:
-                    combined = [{"type": "text", "text": system_prompt + "\n\n---\n\n"}] + user_content
-                thinking_kwargs = {
-                    "model": self.model,
-                    "max_tokens": self.max_tokens,
-                    "messages": [{"role": "user", "content": combined}],
-                    "thinking": {"type": "enabled", "budget_tokens": 10000},
-                }
-                try:
-                    with client.messages.stream(**thinking_kwargs) as stream:
-                        response = stream.get_final_message()
-                except Exception as e:
-                    err_str = str(e) or repr(e)
-                    err_lower = err_str.lower()
-                    if (
-                        "构建请求" in err_str
-                        or "thinking" in err_lower
-                        or "model_not_found" in err_lower
-                        or ("model" in err_lower and "not" in err_lower)
-                        or (not err_str.strip())
-                    ):
-                        base_model = self.model.replace("-thinking", "")
-                        logger.warning(
-                            f"[{self.stage_name}] thinking stream failed ({e!r}), "
-                            f"falling back to plain call: {self.model} → {base_model}"
-                        )
-                        kwargs["model"] = base_model
-                        kwargs["messages"] = [{"role": "user", "content": user_message}]
-                    else:
-                        raise
-
-            if response is None:
-                response = client.messages.create(**kwargs)
+            with client.messages.stream(**kwargs) as stream:
+                response = stream.get_final_message()
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
