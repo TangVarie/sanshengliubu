@@ -2,16 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.8.0"
+VERSION = "v0.8.1"
 VERSION_DATE = "2026-04-12"
-VERSION_NOTES = "Vertex AI 支持 + adaptive thinking（告别中转站 8K 截断）"
+VERSION_NOTES = "Vertex AI Opus 4.1 (us-east5, 15K TPM quota) + 低并发适配"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# All stages use the same base model. On Vertex AI, thinking is controlled
-# by _use_thinking (adaptive thinking) not model name suffix. On legacy relay,
-# the -thinking suffix may still be appended at runtime by _call_claude.
+# Using Opus 4.1 on Vertex AI (only model with available quota).
+# Opus 4.1 does NOT support adaptive thinking — must use budget_tokens.
 
-MODEL = "claude-opus-4-6"
+MODEL = "claude-opus-4-1"
 
 MODELS: dict[str, str] = {
     # ── Strategy / review / architect (thinking enabled) ──
@@ -47,47 +46,42 @@ MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
 # (thinking_budget + actual_output). Headroom kept generous because opus
 # thinking can produce long internal reasoning.
 
-MAX_TOKENS_DEFAULT = 16000
-MAX_TOKENS_STRATEGY = 32000  # strategy/review stages need most room
+MAX_TOKENS_DEFAULT = 8192
+MAX_TOKENS_STRATEGY = 16000  # strategy/review stages
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
-    "dispatcher": 20000,
-    "ministry_personnel": 20000,
-    "ministry_revenue": 20000,
-    "ministry_rites": 20000,
-    "ministry_war": 20000,
-    "ministry_justice": 20000,
+    "dispatcher": 8192,
+    "ministry_personnel": 8192,
+    "ministry_revenue": 8192,
+    "ministry_rites": 8192,
+    "ministry_war": 8192,
+    "ministry_justice": 8192,
     "ministry_works": MAX_TOKENS_STRATEGY,        # architect — global skeleton
-    "ministry_works_cell_planner": 20000,
-    "ministry_works_builder": 32000,              # self-contained prompts
-    "vibe_critic": 20000,
-    "vibe_rewriter": 24000,
+    "ministry_works_cell_planner": 8192,
+    "ministry_works_builder": 16000,              # self-contained prompts need more
+    "vibe_critic": 8192,
+    "vibe_rewriter": 12000,
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-# Concurrency kept at 3 (opus-thinking is heavy on the relay).
-# Cells-per-batch = 1: each cell's system_prompt is already 2-4K tokens with
-# all 5 differentiation pools + personas + compliance + real-person samples +
-# media_brief + comment_seeds + demo_output. Batching multiple cells per call
-# causes JSON malformation (unescaped inner quotes, truncation). Single-cell
-# batches give the simplest possible JSON structure and isolate any failure
-# to exactly one cell (which Round 3 cell-retry will recover anyway).
-MATRIX_BATCH_CONCURRENCY = 3    # max parallel builder calls
-MATRIX_CELLS_PER_BATCH = 1      # cells per builder call
+# Concurrency = 1: Vertex AI quota is only 15K input tokens/min for Opus 4.1.
+# Each call uses 3-10K input tokens, so we can only do ~1-2 calls per minute.
+# Serial execution prevents quota exhaustion.
+MATRIX_BATCH_CONCURRENCY = 1    # serial — one builder call at a time
+MATRIX_CELLS_PER_BATCH = 1      # one cell per call (simplest JSON structure)
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
-CELL_PLANNER_CONCURRENCY = 3    # max parallel cell-planner calls
+CELL_PLANNER_CONCURRENCY = 1    # serial — one planner call at a time
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# On Vertex AI: uses adaptive thinking (model decides when/how much to think).
-# On legacy relay: uses budget_tokens=10000 as fallback.
-# Thinking is enabled for the 5 strategy/review stages listed in
-# _THINKING_STAGES below. Execution stages skip thinking for speed.
+# Opus 4.1 does NOT support adaptive thinking — must use budget_tokens.
+# With 15K TPM quota, thinking budget kept small (4096) to conserve tokens.
+# Execution stages skip thinking entirely.
 
 THINKING_STAGES: frozenset[str] = frozenset({
     "crown_prince",
@@ -97,17 +91,21 @@ THINKING_STAGES: frozenset[str] = frozenset({
     "chancellery_final",
 })
 
+THINKING_BUDGET_TOKENS = 4096  # small to stay within 15K TPM quota
+
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 # Vertex AI pricing: Opus 4.6 input $5, output $25 (direct Anthropic is same).
 # Thinking tokens count as output tokens.
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    "claude-opus-4-1": 5.0,
     "claude-opus-4-6": 5.0,
-    "claude-opus-4-6-thinking": 5.0,  # legacy relay logs
-    "claude-sonnet-4-6": 3.0,         # legacy logs
+    "claude-opus-4-6-thinking": 5.0,
+    "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-1": 25.0,
     "claude-opus-4-6": 25.0,
     "claude-opus-4-6-thinking": 25.0,
     "claude-sonnet-4-6": 15.0,

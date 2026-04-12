@@ -18,7 +18,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES
+from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES, THINKING_BUDGET_TOKENS
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -231,7 +231,14 @@ class BaseAgent:
         # ── Vertex AI path: clean, no workarounds ────────────────────────
         if is_vertex:
             if self._use_thinking:
-                kwargs["thinking"] = {"type": "adaptive"}
+                # Opus 4.6+: adaptive thinking. Older (4.1, 4.5): budget_tokens.
+                if "4-6" in self.model:
+                    kwargs["thinking"] = {"type": "adaptive"}
+                else:
+                    kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": THINKING_BUDGET_TOKENS,
+                    }
             # Always stream on Vertex (avoids timeout for large outputs)
             with client.messages.stream(**kwargs) as stream:
                 response = stream.get_final_message()
