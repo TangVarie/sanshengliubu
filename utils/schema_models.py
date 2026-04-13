@@ -196,8 +196,6 @@ class WorksPlan(BaseModel):
     cell_plans: list[dict[str, Any]] = []
     persona_integration_strategy: str = ""
     total_cells: int = 0
-    batch_rules: dict[str, Any] = {}
-    usage_guide: str = ""
 
 
 class PromptMatrixCell(BaseModel):
@@ -223,8 +221,6 @@ class WorksOutput(BaseModel):
     # Note: prompt_templates was removed in v0.6.1. Legacy data is read via
     # `extra="allow"` above so old runs still parse.
     matrix_dimensions: dict[str, list[str]] = {}
-    batch_rules: dict[str, Any] = {}
-    usage_guide: str = ""
     demo_outputs: list[dict[str, Any]] = []
 
 
