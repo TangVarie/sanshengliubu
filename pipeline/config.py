@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.8.5"
-VERSION_DATE = "2026-04-12"
-VERSION_NOTES = "修复中转站调用：删掉 thinking API 参数（中转站靠模型名路由 thinking）"
+VERSION = "v0.9.0"
+VERSION_DATE = "2026-04-13"
+VERSION_NOTES = "删除 usage_guide/batch_rules 静态字段 — 断开终审无限循环"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).

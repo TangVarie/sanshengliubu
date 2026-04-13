@@ -9,7 +9,7 @@
 接收前五部全部产出 + 中书省策略方案（含 matrix_skeleton），产出：
 1. **共享骨架**（shared_skeleton）——跨格子共用的 prompt 结构元素
 2. **人设集成策略**（persona_integration_strategy）——人设如何影响内容策略的通用框架
-3. **矩阵维度与批次规则**——matrix_dimensions, batch_rules, usage_guide
+3. **矩阵维度**——matrix_dimensions
 4. **不确定性汇总**——来自前五部的残余不确定性
 
 ## 核心职责
@@ -48,7 +48,7 @@
 - `_revision_directives.review_dimensions` 是终审给的各维度评分
 
 修订时的硬要求：
-1. **逐条对照清单**：mandatory_revisions 里的每一条问题，你在新 shared_skeleton / persona_integration_strategy 里都必须解决，不允许漏掉任何一条。如果某条不属于架构师能解决的（比如 cell 级的 demo 字数），可以在 batch_rules 里加约束让下游 builder 处理。
+1. **逐条对照清单**：mandatory_revisions 里的每一条问题，你在新 shared_skeleton / persona_integration_strategy 里都必须解决，不允许漏掉任何一条。如果某条不属于架构师能解决的（比如 cell 级的 demo 字数），可以在 `_revision_response.deferred_to_builder` 里说明让下游 builder 处理。
 2. **持续业务正确**：所有原本对的设计（合规、关键词、人设方法论）保留下来，只针对终审指出的问题做加法或修正，不要推翻整个架构重来。
 3. **架构师能解决的问题清单**（这些必须由你在新版本里直接解决）：
    - persona_library 缺失 / 不完整 → 在 shared_skeleton 里补齐 P01-PNN 全部人设
@@ -125,12 +125,6 @@
     "directions": ["D1", "D2", "D3"],
     "platforms": ["小红书", "抖音"]
   },
-  "batch_rules": {
-    "naming_convention": "批次编号命名规则",
-    "variable_replacement": "变量替换机制说明",
-    "output_format": "每批次输出的格式要求"
-  },
-  "usage_guide": "Prompt 矩阵使用说明（给运营人员看的）",
   "_uncertainty_summary": {}
 }
 ```

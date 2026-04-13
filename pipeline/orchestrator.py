@@ -753,8 +753,6 @@ class PipelineOrchestrator:
             return {
                 "prompt_matrix": [],
                 "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
-                "batch_rules": works_plan.get("batch_rules", {}),
-                "usage_guide": works_plan.get("usage_guide", ""),
                 "demo_outputs": [],
                 "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
             }
@@ -820,8 +818,6 @@ class PipelineOrchestrator:
                 return {
                     "prompt_matrix": all_cells_ordered,
                     "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
-                    "batch_rules": works_plan.get("batch_rules", {}),
-                    "usage_guide": works_plan.get("usage_guide", ""),
                     "demo_outputs": recovered_demos,
                     "shared_skeleton": works_plan.get("shared_skeleton", {}),
                     "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
@@ -1063,8 +1059,6 @@ class PipelineOrchestrator:
         return {
             "prompt_matrix": all_cells,
             "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
-            "batch_rules": works_plan.get("batch_rules", {}),
-            "usage_guide": works_plan.get("usage_guide", ""),
             "demo_outputs": all_demos,
             "shared_skeleton": works_plan.get("shared_skeleton", {}),
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
@@ -1437,8 +1431,8 @@ def revise_and_resume_pipeline_in_background(
     affected_direction_ids = sorted(set(re.findall(r"D\d+", all_revision_text)))
 
     global_keywords = [
-        "shared_skeleton", "batch_rules", "persona_library", "title_rules",
-        "usage_guide", "全局", "所有方向", "所有cell", "全部cell", "每个方向",
+        "shared_skeleton", "persona_library", "title_rules",
+        "全局", "所有方向", "所有cell", "全部cell", "每个方向",
         "每个cell", "统一", "全部方向",
     ]
     is_global_revision = any(
@@ -1475,7 +1469,7 @@ def revise_and_resume_pipeline_in_background(
     stages_to_redo = ["vibe_critic", "vibe_rewriter", "chancellery_final"]
 
     if is_global_revision:
-        # Global concern (persona_library / title_rules / batch_rules etc.)
+        # Global concern (persona_library / title_rules etc.)
         # → must re-run architect + all cell_planner + all builder
         stages_to_redo += [
             "ministry_works",

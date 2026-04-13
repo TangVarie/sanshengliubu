@@ -141,12 +141,6 @@ if demos:
             st.markdown(f"**人设**: {demo.get('persona_used', '')}")
             st.markdown(demo.get("output_content", ""))
 
-# Usage guide
-guide = prompt_system.get("usage_guide", "")
-if guide:
-    with st.expander("📖 使用指南"):
-        st.markdown(guide)
-
 # Uncertainty summary (low-impact residuals — high-impact resolved via clarification upstream)
 uncertainty_summary = prompt_system.get("_uncertainty_summary", {})
 if uncertainty_summary:
@@ -223,12 +217,6 @@ if uncertainty_summary:
                 st.session_state["current_project_id"] = project_id
                 st.query_params["project_id"] = project_id
                 st.switch_page("pages/3_pipeline_detail.py")
-
-# Batch rules
-batch_rules = prompt_system.get("batch_rules", {})
-if batch_rules:
-    with st.expander("⚙️ 批量管理规则"):
-        st.json(batch_rules)
 
 # ── Export ──────────────────────────────────────────────────────────────────
 

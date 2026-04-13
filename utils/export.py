@@ -12,14 +12,6 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
     lines.append(f"# {project_name or 'Prompt System'}")
     lines.append("")
 
-    # Usage guide
-    guide = prompt_system.get("usage_guide", "")
-    if guide:
-        lines.append("## 使用指南")
-        lines.append("")
-        lines.append(guide)
-        lines.append("")
-
     # Prompt matrix (platform → direction). Old runs may have only
     # `prompt_templates` (now removed in v0.6.1) — fall back for legacy data.
     matrix = prompt_system.get("prompt_matrix", []) or prompt_system.get("prompt_templates", [])
@@ -145,16 +137,6 @@ def export_as_markdown(prompt_system: dict[str, Any], project_name: str = "") ->
                 for c in checklist:
                     lines.append(f"- [ ] {c}")
             lines.append("")
-
-    # Batch rules
-    batch_rules = prompt_system.get("batch_rules", {})
-    if batch_rules:
-        lines.append("## 批量管理规则")
-        lines.append("")
-        lines.append("```json")
-        lines.append(json.dumps(batch_rules, ensure_ascii=False, indent=2))
-        lines.append("```")
-        lines.append("")
 
     # Demo outputs
     demos = prompt_system.get("demo_outputs", [])
