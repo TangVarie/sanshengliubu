@@ -33,7 +33,8 @@
 ## 规则
 
 1. **不要输出 cell_plans**——你的输出中不应包含任何 per-cell 内容
-2. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
+2. **不要输出 usage_guide 或 batch_rules**——这两个字段已废弃，批量生成规则已内置到下游 builder 的 system_prompt 里。输出里出现这两个字段会导致终审误判
+3. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
 3. 差异化工具包的每个池至少包含 5 个可选项
 4. persona_integration_strategy 必须覆盖所有在吏部输出中出现的人设类型
 5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language），下游 cell 才有人设可用

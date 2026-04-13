@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.1"
+VERSION = "v0.9.2"
 VERSION_DATE = "2026-04-13"
-VERSION_NOTES = "批量生成模式内置 system_prompt + 删除 usage_guide/batch_rules"
+VERSION_NOTES = "显式禁止工部输出 + 终审检查 usage_guide/batch_rules"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
