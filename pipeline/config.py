@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.6"
+VERSION = "v0.9.7"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "配置归拢：真指数退避 + 平台长度阈值外提 + 澄清超时可配"
+VERSION_NOTES = "README + 设置页说清 Vertex vs Anthropic 两种接入模式（二选一）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).

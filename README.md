@@ -53,13 +53,49 @@ pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
 
-编辑 `.streamlit/secrets.toml`：
+`.streamlit/secrets.toml` 分两块：**Claude 模型接入** + **Supabase**。
+Supabase 永远必填；Claude 接入在下面**二选一**（不要同时填）。
+
+#### Claude 接入 · 二选一
+
+系统启动时会自动判断使用哪种模式——只要检测到 `GCP_PROJECT_ID` 就走
+Vertex AI，否则走 Anthropic 直连/中转。逻辑在
+`pipeline/agents/__init__.py::init_api_config()`。
+
+**方式 A：Anthropic 直连 / 中转**（最简单，适合个人开发）
 
 ```toml
 ANTHROPIC_API_KEY = "sk-ant-your-key"
+# 可选：走代理/中转站时填入 base URL，不填则直连官方 API
+ANTHROPIC_BASE_URL = ""
+```
+
+- ✅ 零门槛，API Key 直接用
+- ⚠️ 官方配额小，容易限流；中转站的 thinking / prompt caching 支持不一
+- 💡 thinking 通过模型名后缀 `-thinking` 路由（中转站需支持）
+
+**方式 B：Vertex AI**（企业/生产，已有 GCP 时推荐）
+
+```toml
+GCP_PROJECT_ID = "your-project-id"
+GCP_REGION     = "asia-southeast1"   # 或其他支持 Claude 的 region
+
+[gcp_service_account]
+# 粘贴 service account JSON 内容（type / project_id / private_key / ... 字段全铺平）
+```
+
+- ✅ 配额大、合规性好、adaptive thinking 原生支持
+- ⚠️ 需要先在 GCP 申请并开通 Claude on Vertex
+
+#### Supabase（必填）
+
+```toml
 SUPABASE_URL = "https://your-project.supabase.co"
 SUPABASE_KEY = "your-anon-key"
 ```
+
+> 同时填了 A 和 B 会优先走 B（Vertex），A 的 key 会被忽略。要切换模式，
+> 把不想用的那一块整块删掉或注释掉再重启。
 
 ### 4. 启动
 
