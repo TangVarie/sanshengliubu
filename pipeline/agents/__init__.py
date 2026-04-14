@@ -18,7 +18,17 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES, THINKING_BUDGET_TOKENS, MIN_SECONDS_BETWEEN_CALLS
+from pipeline.config import (
+    ENABLE_PROMPT_CACHING,
+    MAX_RETRIES,
+    MAX_TOKENS_DEFAULT,
+    MIN_SECONDS_BETWEEN_CALLS,
+    MODELS,
+    RETRY_BASE_DELAY_SECONDS,
+    STAGE_MAX_TOKENS,
+    THINKING_BUDGET_TOKENS,
+    THINKING_STAGES,
+)
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -233,10 +243,28 @@ class BaseAgent:
         user_content = self._build_content_blocks(user_message)
         messages = [{"role": "user", "content": user_content}]
 
+        # Structured system prompt with ephemeral cache control. Anthropic
+        # caches the system portion for ~5 minutes — subsequent calls within
+        # the window pay ~10% input rate for it. Foundation + agent prompt
+        # together are ~5-15KB per agent, and we call each agent multiple
+        # times per run (strategy loop, retry rounds, batch retries), so the
+        # cache hit rate is high. Falls back to plain string when caching is
+        # disabled (e.g. for relays that 400 on cache_control).
+        if ENABLE_PROMPT_CACHING:
+            system_block: Any = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            system_block = system_prompt
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "system": system_prompt,
+            "system": system_block,
             "messages": messages,
         }
 

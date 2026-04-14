@@ -377,9 +377,25 @@ class PipelineOrchestrator:
     async def _run_ministries(
         self, tasks: dict, brief: dict, plan: dict, done: dict | None = None
     ) -> dict:
-        """Run first 5 ministries in parallel. Any failure aborts the pipeline."""
+        """Run first 5 ministries in parallel. Any failure aborts the pipeline.
+
+        Context-slimming: the 5 non-works ministries don't need the full plan
+        (matrix_skeleton / module_plan / platform_direction_matrix are all
+        downstream concerns). They only reference tactical_directions /
+        target_platforms / strategic_insight. Passing a slim plan cuts 5 ×
+        ~30KB of redundant input tokens per run. Dispatcher's task.context
+        already surfaces per-ministry direction info, so this is safe.
+        """
         task_map = tasks.get("tasks", {})
         done = done or {}
+
+        # Extract only the fields the 5 non-works ministries actually read.
+        # If a field is missing, it's fine — the prompt will just not get it.
+        slim_plan = {
+            k: plan[k]
+            for k in ("tactical_directions", "target_platforms", "strategic_insight", "system_name")
+            if k in plan
+        }
 
         async def run_one(name: str) -> tuple[str, dict]:
             # Skip if already completed in a previous run attempt
@@ -392,7 +408,7 @@ class PipelineOrchestrator:
             input_data = {
                 "task": ministry_task,
                 "brief": brief,
-                "plan": plan,
+                "plan": slim_plan,
             }
             try:
                 result = await self._run_with_clarification(agent, input_data)

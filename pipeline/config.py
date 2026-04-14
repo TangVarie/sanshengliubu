@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.4"
+VERSION = "v0.9.5"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "终审加轮次上限 + 增量评审；校验器对齐终审标准（5 池/人设/AI 空话）"
+VERSION_NOTES = "五部改传 slim_plan + system prompt 开启 ephemeral 缓存，削减 input tokens"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -99,6 +99,19 @@ THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 # Set to 0 for relay/direct (no rate limit needed). Increase for Vertex if
 # quota is tight.
 MIN_SECONDS_BETWEEN_CALLS = 0
+
+# ── Prompt Caching ────────────────────────────────────────────────────────
+# When True, the system prompt is sent with cache_control={"type":"ephemeral"}
+# so Anthropic caches it for ~5 minutes. Re-use across retries/batches hits
+# the cache and pays ~10% input-token rate for the system portion. Requires
+# system prompt to be ≥ 1024 tokens (small prompts silently don't cache).
+#
+# Vertex AI: native support.
+# Anthropic direct: native support.
+# Relay proxies: depends on the relay. Most pass the field through; some
+# drop it (cache just misses, no error). If your relay 400s on it, set this
+# to False.
+ENABLE_PROMPT_CACHING = True
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
