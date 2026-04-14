@@ -25,7 +25,12 @@ from pipeline.config import (
     PLATFORM_DEMO_LENGTH_DEFAULT,
     PLATFORM_DEMO_LENGTH_RANGES,
 )
-from pipeline.agents import ClarificationNeeded
+from pipeline.agents import (
+    ClarificationNeeded,
+    RunBudgetExceededError,
+    get_run_totals,
+    reset_run_budget,
+)
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
@@ -195,6 +200,12 @@ class PipelineOrchestrator:
         try:
             self.db.update_pipeline_run(self.run_id, status="running")
             self.db.update_project(self.project_id, status="running")
+
+            # Zero out per-run token counters so this attempt starts fresh.
+            # Reset is essential for resumed/revised runs — otherwise the
+            # previously-charged tokens would still count toward the budget
+            # cap and a run could trip the guardrail on its first retry call.
+            reset_run_budget(self.run_id)
 
             done = self._load_completed_stages()
 

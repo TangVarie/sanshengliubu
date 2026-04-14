@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.8"
+VERSION = "v0.9.9"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "防重复触发 + 线程初始化崩溃兜底 + 错误信息类型容错"
+VERSION_NOTES = "中转站硬化：预算上限 + relay 自动节流 + 缓存命中探测"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -133,9 +133,24 @@ THINKING_STAGES: frozenset[str] = frozenset({
 THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────
-# Set to 0 for relay/direct (no rate limit needed). Increase for Vertex if
-# quota is tight.
+# Per-process throttle between API calls. 0 = no throttle. init_api_config
+# upgrades this to RELAY_MIN_SECONDS_BETWEEN_CALLS on relay mode because
+# most relays have stricter concurrency caps than direct Anthropic.
 MIN_SECONDS_BETWEEN_CALLS = 0
+# Applied automatically when a relay backend is detected. Set to 0 to
+# opt out of the auto-throttle (your relay doesn't need it).
+RELAY_MIN_SECONDS_BETWEEN_CALLS = 0.3
+
+# ── Per-run budget ───────────────────────────────────────────────────────
+# Hard ceiling on combined input + output tokens accumulated within a
+# single pipeline run. Once exceeded, the next agent call raises
+# RunBudgetExceededError and the orchestrator marks the run as failed.
+# Safety net against runaway retry loops — 14 stages × worst-case retries
+# × thinking budgets can compound quickly without a cap.
+#
+# Opus at $15/M input + $75/M output → 1M tokens ≈ $45 ceiling per run
+# (assuming roughly balanced in/out). Tune to your cost tolerance.
+MAX_TOKENS_PER_RUN = 2_000_000
 
 # ── Prompt Caching ────────────────────────────────────────────────────────
 # When True, the system prompt is sent with cache_control={"type":"ephemeral"}

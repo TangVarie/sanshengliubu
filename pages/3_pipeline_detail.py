@@ -6,7 +6,13 @@ import time
 
 import streamlit as st
 from db.supabase_client import SupabaseClient
-from pipeline.config import MAX_FINAL_REJECTIONS, PIPELINE_STAGES, POLL_INTERVAL_SECONDS
+from pipeline.agents import get_run_totals
+from pipeline.config import (
+    MAX_FINAL_REJECTIONS,
+    MAX_TOKENS_PER_RUN,
+    PIPELINE_STAGES,
+    POLL_INTERVAL_SECONDS,
+)
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
@@ -551,12 +557,48 @@ total_tokens = sum(l.get("tokens_used", 0) for l in stage_logs)
 total_duration = sum(l.get("duration_seconds", 0) or 0 for l in stage_logs)
 completed_stages = sum(1 for l in stage_logs if l.get("status") == "completed")
 
+# Live per-run totals from the in-process budget tracker (only populated
+# while the thread is running in this Streamlit process). Used mainly to
+# surface cache effectiveness; falls back to stage_logs sum otherwise.
+_run_totals = get_run_totals(run_id)
+_cache_read = _run_totals.get("cache_read", 0)
+_cache_creation = _run_totals.get("cache_creation", 0)
+_calls = _run_totals.get("calls", 0)
+_cache_calls = _run_totals.get("calls_with_cache_activity", 0)
+
 with col_a:
     st.metric("已完成环节", f"{completed_stages}/{len(PIPELINE_STAGES)}")
 with col_b:
-    st.metric("总 Token", f"{total_tokens:,}")
+    # Show budget remaining as the subtitle so the operator can eyeball how
+    # close we are to the hard cap. Uses stage_logs sum as authoritative
+    # (works across resume); in-process totals are additive during a fresh run.
+    budget_pct = (total_tokens / MAX_TOKENS_PER_RUN * 100) if MAX_TOKENS_PER_RUN else 0
+    st.metric(
+        "总 Token",
+        f"{total_tokens:,}",
+        f"{budget_pct:.0f}% of budget",
+        delta_color="off",
+    )
 with col_c:
     st.metric("总耗时", f"{total_duration:.1f}s")
+
+# Cache effectiveness indicator — only shown when the background thread
+# reported at least a few calls in this process. Otherwise the totals are
+# 0 because a different process/restart handled those calls.
+if _calls >= 3:
+    if _cache_read + _cache_creation == 0:
+        st.caption(
+            f"🟡 Prompt 缓存：本次 {_calls} 次调用中 0 次命中缓存。"
+            f"很可能中转站丢弃了 `cache_control` 字段——在 `pipeline/config.py` "
+            f"把 `ENABLE_PROMPT_CACHING` 改成 `False` 可以避免发送多余字段。"
+        )
+    else:
+        hit_rate = _cache_calls / _calls * 100
+        st.caption(
+            f"🟢 Prompt 缓存生效：{_cache_calls}/{_calls} 次调用命中 "
+            f"({hit_rate:.0f}%)，已累计 cache_read={_cache_read:,} / "
+            f"cache_creation={_cache_creation:,} tokens。"
+        )
 
 # ── Actions + auto-refresh ─────────────────────────────────────────────────
 

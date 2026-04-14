@@ -22,8 +22,10 @@ from pipeline.config import (
     ENABLE_PROMPT_CACHING,
     MAX_RETRIES,
     MAX_TOKENS_DEFAULT,
+    MAX_TOKENS_PER_RUN,
     MIN_SECONDS_BETWEEN_CALLS,
     MODELS,
+    RELAY_MIN_SECONDS_BETWEEN_CALLS,
     RETRY_BASE_DELAY_SECONDS,
     STAGE_MAX_TOKENS,
     THINKING_BUDGET_TOKENS,
@@ -77,10 +79,30 @@ def init_api_config():
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         _api_config["base_url"] = base_url
-        logger.info(
-            f"[init_api_config] Direct/relay mode: "
-            f"base_url={'(default)' if not base_url else base_url}"
-        )
+        # Auto-throttle on relay: most relays have tighter concurrency caps
+        # than native Anthropic (often 5 req/s). Only upgrade if the user
+        # hasn't already set an explicit MIN_SECONDS_BETWEEN_CALLS > 0.
+        if MIN_SECONDS_BETWEEN_CALLS <= 0 and RELAY_MIN_SECONDS_BETWEEN_CALLS > 0:
+            _api_config["rate_limit_seconds"] = RELAY_MIN_SECONDS_BETWEEN_CALLS
+            logger.info(
+                f"[init_api_config] Direct/relay mode: "
+                f"base_url={'(default)' if not base_url else base_url}, "
+                f"auto-throttle={RELAY_MIN_SECONDS_BETWEEN_CALLS}s between calls"
+            )
+        else:
+            _api_config["rate_limit_seconds"] = MIN_SECONDS_BETWEEN_CALLS
+            logger.info(
+                f"[init_api_config] Direct/relay mode: "
+                f"base_url={'(default)' if not base_url else base_url}, "
+                f"explicit throttle={MIN_SECONDS_BETWEEN_CALLS}s"
+            )
+
+
+def _effective_rate_limit_seconds() -> float:
+    """The throttle actually enforced per call. init_api_config sets this
+    per backend. Defaults to the static config constant if init wasn't
+    called (unit tests, tooling) or no override exists."""
+    return float(_api_config.get("rate_limit_seconds", MIN_SECONDS_BETWEEN_CALLS))
 
 
 class ClarificationNeeded(Exception):
@@ -93,6 +115,111 @@ class ClarificationNeeded(Exception):
         self.partial_output = partial_output
         self.log_id = log_id
         super().__init__(f"Agent {stage_name} needs clarification: {questions}")
+
+
+class RunBudgetExceededError(RuntimeError):
+    """Raised when a pipeline run exceeds MAX_TOKENS_PER_RUN. Surfaces as a
+    failed run with an explicit cost-safety message so the operator knows
+    the failure was a guardrail trip, not a model error."""
+
+
+# ── Per-run budget tracker ─────────────────────────────────────────────
+# Shared across all agents in the process so every _call_claude accrues
+# into the same pot. Keyed by run_id to stay isolated across concurrent
+# runs (if ever). Reset at the start of orchestrator.run() via
+# reset_run_budget(run_id).
+_run_totals: dict[str, dict[str, int]] = {}
+
+
+def reset_run_budget(run_id: str) -> None:
+    """Zero out token counters for a run. Called by orchestrator.run()
+    before any agent executes, so resumed runs don't re-count tokens
+    that were already charged in the prior attempt."""
+    _run_totals[run_id] = {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_creation": 0,
+        "calls": 0,
+        "calls_with_cache_activity": 0,
+    }
+
+
+def get_run_totals(run_id: str) -> dict[str, int]:
+    """Expose the live counters for UI / observability."""
+    return dict(_run_totals.get(run_id, {}))
+
+
+def _accumulate_run_tokens(
+    run_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int = 0,
+    cache_creation: int = 0,
+) -> dict[str, int]:
+    totals = _run_totals.setdefault(
+        run_id,
+        {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_creation": 0,
+            "calls": 0,
+            "calls_with_cache_activity": 0,
+        },
+    )
+    totals["input"] += input_tokens
+    totals["output"] += output_tokens
+    totals["cache_read"] += cache_read
+    totals["cache_creation"] += cache_creation
+    totals["calls"] += 1
+    if cache_read > 0 or cache_creation > 0:
+        totals["calls_with_cache_activity"] += 1
+    return totals
+
+
+def _check_run_budget(run_id: str) -> None:
+    """Raise RunBudgetExceededError if the run has passed MAX_TOKENS_PER_RUN.
+    Called right after every API response is accounted for."""
+    totals = _run_totals.get(run_id)
+    if not totals:
+        return
+    combined = totals["input"] + totals["output"]
+    if combined > MAX_TOKENS_PER_RUN:
+        raise RunBudgetExceededError(
+            f"流水线 {run_id[:8]} 已累计 {combined:,} tokens "
+            f"(input={totals['input']:,}, output={totals['output']:,})，"
+            f"超过 MAX_TOKENS_PER_RUN={MAX_TOKENS_PER_RUN:,}。"
+            f"为防止重试失控，已强制终止。如需继续请在 pipeline/config.py 调高上限，"
+            f"或人工排查为什么某个阶段反复重试。"
+        )
+
+
+def _maybe_warn_no_cache_hits(run_id: str) -> None:
+    """After the first few calls, if ENABLE_PROMPT_CACHING is on but the
+    backend reports zero cache activity, log once so the operator knows
+    the cache_control field is being dropped by their relay. Silent cache
+    misses = paying full price for nothing."""
+    if not ENABLE_PROMPT_CACHING:
+        return
+    totals = _run_totals.get(run_id)
+    if not totals or totals["calls"] < 4:
+        return
+    # Already warned for this run?
+    if totals.get("_cache_warned"):
+        return
+    if totals["calls_with_cache_activity"] == 0:
+        logger.warning(
+            "[cache-probe] run=%s: made %d calls with cache_control but the "
+            "backend reports 0 cache activity (no cache_read or "
+            "cache_creation tokens). Your relay likely drops the "
+            "cache_control field silently. Consider setting "
+            "ENABLE_PROMPT_CACHING=False in pipeline/config.py to avoid "
+            "sending dead weight.",
+            run_id[:8],
+            totals["calls"],
+        )
+        totals["_cache_warned"] = True
 
 
 class BaseAgent:
@@ -220,19 +347,29 @@ class BaseAgent:
     # Class-level timestamp for rate limiting across all agents
     _last_call_time: float = 0.0
 
-    def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
-        """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
+    def _call_claude(
+        self, system_prompt: str, user_message: str
+    ) -> tuple[str, int, int, int, int]:
+        """Synchronous Claude API call.
+
+        Returns (response_text, input_tokens, output_tokens,
+        cache_read_input_tokens, cache_creation_input_tokens). The last two
+        are 0 when caching isn't active or the backend doesn't report them
+        (common on relays that silently drop cache_control). They feed the
+        per-run cache-effectiveness probe.
 
         Two modes:
         - Vertex AI: uses adaptive/budget thinking, system= works normally.
         - Relay/direct: legacy path with budget_tokens thinking + proxy fallbacks.
         """
-        # Rate limiting: ensure minimum gap between API calls (Vertex 15K TPM)
-        if MIN_SECONDS_BETWEEN_CALLS > 0:
+        # Rate limiting. The effective value is picked by init_api_config
+        # (relay mode auto-throttles even if the static config constant is 0).
+        rate_limit = _effective_rate_limit_seconds()
+        if rate_limit > 0:
             elapsed = time.time() - BaseAgent._last_call_time
-            if elapsed < MIN_SECONDS_BETWEEN_CALLS:
-                wait = MIN_SECONDS_BETWEEN_CALLS - elapsed
-                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.1f}s")
+            if elapsed < rate_limit:
+                wait = rate_limit - elapsed
+                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.2f}s")
                 time.sleep(wait)
             BaseAgent._last_call_time = time.time()
 
@@ -312,7 +449,15 @@ class BaseAgent:
 
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
-        return text, input_tokens, output_tokens
+        # Cache usage fields are present when the backend supports prompt
+        # caching. Missing / None = silently unsupported (typical on many
+        # relay proxies). getattr falls back to 0 without crashing on older
+        # SDK versions that lack these attributes.
+        cache_read = int(getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+        cache_creation = int(
+            getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        )
+        return text, input_tokens, output_tokens, cache_read, cache_creation
 
     @staticmethod
     def _lenient_json_loads(text: str) -> dict[str, Any]:
@@ -522,11 +667,28 @@ class BaseAgent:
                 system_prompt = self.load_system_prompt()
                 user_message = json.dumps(input_data, ensure_ascii=False, indent=2)
 
-                text, input_tokens, output_tokens = await asyncio.to_thread(
+                (
+                    text,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation,
+                ) = await asyncio.to_thread(
                     self._call_claude, system_prompt, user_message
                 )
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
+
+                # Feed the per-run budget tracker. Raises RunBudgetExceededError
+                # if we've blown through MAX_TOKENS_PER_RUN — caught at the
+                # orchestrator level which marks the run as failed. Runs
+                # BEFORE JSON extraction so a catastrophic reply doesn't also
+                # get billed into a loop.
+                _accumulate_run_tokens(
+                    run_id, input_tokens, output_tokens, cache_read, cache_creation
+                )
+                _check_run_budget(run_id)
+                _maybe_warn_no_cache_hits(run_id)
 
                 output = self._extract_json(text)
                 duration = time.time() - start_time
@@ -561,6 +723,26 @@ class BaseAgent:
 
             except ClarificationNeeded:
                 raise  # Don't retry clarification requests
+
+            except RunBudgetExceededError:
+                # Don't retry budget exhaustion — that would just double-down
+                # on the failure. Let it bubble up to the orchestrator, which
+                # will mark the run as failed. Still log the stage as failed
+                # so the UI shows which stage tripped the guard.
+                duration = time.time() - start_time
+                db.update_stage_log(
+                    log_id,
+                    status="failed",
+                    error_message=(
+                        "RunBudgetExceededError: 流水线累计 token 超过 "
+                        "MAX_TOKENS_PER_RUN 上限，已强制终止以防成本失控。"
+                        "请检查是否有阶段在反复重试，或在 pipeline/config.py "
+                        "调高 MAX_TOKENS_PER_RUN。"
+                    ),
+                    tokens_used=total_input_tokens + total_output_tokens,
+                    duration_seconds=round(duration, 2),
+                )
+                raise
 
             except Exception as e:
                 last_error = e
