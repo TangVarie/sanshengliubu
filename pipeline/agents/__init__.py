@@ -428,9 +428,22 @@ class BaseAgent:
         # Try cut points from most recent to earliest (keep as much data as possible)
         for cp in reversed(cut_points[-300:]):
             candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
-            # Strip dangling `"key":` (key with no value, left when cut mid-value)
-            candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)
-            candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)
+            # Strip a dangling partial field. Order matters — more specific
+            # patterns first. All regexes assume the candidate has no unclosed
+            # strings (cut_points are only recorded outside strings). After
+            # these substitutions the candidate should end at a clean structure
+            # boundary (`}`, `]`, a closed string value, a number, or
+            # `true`/`false`/`null`).
+            candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)  # , "k":
+            candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)  # { "k":
+            # NEW: lone trailing keys with no colon yet (truncation hit between
+            # the key and its colon). Matches `, "k"` and `{ "k"` respectively.
+            candidate = re.sub(r',\s*"[^"]*"\s*$', "", candidate)  # , "k"
+            candidate = re.sub(r'\{\s*"[^"]*"\s*$', "{", candidate)  # { "k"
+            # NEW: trailing array item that is just a lone string with no
+            # preceding comma — e.g. `[ "a", "b"` is fine (commas delimit)
+            # but `["a"` after a cut is fine too (stack handles it). We only
+            # need to handle `[ "a", ` which rstrip already covers.
             candidate = candidate.rstrip().rstrip(",")
 
             # Re-scan candidate with a real stack
