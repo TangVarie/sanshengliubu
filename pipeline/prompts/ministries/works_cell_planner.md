@@ -78,4 +78,13 @@
 }
 ```
 
-**`paradigm` 字段处理**：从输入的 active_cell 里读 `paradigm` 字段（上游 secretariat 已标注），原样透传到输出。如果 active_cell 没有 paradigm 字段，写 `"A_emotional_hook"` 作为默认值，并在 `customization_notes` 里加一行注释提醒下游。**绝对不要自己重新判断范式**——上游已经决定了，你只是搬运。
+**`paradigm` 字段处理**（唯一合法的两种情况）：
+
+1. **正常路径（期望 99% 走这条）**：输入的 active_cell 带有 `paradigm` 字段（上游 secretariat 已标注）。你**原样透传**到输出的 cell_plan。**绝对不要自己判断、改写、覆盖**——范式由上游决定，你只是搬运。
+
+2. **兜底路径（异常场景）**：输入的 active_cell 缺失 `paradigm` 字段（说明上游 secretariat 漏填，这是架构师级别的 bug）。此时你：
+   - 填入默认值 `"A_emotional_hook"`
+   - **必须**在 `customization_notes` 里显式加一行：`"⚠️ paradigm 默认为 A（上游 active_cell 未标注，请 builder 确认是否正确）"`
+   - 这不是你在"判断范式"，这是在**标记上游缺失**让 builder 知情
+
+这两种路径之外的所有"我觉得这个方向更像 B"之类的自作主张都是禁止的。
