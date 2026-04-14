@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.3"
+VERSION = "v0.9.4"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "终审加轮次上限 + 增量评审，防止反复驳回死循环"
+VERSION_NOTES = "终审加轮次上限 + 增量评审；校验器对齐终审标准（5 池/人设/AI 空话）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).

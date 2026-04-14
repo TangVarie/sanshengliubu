@@ -1267,6 +1267,14 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             issues.append(f"{cid}: system_prompt 结尾不完整（末尾: ...{tail!r}）")
 
     # ── 3. system_prompt must contain essential sections ────────────────
+    #
+    # These checks mirror what chancellery_final's final_review section in
+    # chancellery.md evaluates, so works_builder can self-catch the same
+    # class of issues locally (no LLM cost) instead of getting punted back
+    # by the reviewer three rounds later.
+    #
+    # Principle: only hard-fail on items chancellery explicitly flags.
+    # Stylistic nits (tone/naturalness) still belong to the reviewer.
     if sp:
         essential_keywords = {
             "合规": "合规/compliance 规则",
@@ -1277,13 +1285,54 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             if keyword not in sp:
                 issues.append(f"{cid}: system_prompt 缺少「{description}」（找不到 '{keyword}'）")
 
-        # Check differentiation pools — at least mention narrative/opening/emotion
-        pool_keywords = ["叙事", "开头", "情绪"]
-        pool_missing = [kw for kw in pool_keywords if kw not in sp]
-        if len(pool_missing) >= 2:
+        # 5 differentiation pools — works_builder.md:17-23 explicitly says
+        # "5 个池必须全部内置，缺一个都算不合格". We accept either the
+        # Chinese pool name OR its English key as proof the pool is present.
+        # Count distinct pools found; < 4 = hard fail (matches chancellery's
+        # "缺一个都算不合格" but with 1-pool tolerance for keyword variations).
+        pool_aliases = {
+            "叙事结构": ["叙事结构", "叙事", "narrative_structure", "narrative"],
+            "开头切入": ["开头切入", "开头", "opening_angle", "opening"],
+            "情绪基调": ["情绪基调", "情绪", "emotion_baseline", "emotion"],
+            "结尾方式": ["结尾方式", "结尾", "closing_style", "closing"],
+            "信息密度": ["信息密度", "密度", "information_density", "密度池"],
+        }
+        pools_found = [
+            name for name, aliases in pool_aliases.items()
+            if any(a in sp for a in aliases)
+        ]
+        pools_missing = [n for n in pool_aliases if n not in pools_found]
+        if len(pools_found) < 4:
             issues.append(
-                f"{cid}: system_prompt 差异化池不完整（缺少: {'/'.join(pool_missing)}）"
+                f"{cid}: system_prompt 五个差异化池只命中 {len(pools_found)}/5，"
+                f"缺失: {'/'.join(pools_missing) or '无'}"
             )
+        elif len(pools_found) == 4:
+            # soft warning — 4 out of 5 still lets builder pass but we note it
+            issues.append(
+                f"{cid}: system_prompt 差异化池命中 4/5（缺: {'/'.join(pools_missing)}），"
+                f"建议补齐但不强制重试"
+            )
+
+        # Batch generation rules — works_builder.md:24-29 requires 人设轮换
+        # + 差异化旋钮轮转 to be baked into every system_prompt. Chancellery
+        # has historically rejected for missing these. Mark as SOFT so we
+        # surface it but don't spin the builder into 3-round retry hell over
+        # wording variations (轮换 / 轮流 / 切换 / 交替 …).
+        batch_rule_aliases = [
+            "人设轮换", "轮流分配", "persona_rotation", "人设切换",
+            "轮流", "交替", "每篇换",
+        ]
+        if not any(a in sp for a in batch_rule_aliases):
+            issues.append(
+                f"{cid}: system_prompt 缺少「人设轮换规则」"
+                f"（批量生成时必须指定，建议补齐但不强制重试）"
+            )
+
+        # Persona integration — if system_prompt doesn't mention 人设 / persona
+        # at all, it's broken regardless of paradigm
+        if "人设" not in sp and "persona" not in sp.lower():
+            issues.append(f"{cid}: system_prompt 完全没有人设相关内容")
 
     # ── 4. demo_output platform-specific length check ──────────────────
     demo = (cell.get("demo_output") or "").strip()
@@ -1321,10 +1370,27 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             tail = demo[-40:].replace("\n", " ")
             issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
 
-    # Classify: hard issues (must retry) vs soft issues (warn only)
+        # AI-cliché blacklist — works_builder.md:60 explicitly lists these
+        # as forbidden phrases. If the demo contains them, chancellery will
+        # reliably reject for "AI 味". Catch locally to avoid the round trip.
+        ai_cliches = [
+            "效果显著", "性价比高", "值得推荐", "适合所有人", "温和不刺激",
+            "希望对你有帮助", "综上所述", "在如今", "让我们一起", "姐妹们冲",
+            "快快收藏",
+        ]
+        hit_cliches = [c for c in ai_cliches if c in demo]
+        if hit_cliches:
+            issues.append(
+                f"{cid}: demo_output 命中 AI 空话黑名单 {hit_cliches}（works_builder 禁用项）"
+            )
+
+    # Classify: hard issues (must retry) vs soft issues (warn only).
+    # Soft markers are written in Chinese into the issue text; anything that
+    # contains a soft marker is downgraded to warn-only.
+    soft_markers = ["建议补齐但不强制重试", "media_brief 缺失", "comment_seeds 缺失"]
     hard_issues = [
         i for i in issues
-        if any(kw in i for kw in ["为空", "过短", "结尾不完整", "过长", "差异化池不完整"])
+        if not any(sm in i for sm in soft_markers)
     ]
     soft_issues = [i for i in issues if i not in hard_issues]
 
