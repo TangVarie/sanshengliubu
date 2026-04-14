@@ -506,25 +506,48 @@ class PipelineOrchestrator:
                     "paradigm": d_paradigm,
                 })
 
-        # Decide whether to use secretariat's active_cells or our reconstruction.
-        # Use reconstruction whenever it covers strictly more directions, since
-        # losing directions is the bug we're fixing.
+        # Decide how to reconcile secretariat's active_cells vs our D×P
+        # reconstruction. Historical bug: model sometimes only emits D1 cells
+        # and omits the rest — reconstruction catches that. New concern (#6):
+        # previously we replaced active_cells wholesale with the reconstruction
+        # as soon as ANY direction was missing, which could force-plan
+        # directions that secretariat intentionally dropped (without listing
+        # them in excluded_cells). Fix: only ADD truly-missing (direction_id,
+        # platform) pairs and keep everything else from secretariat, so
+        # intentional non-coverage is preserved.
         active_dir_set = {str(c.get("direction_id")) for c in active_cells if isinstance(c, dict)}
         expected_dir_set = {str(c.get("direction_id")) for c in expected_cells}
 
-        if expected_cells and len(expected_dir_set - active_dir_set) > 0:
-            logger.warning(
-                f"matrix_skeleton.active_cells covers directions {sorted(active_dir_set)} "
-                f"but tactical_directions × platforms expects {sorted(expected_dir_set)}. "
-                f"Reconstructing active_cells from D×P (n={len(expected_cells)})."
-            )
-            active_cells = expected_cells
-        elif not active_cells and expected_cells:
+        if not active_cells and expected_cells:
+            # Case A: secretariat gave us nothing at all. Use reconstruction.
             logger.warning(
                 f"matrix_skeleton.active_cells is empty, using reconstruction "
                 f"({len(expected_cells)} cells from {len(directions)}×{len(platforms)})"
             )
             active_cells = expected_cells
+        elif expected_cells:
+            # Case B: secretariat gave us some cells. Only splice in D×P pairs
+            # that secretariat literally didn't produce AND aren't in excluded.
+            existing_pairs = {
+                (str(c.get("direction_id")), _platform_key(c.get("platform", "")))
+                for c in active_cells
+                if isinstance(c, dict)
+            }
+            splice_in = [
+                cell for cell in expected_cells
+                if (cell["direction_id"], _platform_key(cell["platform"]))
+                not in existing_pairs
+            ]
+            if splice_in:
+                missing_dirs = sorted(expected_dir_set - active_dir_set)
+                logger.warning(
+                    f"matrix_skeleton.active_cells is missing "
+                    f"{len(splice_in)} (direction×platform) pairs that "
+                    f"tactical_directions × target_platforms expects "
+                    f"(missing dirs: {missing_dirs}); splicing them in. "
+                    f"Secretariat's original cells are preserved."
+                )
+                active_cells = list(active_cells) + splice_in
 
         if not active_cells:
             logger.error(
