@@ -241,6 +241,16 @@ run = runs[0]
 run_id = run["id"]
 stage_logs = db.get_stage_logs(run_id)
 
+# If Supabase couldn't return the full payload (free-tier connection hiccups,
+# big output_data blobs), .partial flips True and we fall back to a slim
+# query without output_data. Surface it so the user isn't puzzled by empty
+# stage details after a flaky refresh.
+if getattr(stage_logs, "partial", False):
+    st.warning(
+        "⚠️ 数据未完整加载：当前表格未包含各阶段的 `output_data`（受 Supabase "
+        "连接/负载影响，系统自动降级成轻量查询）。刷新页面通常会恢复。"
+    )
+
 # Build a lookup: stage_name -> log. Skip rows missing stage_name (defensive
 # against partial writes / schema drift) instead of KeyError-ing the page.
 log_map: dict[str, dict] = {}
@@ -551,11 +561,20 @@ with tabs[5]:
 # ── Stats footer ───────────────────────────────────────────────────────────
 
 st.divider()
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b, col_c, col_d = st.columns(4)
 
 total_tokens = sum(l.get("tokens_used", 0) for l in stage_logs)
 total_duration = sum(l.get("duration_seconds", 0) or 0 for l in stage_logs)
 completed_stages = sum(1 for l in stage_logs if l.get("status") == "completed")
+
+# Cost: prefer the DB-authoritative value on pipeline_runs.total_cost_usd
+# (updated after each agent completion via agents/__init__.py), fall back
+# to in-process _run_totals for the same-process running case, then to 0.
+_run_cost_db = 0.0
+try:
+    _run_cost_db = float(run.get("total_cost_usd", 0) or 0)
+except (TypeError, ValueError):
+    _run_cost_db = 0.0
 
 # Live per-run totals from the in-process budget tracker (only populated
 # while the thread is running in this Streamlit process). Used mainly to
@@ -565,6 +584,8 @@ _cache_read = _run_totals.get("cache_read", 0)
 _cache_creation = _run_totals.get("cache_creation", 0)
 _calls = _run_totals.get("calls", 0)
 _cache_calls = _run_totals.get("calls_with_cache_activity", 0)
+_run_cost_live = float(_run_totals.get("cost_usd", 0.0))
+_run_cost = max(_run_cost_db, _run_cost_live)
 
 with col_a:
     st.metric("已完成环节", f"{completed_stages}/{len(PIPELINE_STAGES)}")
@@ -580,6 +601,10 @@ with col_b:
         delta_color="off",
     )
 with col_c:
+    # Cost is best-effort (unknown models → $0). The caption below states
+    # the precision so a $0.00 reading isn't mistaken for free execution.
+    st.metric("预计成本", f"${_run_cost:.2f}")
+with col_d:
     st.metric("总耗时", f"{total_duration:.1f}s")
 
 # Cache effectiveness indicator — only shown when the background thread

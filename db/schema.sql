@@ -58,6 +58,11 @@ CREATE TABLE outputs (
 CREATE INDEX idx_pipeline_runs_project ON pipeline_runs(project_id);
 CREATE INDEX idx_stage_logs_run ON stage_logs(run_id);
 CREATE INDEX idx_stage_logs_stage ON stage_logs(stage_name);
+-- Composite covers the hot path in resume/revise/cell-recovery: filter
+-- by (run_id, stage_name) to skip stages already completed. Single-column
+-- indexes above would still work but postgres prefers the composite for
+-- this exact query shape.
+CREATE INDEX idx_stage_logs_run_stage ON stage_logs(run_id, stage_name);
 CREATE INDEX idx_outputs_run ON outputs(run_id);
 
 -- 禁用 RLS（开发环境；生产环境请改用适当的 policy）

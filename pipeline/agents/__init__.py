@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    COST_PER_1M_INPUT,
+    COST_PER_1M_OUTPUT,
     ENABLE_PROMPT_CACHING,
     MAX_RETRIES,
     MAX_TOKENS_DEFAULT,
@@ -140,9 +142,45 @@ def reset_run_budget(run_id: str) -> None:
         "output": 0,
         "cache_read": 0,
         "cache_creation": 0,
+        "cost_usd": 0.0,
         "calls": 0,
         "calls_with_cache_activity": 0,
     }
+
+
+def _estimate_call_cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_creation: int,
+) -> float:
+    """Approximate the dollar cost of one Claude call.
+
+    Anthropic publishes:
+      - cache_creation_input_tokens bill at 1.25× input rate (write premium)
+      - cache_read_input_tokens bill at 0.10× input rate (read discount)
+      - regular input_tokens and output_tokens at their standard rates
+
+    `input_tokens` from response.usage is the NON-cached portion
+    (Anthropic splits them out when caching is active). So we add the
+    three input categories independently — no double-counting.
+
+    Unknown model → input and output priced at 0; the call just won't
+    accrue (operator will see $0.00 and know to add the model to
+    COST_PER_1M_*). We deliberately don't estimate from a default so
+    wrong cost data isn't silently reported.
+    """
+    in_rate = COST_PER_1M_INPUT.get(model, 0.0)
+    out_rate = COST_PER_1M_OUTPUT.get(model, 0.0)
+    if in_rate == 0.0 and out_rate == 0.0:
+        return 0.0
+    return (
+        input_tokens * in_rate
+        + output_tokens * out_rate
+        + cache_read * in_rate * 0.10
+        + cache_creation * in_rate * 1.25
+    ) / 1_000_000
 
 
 def get_run_totals(run_id: str) -> dict[str, int]:
@@ -152,11 +190,15 @@ def get_run_totals(run_id: str) -> dict[str, int]:
 
 def _accumulate_run_tokens(
     run_id: str,
+    model: str,
     input_tokens: int,
     output_tokens: int,
     cache_read: int = 0,
     cache_creation: int = 0,
-) -> dict[str, int]:
+) -> tuple[dict, float]:
+    """Accumulate one call's usage into the run-level pot. Returns
+    (run_totals_dict, this_call_cost_usd) so the caller can write the
+    per-stage cost to stage_logs without recomputing."""
     totals = _run_totals.setdefault(
         run_id,
         {
@@ -164,6 +206,7 @@ def _accumulate_run_tokens(
             "output": 0,
             "cache_read": 0,
             "cache_creation": 0,
+            "cost_usd": 0.0,
             "calls": 0,
             "calls_with_cache_activity": 0,
         },
@@ -175,7 +218,11 @@ def _accumulate_run_tokens(
     totals["calls"] += 1
     if cache_read > 0 or cache_creation > 0:
         totals["calls_with_cache_activity"] += 1
-    return totals
+    this_call_cost = _estimate_call_cost_usd(
+        model, input_tokens, output_tokens, cache_read, cache_creation
+    )
+    totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + this_call_cost
+    return totals, this_call_cost
 
 
 def _check_run_budget(run_id: str) -> None:
@@ -684,8 +731,13 @@ class BaseAgent:
                 # orchestrator level which marks the run as failed. Runs
                 # BEFORE JSON extraction so a catastrophic reply doesn't also
                 # get billed into a loop.
-                _accumulate_run_tokens(
-                    run_id, input_tokens, output_tokens, cache_read, cache_creation
+                _, _call_cost = _accumulate_run_tokens(
+                    run_id,
+                    self.model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation,
                 )
                 _check_run_budget(run_id)
                 _maybe_warn_no_cache_hits(run_id)
@@ -719,6 +771,28 @@ class BaseAgent:
                     tokens_used=total_input_tokens + total_output_tokens,
                     duration_seconds=round(duration, 2),
                 )
+                # Push the run-level cost + token totals to pipeline_runs so
+                # the UI can display current spend without needing access to
+                # the in-process _run_totals dict. Swallow DB errors — cost
+                # tracking is observability, not a hard invariant. One small
+                # write per agent completion, at most ~14/run.
+                try:
+                    _run_total = _run_totals.get(run_id) or {}
+                    _run_tokens = (
+                        _run_total.get("input", 0) + _run_total.get("output", 0)
+                    )
+                    _run_cost = round(float(_run_total.get("cost_usd", 0.0)), 4)
+                    db.update_pipeline_run(
+                        run_id,
+                        total_tokens=_run_tokens,
+                        total_cost_usd=_run_cost,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] failed to push run totals to pipeline_runs",
+                        self.stage_name,
+                        exc_info=True,
+                    )
                 return output
 
             except ClarificationNeeded:

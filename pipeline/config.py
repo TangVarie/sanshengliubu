@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.9"
+VERSION = "v0.10.0"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "中转站硬化：预算上限 + relay 自动节流 + 缓存命中探测"
+VERSION_NOTES = "成本追踪 + DB 降级可见 + 复合索引（需要跑 migrations/001）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).

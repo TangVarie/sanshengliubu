@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import streamlit as st
 from supabase import create_client, Client
 from datetime import datetime, timezone
@@ -10,6 +11,16 @@ from typing import Any
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class _StageLogsList(list):
+    """list subclass carrying a `.partial` flag. get_stage_logs returns this
+    so the UI can detect when the DB slim-query fallback kicked in and
+    show a warning instead of rendering an empty stage output silently.
+    Backward compatible — iterates exactly like a plain list.
+    """
+
+    partial: bool = False
 
 
 class SupabaseClient:
@@ -119,7 +130,7 @@ class SupabaseClient:
         resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
         return resp.data[0]
 
-    def get_stage_logs(self, run_id: str) -> list[dict]:
+    def get_stage_logs(self, run_id: str) -> _StageLogsList:
         """Load stage_logs for a run, EXCLUDING input_data to keep payload small.
 
         input_data contains the full shared_skeleton + ministry_outputs +
@@ -130,6 +141,9 @@ class SupabaseClient:
 
         Falls back to a lighter query (no output_data) if the first attempt
         fails due to connection issues — at least the UI can show status.
+        The returned list carries `.partial = True` when the fallback
+        triggered, so the UI can surface a warning instead of rendering
+        empty stage outputs silently.
         """
         select_full = (
             "id, run_id, stage_name, status, output_data, error_message, "
@@ -150,13 +164,14 @@ class SupabaseClient:
                     .order("created_at")
                     .execute()
                 )
+                result = _StageLogsList(resp.data or [])
+                result.partial = attempt > 0
                 if attempt > 0:
-                    import logging
                     logging.getLogger(__name__).warning(
                         "get_stage_logs: full query failed, using lightweight "
                         "fallback (no output_data). Stage outputs won't render."
                     )
-                return resp.data
+                return result
             except Exception:
                 if attempt == 0:
                     continue  # try lighter query
