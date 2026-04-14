@@ -47,6 +47,11 @@ pip install -r requirements.txt
 3. 在 SQL Editor 中运行 `db/schema.sql`
 4. 记下 Project URL 和 anon key
 
+> **已有数据库升级？**
+> `db/schema.sql` 本身已是幂等的（所有对象都用 `IF NOT EXISTS`），直接重跑不会报错、只会补齐新增的索引/字段。
+> 如果你希望最小化改动、只打补丁，也可以按版本逐个跑 `db/migrations/` 下的脚本：
+> - `001_add_stage_logs_composite_index.sql` — v0.10.0 新增的 `(run_id, stage_name)` 复合索引，加速 resume/revise 的热路径。
+
 ### 3. 配置 Secrets
 
 ```bash

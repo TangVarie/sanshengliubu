@@ -1,8 +1,14 @@
 -- 三省六部 Prompt Engineering System — Supabase Schema
 -- Run this in the Supabase SQL Editor (https://supabase.com/dashboard → SQL Editor)
+--
+-- This schema is idempotent (IF NOT EXISTS on every object), so re-running
+-- is safe and will only add what's missing. Existing installs upgrading
+-- across versions can re-run this file instead of hunting individual
+-- migration scripts — though migration files under db/migrations/ are
+-- still kept for reference and as minimal targeted alternatives.
 
 -- 项目表
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
     status TEXT DEFAULT 'draft',           -- draft | running | completed | failed
@@ -16,7 +22,7 @@ CREATE TABLE projects (
 );
 
 -- 流水线运行记录
-CREATE TABLE pipeline_runs (
+CREATE TABLE IF NOT EXISTS pipeline_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     status TEXT DEFAULT 'running',         -- running | completed | failed | paused_for_review
@@ -28,7 +34,7 @@ CREATE TABLE pipeline_runs (
 );
 
 -- 各环节执行日志
-CREATE TABLE stage_logs (
+CREATE TABLE IF NOT EXISTS stage_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES pipeline_runs(id) ON DELETE CASCADE,
     stage_name TEXT NOT NULL,              -- crown_prince | secretariat | chancellery_1 | ...
@@ -45,7 +51,7 @@ CREATE TABLE stage_logs (
 );
 
 -- 最终产出
-CREATE TABLE outputs (
+CREATE TABLE IF NOT EXISTS outputs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES pipeline_runs(id) ON DELETE CASCADE,
     prompt_system JSONB NOT NULL,          -- 完整 prompt 系统
@@ -55,15 +61,15 @@ CREATE TABLE outputs (
 );
 
 -- 索引
-CREATE INDEX idx_pipeline_runs_project ON pipeline_runs(project_id);
-CREATE INDEX idx_stage_logs_run ON stage_logs(run_id);
-CREATE INDEX idx_stage_logs_stage ON stage_logs(stage_name);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_project ON pipeline_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_stage_logs_run ON stage_logs(run_id);
+CREATE INDEX IF NOT EXISTS idx_stage_logs_stage ON stage_logs(stage_name);
 -- Composite covers the hot path in resume/revise/cell-recovery: filter
 -- by (run_id, stage_name) to skip stages already completed. Single-column
 -- indexes above would still work but postgres prefers the composite for
--- this exact query shape.
-CREATE INDEX idx_stage_logs_run_stage ON stage_logs(run_id, stage_name);
-CREATE INDEX idx_outputs_run ON outputs(run_id);
+-- this exact query shape. Added in v0.10.0.
+CREATE INDEX IF NOT EXISTS idx_stage_logs_run_stage ON stage_logs(run_id, stage_name);
+CREATE INDEX IF NOT EXISTS idx_outputs_run ON outputs(run_id);
 
 -- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
 ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
