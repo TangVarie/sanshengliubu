@@ -122,12 +122,43 @@ else:
 
 st.divider()
 st.subheader("模型配置")
-st.caption("当前各环节使用的模型（修改需编辑 `pipeline/config.py`）：")
+st.caption(
+    "当前各环节使用的模型（修改需编辑 `pipeline/config.py`）。"
+    "🟣 Opus / 🔵 Sonnet 都是 Claude；🟢 Gemini 是辅助（advisory），失败不阻塞。"
+)
+
+# Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
+# 这里列出"Gemini 会介入"的阶段，而不是"Gemini 是主判"的阶段。
+GEMINI_ASSIST_STAGES: dict[str, str] = {
+    "vibe_critic": "二审（Claude 判 pass 的 cell 再过 Gemini）",
+    "ministry_works_structure_review": "主判（Gemini-only）",
+}
 
 for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
-    model = MODELS.get(stage_key, "未配置")
-    tier = "🟣 Opus" if "opus" in model else "🔵 Sonnet"
-    st.markdown(f"{stage_icon} **{stage_label}** ({stage_key}) → `{model}` {tier}")
+    model = MODELS.get(stage_key)
+    gemini_role = GEMINI_ASSIST_STAGES.get(stage_key)
+
+    # Assemble the right-hand-side badges based on which backends run here
+    parts: list[str] = []
+    if model:
+        tier = "🟣 Opus" if "opus" in model else "🔵 Sonnet"
+        parts.append(f"`{model}` {tier}")
+
+    if gemini_role and ENABLE_GEMINI_ASSIST and _gemini_key:
+        # Gemini actually available
+        parts.append(f"+ `{GEMINI_MODEL}` 🟢 Gemini · {gemini_role}")
+    elif gemini_role:
+        # Gemini role designed but not configured — annotate so user
+        # understands why this stage may look "only Claude" in logs
+        parts.append(f"+ 🟢 Gemini · {gemini_role} _(未配置 · 跳过)_")
+
+    if not parts:
+        # e.g. structure_review when Gemini disabled + unconfigured
+        parts = ["_未配置 · 跳过_"]
+
+    st.markdown(
+        f"{stage_icon} **{stage_label}** ({stage_key}) → " + " ".join(parts)
+    )
 
 # ── Setup Guide ────────────────────────────────────────────────────────────
 

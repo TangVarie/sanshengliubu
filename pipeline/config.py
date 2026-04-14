@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.12.1"
+VERSION = "v0.12.2"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "Gemini 结构审上线：工部构建后审查 5 池/人设/合规/平台调性，hint 注入 rewriter"
+VERSION_NOTES = "设置页把 Gemini 职责显式展示；secrets.toml.example 给三组典型模板"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
