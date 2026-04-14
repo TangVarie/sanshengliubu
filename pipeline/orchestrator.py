@@ -28,9 +28,11 @@ from pipeline.config import (
 from pipeline.agents import (
     ClarificationNeeded,
     RunBudgetExceededError,
+    accumulate_auxiliary_cost,
     get_run_totals,
     reset_run_budget,
 )
+from pipeline.agents.gemini_critic import run_gemini_critic
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
@@ -1312,9 +1314,79 @@ class PipelineOrchestrator:
                 break
 
             failed = critic_result.get("failed_cells", [])
+            failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+
+            # ── Gemini arbitration (Plan B: 分歧仲裁) ──────────────────
+            # Claude's critic often gives face-saving borderline → pass on
+            # AI-tone content. Ask Gemini to re-evaluate the cells Claude
+            # passed; if Gemini flags them, add to failed list.
+            # Advisory-only: Gemini errors / not-configured → silently
+            # keep Claude's verdict (logged at debug / warn respectively).
+            claude_passed = [
+                c for c in cells_to_critique
+                if c.get("cell_id") not in failed_ids
+            ]
+            if claude_passed:
+                try:
+                    gemini_result = await run_gemini_critic(claude_passed)
+                except Exception as e:
+                    # run_gemini_critic is supposed to swallow everything.
+                    # If something still leaks, treat as non-fatal.
+                    logger.warning(
+                        f"[gemini arbitration] unexpected exception, skipping: {e!r}"
+                    )
+                    gemini_result = {"verdict": "skipped", "failed_cells": []}
+
+                gemini_verdict = gemini_result.get("verdict", "skipped")
+                gemini_failed = gemini_result.get("failed_cells") or []
+                # Account Gemini tokens + cost into the run totals so the UI
+                # cost metric reflects multi-backend spend, even though
+                # Gemini doesn't count toward MAX_TOKENS_PER_RUN.
+                _usage = gemini_result.get("_gemini_usage") or {}
+                if _usage.get("cost_usd") or _usage.get("input_tokens") or _usage.get("output_tokens"):
+                    accumulate_auxiliary_cost(
+                        self.run_id,
+                        cost_usd=float(_usage.get("cost_usd", 0.0)),
+                        input_tokens=int(_usage.get("input_tokens", 0)),
+                        output_tokens=int(_usage.get("output_tokens", 0)),
+                        source="gemini_critic",
+                    )
+                if gemini_verdict != "skipped" and gemini_failed:
+                    # Accumulate Gemini-flagged cells into Claude's failed
+                    # list so the rewriter gets a combined set.
+                    # Dedup by cell_id — Gemini could theoretically flag
+                    # a cell Claude also flagged (shouldn't happen in
+                    # Plan B because we only show Gemini Claude's passed
+                    # cells, but defend anyway).
+                    existing_ids = {f.get("cell_id") for f in failed}
+                    added = 0
+                    for gf in gemini_failed:
+                        if gf.get("cell_id") and gf["cell_id"] not in existing_ids:
+                            # Tag Gemini-flagged cells so the rewrite
+                            # directives are traceable in stage_logs.
+                            gf = {
+                                **gf,
+                                "_flagged_by": "gemini",
+                                "rewrite_directives": (
+                                    "【Gemini 二审提出】"
+                                    + (gf.get("rewrite_directives") or "")
+                                ),
+                            }
+                            failed.append(gf)
+                            added += 1
+                    if added:
+                        logger.info(
+                            f"[gemini arbitration] Gemini flagged {added} "
+                            f"additional cells Claude had passed: "
+                            f"{sorted(gf.get('cell_id') for gf in gemini_failed)[:10]}"
+                        )
+                # Even if Gemini didn't add new fails, stash its raw
+                # result on the critic_result for UI / stage_log record.
+                critic_result["_gemini_arbitration"] = gemini_result
+
             if not failed:
                 logger.info(f"Vibe critic passed all {len(prompt_cells)} cells "
-                            f"on iteration {iteration + 1}")
+                            f"on iteration {iteration + 1} (Claude + Gemini both cleared)")
                 final_system["vibe_critic_result"] = critic_result
                 return final_system
 
@@ -1323,9 +1395,12 @@ class PipelineOrchestrator:
                 f"{len(failed)}/{len(prompt_cells)} cells failed"
             )
 
-            # Build rewrite input — failed cells with their original prompts + critic feedback
-            failed_ids = {f["cell_id"] for f in failed}
-            critic_map = {f["cell_id"]: f for f in failed}
+            # Build rewrite input — failed cells with their original prompts + critic feedback.
+            # failed is the combined Claude + Gemini list (see arbitration
+            # above); rebuild failed_ids from the full set so Gemini-added
+            # cells make it into the rewrite batch.
+            failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+            critic_map = {f["cell_id"]: f for f in failed if f.get("cell_id")}
             failed_full_cells = [
                 {
                     **c,

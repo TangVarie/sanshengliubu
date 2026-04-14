@@ -188,6 +188,43 @@ def get_run_totals(run_id: str) -> dict[str, int]:
     return dict(_run_totals.get(run_id, {}))
 
 
+def accumulate_auxiliary_cost(
+    run_id: str,
+    cost_usd: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    source: str = "auxiliary",
+) -> None:
+    """Add cost from an out-of-band (non-Claude) backend to the run's
+    running totals. Used by Gemini assist so its spend shows up in
+    pipeline_run.total_cost_usd alongside Claude's.
+
+    Does NOT count toward MAX_TOKENS_PER_RUN — that ceiling is there
+    to bound runaway Claude retry loops, and Gemini (priced 10-100×
+    cheaper for Flash/Pro tiers) would underflow the guard into
+    irrelevance. Tokens are still tracked per-source for UI breakdown.
+    """
+    totals = _run_totals.setdefault(
+        run_id,
+        {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_creation": 0,
+            "cost_usd": 0.0,
+            "calls": 0,
+            "calls_with_cache_activity": 0,
+        },
+    )
+    totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + float(cost_usd)
+    # Stash per-source tokens under namespaced keys so the breakdown
+    # stays visible in the UI without polluting the budget-check path.
+    aux_tokens_key = f"aux_{source}_tokens"
+    totals[aux_tokens_key] = (
+        int(totals.get(aux_tokens_key, 0)) + int(input_tokens) + int(output_tokens)
+    )
+
+
 def _accumulate_run_tokens(
     run_id: str,
     model: str,

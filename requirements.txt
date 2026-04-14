@@ -1,6 +1,11 @@
 streamlit>=1.32.0
 anthropic[vertex]>=0.25.0
 google-auth>=2.20.0
+# Gemini (Vertex AI Express API key or Studio API key). Optional —
+# pipeline runs fine without it; when configured it acts as a second-
+# opinion critic + structure reviewer. See pipeline/config.py
+# ENABLE_GEMINI_ASSIST and VERTEX_EXPRESS_API_KEY in secrets.toml.
+google-genai>=0.3.0
 supabase>=2.4.0
 pydantic>=2.6.0
 PyPDF2>=3.0.0

@@ -1,7 +1,15 @@
 """设置 — API keys, model preferences, Supabase status."""
 
 import streamlit as st
-from pipeline.config import MODELS, PIPELINE_STAGES, VERSION, VERSION_DATE, VERSION_NOTES
+from pipeline.config import (
+    ENABLE_GEMINI_ASSIST,
+    GEMINI_MODEL,
+    MODELS,
+    PIPELINE_STAGES,
+    VERSION,
+    VERSION_DATE,
+    VERSION_NOTES,
+)
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="设置", page_icon="⚙️")
@@ -69,6 +77,46 @@ with col2:
     else:
         st.error("❌ 未配置")
         st.caption("在 `.streamlit/secrets.toml` 中设置 `SUPABASE_URL` 和 `SUPABASE_KEY`")
+
+# ── Gemini auxiliary ────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Gemini 辅助检查（可选）")
+
+_gemini_key = st.secrets.get("VERTEX_EXPRESS_API_KEY", "").strip()
+if not ENABLE_GEMINI_ASSIST:
+    st.info(
+        "ℹ️ 已在 `pipeline/config.py` 里禁用（`ENABLE_GEMINI_ASSIST=False`）。"
+        "如需开启：改成 `True` 并在 secrets.toml 配 `VERTEX_EXPRESS_API_KEY`。"
+    )
+elif not _gemini_key:
+    st.warning(
+        "⚠️ 已在 config 启用但未配 `VERTEX_EXPRESS_API_KEY`。"
+        "Gemini 辅助检查本轮会被跳过（advisory-only，不影响主流程）。"
+        "在 GCP Console → Vertex AI → Settings → API keys 生成一个 Key 填入 secrets.toml。"
+    )
+else:
+    # Don't actually make a network call here — just confirm the client
+    # can be constructed (catches missing `google-genai` install).
+    try:
+        from pipeline.agents.gemini_client import is_available
+        if is_available():
+            st.success(
+                f"✅ 已配置 (***{_gemini_key[-4:]}) · 模型 `{GEMINI_MODEL}`"
+            )
+            st.caption(
+                "Gemini 会作为 (1) 网感二审：Claude critic 判 pass 的 cell 由 Gemini "
+                "二次复核；(2) 结构审：工部构建后审查 system_prompt 的完整性。"
+                "调用失败会降级为只用 Claude 结果。"
+            )
+        else:
+            st.error("❌ Gemini 客户端初始化失败（`google-genai` 未装？）")
+            st.caption(
+                "`pip install google-genai>=0.3.0`（或重新跑 "
+                "`pip install -r requirements.txt`）后重启 Streamlit。"
+            )
+    except Exception as e:
+        st.error(f"❌ 状态检测异常：{e}")
 
 # ── Model Configuration ───────────────────────────────────────────────────
 

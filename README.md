@@ -102,6 +102,25 @@ SUPABASE_KEY = "your-anon-key"
 > 同时填了 A 和 B 会优先走 B（Vertex），A 的 key 会被忽略。要切换模式，
 > 把不想用的那一块整块删掉或注释掉再重启。
 
+#### Gemini 辅助（可选·推荐）
+
+把 Gemini 当成 Claude 的"第二意见"——专治 Claude critic 给 AI 腔内容发放水票的问题。
+
+```toml
+# 从 GCP Console → Vertex AI → Settings → API keys 获得
+VERTEX_EXPRESS_API_KEY = "AIzaSy..."
+```
+
+开关和模型在 `pipeline/config.py` 里：
+- `ENABLE_GEMINI_ASSIST = True`（默认开）
+- `GEMINI_MODEL = "gemini-3-1-pro-preview"`（替换成你账户里能用的 ID；常见可选：`gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`）
+
+Gemini 做两件事：
+1. **网感二审**：Claude critic 判 pass 的 cell 再过一次 Gemini；任一判 fail → 进重写
+2. **结构审**：工部构建后检查 system_prompt 的 5 池 / 人设 / 合规完整性
+
+**失败降级**：Gemini 调用失败（未配置 / 限流 / 模型不存在）→ 打 warn 日志，流水线继续走 Claude 单判，不阻塞。
+
 ### 4. 启动
 
 ```bash

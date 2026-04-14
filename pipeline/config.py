@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.11.0"
+VERSION = "v0.12.0"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "修 D4 缺失/demo 重复；网感硬化：跨 cell 查重 + AI 黑名单前置 + 循环可升级到 3 轮"
+VERSION_NOTES = "Gemini 辅助检查上线：网感二审（分歧仲裁）+ advisory 降级"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -151,6 +151,43 @@ RELAY_MIN_SECONDS_BETWEEN_CALLS = 0.3
 # Opus at $15/M input + $75/M output → 1M tokens ≈ $45 ceiling per run
 # (assuming roughly balanced in/out). Tune to your cost tolerance.
 MAX_TOKENS_PER_RUN = 2_000_000
+
+# ── Gemini auxiliary assist (second-opinion critic + structure reviewer) ──
+# Independent of the primary Claude backend. When configured, Gemini:
+#   1. Re-evaluates cells Claude's vibe_critic passed (B: 分歧仲裁).
+#      If Gemini says fail, the cell is sent back to vibe_rewriter.
+#      Use case: catch AI-tone outputs Claude's critic gives face-saving
+#      borderline → pass scores to.
+#   2. Audits structure completeness of every built prompt_cell (5 pools,
+#      persona integration, compliance block, keyword list). Output is
+#      appended to _revision_directives as advisory notes.
+#
+# Failure mode: advisory-only. Gemini call errors log a warning and the
+# pipeline proceeds with Claude-only verdicts. Never blocks a run.
+#
+# Auth: Vertex Express API key (the `?key=${API_KEY}` variant — see
+# https://cloud.google.com/vertex-ai/docs/general/vertex-express).
+# Secrets.toml field: VERTEX_EXPRESS_API_KEY.
+ENABLE_GEMINI_ASSIST = True
+
+# Model identifier. The value below is what the user requested; if Vertex
+# returns 404 model-not-found, replace with an ID you can actually call
+# (e.g. "gemini-2.5-pro" / "gemini-2.5-flash" / "gemini-2.5-flash-lite").
+# Check available models at
+# https://cloud.google.com/vertex-ai/generative-ai/docs/models
+GEMINI_MODEL = "gemini-3-1-pro-preview"
+
+# Max output tokens per Gemini call. Gemini's output cap is per-model;
+# 8K is safe across 2.5 Pro and most preview tiers.
+GEMINI_MAX_OUTPUT_TOKENS = 8192
+
+# Rough per-1M-token prices (USD) for cost accounting. Update when
+# Google publishes final pricing for the chosen model. These values are
+# intentionally on the high side so reported cost errs toward "expensive"
+# rather than "surprise bill".
+GEMINI_COST_PER_1M_INPUT = 1.25
+GEMINI_COST_PER_1M_OUTPUT = 10.0
+
 
 # ── Prompt Caching ────────────────────────────────────────────────────────
 # When True, the system prompt is sent with cache_control={"type":"ephemeral"}
