@@ -18,7 +18,21 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
-from pipeline.config import MODELS, MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, STAGE_MAX_TOKENS, MAX_TOKENS_DEFAULT, THINKING_STAGES, THINKING_BUDGET_TOKENS, MIN_SECONDS_BETWEEN_CALLS
+from pipeline.config import (
+    COST_PER_1M_INPUT,
+    COST_PER_1M_OUTPUT,
+    ENABLE_PROMPT_CACHING,
+    MAX_RETRIES,
+    MAX_TOKENS_DEFAULT,
+    MAX_TOKENS_PER_RUN,
+    MIN_SECONDS_BETWEEN_CALLS,
+    MODELS,
+    RELAY_MIN_SECONDS_BETWEEN_CALLS,
+    RETRY_BASE_DELAY_SECONDS,
+    STAGE_MAX_TOKENS,
+    THINKING_BUDGET_TOKENS,
+    THINKING_STAGES,
+)
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -67,10 +81,30 @@ def init_api_config():
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         _api_config["base_url"] = base_url
-        logger.info(
-            f"[init_api_config] Direct/relay mode: "
-            f"base_url={'(default)' if not base_url else base_url}"
-        )
+        # Auto-throttle on relay: most relays have tighter concurrency caps
+        # than native Anthropic (often 5 req/s). Only upgrade if the user
+        # hasn't already set an explicit MIN_SECONDS_BETWEEN_CALLS > 0.
+        if MIN_SECONDS_BETWEEN_CALLS <= 0 and RELAY_MIN_SECONDS_BETWEEN_CALLS > 0:
+            _api_config["rate_limit_seconds"] = RELAY_MIN_SECONDS_BETWEEN_CALLS
+            logger.info(
+                f"[init_api_config] Direct/relay mode: "
+                f"base_url={'(default)' if not base_url else base_url}, "
+                f"auto-throttle={RELAY_MIN_SECONDS_BETWEEN_CALLS}s between calls"
+            )
+        else:
+            _api_config["rate_limit_seconds"] = MIN_SECONDS_BETWEEN_CALLS
+            logger.info(
+                f"[init_api_config] Direct/relay mode: "
+                f"base_url={'(default)' if not base_url else base_url}, "
+                f"explicit throttle={MIN_SECONDS_BETWEEN_CALLS}s"
+            )
+
+
+def _effective_rate_limit_seconds() -> float:
+    """The throttle actually enforced per call. init_api_config sets this
+    per backend. Defaults to the static config constant if init wasn't
+    called (unit tests, tooling) or no override exists."""
+    return float(_api_config.get("rate_limit_seconds", MIN_SECONDS_BETWEEN_CALLS))
 
 
 class ClarificationNeeded(Exception):
@@ -83,6 +117,156 @@ class ClarificationNeeded(Exception):
         self.partial_output = partial_output
         self.log_id = log_id
         super().__init__(f"Agent {stage_name} needs clarification: {questions}")
+
+
+class RunBudgetExceededError(RuntimeError):
+    """Raised when a pipeline run exceeds MAX_TOKENS_PER_RUN. Surfaces as a
+    failed run with an explicit cost-safety message so the operator knows
+    the failure was a guardrail trip, not a model error."""
+
+
+# ── Per-run budget tracker ─────────────────────────────────────────────
+# Shared across all agents in the process so every _call_claude accrues
+# into the same pot. Keyed by run_id to stay isolated across concurrent
+# runs (if ever). Reset at the start of orchestrator.run() via
+# reset_run_budget(run_id).
+_run_totals: dict[str, dict[str, int]] = {}
+
+
+def reset_run_budget(run_id: str) -> None:
+    """Zero out token counters for a run. Called by orchestrator.run()
+    before any agent executes, so resumed runs don't re-count tokens
+    that were already charged in the prior attempt."""
+    _run_totals[run_id] = {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_creation": 0,
+        "cost_usd": 0.0,
+        "calls": 0,
+        "calls_with_cache_activity": 0,
+    }
+
+
+def _estimate_call_cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_creation: int,
+) -> float:
+    """Approximate the dollar cost of one Claude call.
+
+    Anthropic publishes:
+      - cache_creation_input_tokens bill at 1.25× input rate (write premium)
+      - cache_read_input_tokens bill at 0.10× input rate (read discount)
+      - regular input_tokens and output_tokens at their standard rates
+
+    `input_tokens` from response.usage is the NON-cached portion
+    (Anthropic splits them out when caching is active). So we add the
+    three input categories independently — no double-counting.
+
+    Unknown model → input and output priced at 0; the call just won't
+    accrue (operator will see $0.00 and know to add the model to
+    COST_PER_1M_*). We deliberately don't estimate from a default so
+    wrong cost data isn't silently reported.
+    """
+    in_rate = COST_PER_1M_INPUT.get(model, 0.0)
+    out_rate = COST_PER_1M_OUTPUT.get(model, 0.0)
+    if in_rate == 0.0 and out_rate == 0.0:
+        return 0.0
+    return (
+        input_tokens * in_rate
+        + output_tokens * out_rate
+        + cache_read * in_rate * 0.10
+        + cache_creation * in_rate * 1.25
+    ) / 1_000_000
+
+
+def get_run_totals(run_id: str) -> dict[str, int]:
+    """Expose the live counters for UI / observability."""
+    return dict(_run_totals.get(run_id, {}))
+
+
+def _accumulate_run_tokens(
+    run_id: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int = 0,
+    cache_creation: int = 0,
+) -> tuple[dict, float]:
+    """Accumulate one call's usage into the run-level pot. Returns
+    (run_totals_dict, this_call_cost_usd) so the caller can write the
+    per-stage cost to stage_logs without recomputing."""
+    totals = _run_totals.setdefault(
+        run_id,
+        {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_creation": 0,
+            "cost_usd": 0.0,
+            "calls": 0,
+            "calls_with_cache_activity": 0,
+        },
+    )
+    totals["input"] += input_tokens
+    totals["output"] += output_tokens
+    totals["cache_read"] += cache_read
+    totals["cache_creation"] += cache_creation
+    totals["calls"] += 1
+    if cache_read > 0 or cache_creation > 0:
+        totals["calls_with_cache_activity"] += 1
+    this_call_cost = _estimate_call_cost_usd(
+        model, input_tokens, output_tokens, cache_read, cache_creation
+    )
+    totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + this_call_cost
+    return totals, this_call_cost
+
+
+def _check_run_budget(run_id: str) -> None:
+    """Raise RunBudgetExceededError if the run has passed MAX_TOKENS_PER_RUN.
+    Called right after every API response is accounted for."""
+    totals = _run_totals.get(run_id)
+    if not totals:
+        return
+    combined = totals["input"] + totals["output"]
+    if combined > MAX_TOKENS_PER_RUN:
+        raise RunBudgetExceededError(
+            f"流水线 {run_id[:8]} 已累计 {combined:,} tokens "
+            f"(input={totals['input']:,}, output={totals['output']:,})，"
+            f"超过 MAX_TOKENS_PER_RUN={MAX_TOKENS_PER_RUN:,}。"
+            f"为防止重试失控，已强制终止。如需继续请在 pipeline/config.py 调高上限，"
+            f"或人工排查为什么某个阶段反复重试。"
+        )
+
+
+def _maybe_warn_no_cache_hits(run_id: str) -> None:
+    """After the first few calls, if ENABLE_PROMPT_CACHING is on but the
+    backend reports zero cache activity, log once so the operator knows
+    the cache_control field is being dropped by their relay. Silent cache
+    misses = paying full price for nothing."""
+    if not ENABLE_PROMPT_CACHING:
+        return
+    totals = _run_totals.get(run_id)
+    if not totals or totals["calls"] < 4:
+        return
+    # Already warned for this run?
+    if totals.get("_cache_warned"):
+        return
+    if totals["calls_with_cache_activity"] == 0:
+        logger.warning(
+            "[cache-probe] run=%s: made %d calls with cache_control but the "
+            "backend reports 0 cache activity (no cache_read or "
+            "cache_creation tokens). Your relay likely drops the "
+            "cache_control field silently. Consider setting "
+            "ENABLE_PROMPT_CACHING=False in pipeline/config.py to avoid "
+            "sending dead weight.",
+            run_id[:8],
+            totals["calls"],
+        )
+        totals["_cache_warned"] = True
 
 
 class BaseAgent:
@@ -210,19 +394,29 @@ class BaseAgent:
     # Class-level timestamp for rate limiting across all agents
     _last_call_time: float = 0.0
 
-    def _call_claude(self, system_prompt: str, user_message: str) -> tuple[str, int, int]:
-        """Synchronous Claude API call. Returns (response_text, input_tokens, output_tokens).
+    def _call_claude(
+        self, system_prompt: str, user_message: str
+    ) -> tuple[str, int, int, int, int]:
+        """Synchronous Claude API call.
+
+        Returns (response_text, input_tokens, output_tokens,
+        cache_read_input_tokens, cache_creation_input_tokens). The last two
+        are 0 when caching isn't active or the backend doesn't report them
+        (common on relays that silently drop cache_control). They feed the
+        per-run cache-effectiveness probe.
 
         Two modes:
         - Vertex AI: uses adaptive/budget thinking, system= works normally.
         - Relay/direct: legacy path with budget_tokens thinking + proxy fallbacks.
         """
-        # Rate limiting: ensure minimum gap between API calls (Vertex 15K TPM)
-        if MIN_SECONDS_BETWEEN_CALLS > 0:
+        # Rate limiting. The effective value is picked by init_api_config
+        # (relay mode auto-throttles even if the static config constant is 0).
+        rate_limit = _effective_rate_limit_seconds()
+        if rate_limit > 0:
             elapsed = time.time() - BaseAgent._last_call_time
-            if elapsed < MIN_SECONDS_BETWEEN_CALLS:
-                wait = MIN_SECONDS_BETWEEN_CALLS - elapsed
-                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.1f}s")
+            if elapsed < rate_limit:
+                wait = rate_limit - elapsed
+                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.2f}s")
                 time.sleep(wait)
             BaseAgent._last_call_time = time.time()
 
@@ -233,10 +427,28 @@ class BaseAgent:
         user_content = self._build_content_blocks(user_message)
         messages = [{"role": "user", "content": user_content}]
 
+        # Structured system prompt with ephemeral cache control. Anthropic
+        # caches the system portion for ~5 minutes — subsequent calls within
+        # the window pay ~10% input rate for it. Foundation + agent prompt
+        # together are ~5-15KB per agent, and we call each agent multiple
+        # times per run (strategy loop, retry rounds, batch retries), so the
+        # cache hit rate is high. Falls back to plain string when caching is
+        # disabled (e.g. for relays that 400 on cache_control).
+        if ENABLE_PROMPT_CACHING:
+            system_block: Any = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            system_block = system_prompt
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "system": system_prompt,
+            "system": system_block,
             "messages": messages,
         }
 
@@ -284,7 +496,15 @@ class BaseAgent:
 
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
-        return text, input_tokens, output_tokens
+        # Cache usage fields are present when the backend supports prompt
+        # caching. Missing / None = silently unsupported (typical on many
+        # relay proxies). getattr falls back to 0 without crashing on older
+        # SDK versions that lack these attributes.
+        cache_read = int(getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+        cache_creation = int(
+            getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        )
+        return text, input_tokens, output_tokens, cache_read, cache_creation
 
     @staticmethod
     def _lenient_json_loads(text: str) -> dict[str, Any]:
@@ -363,7 +583,6 @@ class BaseAgent:
         )
 
     @staticmethod
-    @staticmethod
     def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
         """Repair truncated JSON by finding the last valid cut point and closing
         open containers in proper nesting order.
@@ -401,9 +620,22 @@ class BaseAgent:
         # Try cut points from most recent to earliest (keep as much data as possible)
         for cp in reversed(cut_points[-300:]):
             candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
-            # Strip dangling `"key":` (key with no value, left when cut mid-value)
-            candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)
-            candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)
+            # Strip a dangling partial field. Order matters — more specific
+            # patterns first. All regexes assume the candidate has no unclosed
+            # strings (cut_points are only recorded outside strings). After
+            # these substitutions the candidate should end at a clean structure
+            # boundary (`}`, `]`, a closed string value, a number, or
+            # `true`/`false`/`null`).
+            candidate = re.sub(r',\s*"[^"]*"\s*:\s*$', "", candidate)  # , "k":
+            candidate = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", candidate)  # { "k":
+            # NEW: lone trailing keys with no colon yet (truncation hit between
+            # the key and its colon). Matches `, "k"` and `{ "k"` respectively.
+            candidate = re.sub(r',\s*"[^"]*"\s*$', "", candidate)  # , "k"
+            candidate = re.sub(r'\{\s*"[^"]*"\s*$', "{", candidate)  # { "k"
+            # NEW: trailing array item that is just a lone string with no
+            # preceding comma — e.g. `[ "a", "b"` is fine (commas delimit)
+            # but `["a"` after a cut is fine too (stack handles it). We only
+            # need to handle `[ "a", ` which rstrip already covers.
             candidate = candidate.rstrip().rstrip(",")
 
             # Re-scan candidate with a real stack
@@ -482,11 +714,33 @@ class BaseAgent:
                 system_prompt = self.load_system_prompt()
                 user_message = json.dumps(input_data, ensure_ascii=False, indent=2)
 
-                text, input_tokens, output_tokens = await asyncio.to_thread(
+                (
+                    text,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation,
+                ) = await asyncio.to_thread(
                     self._call_claude, system_prompt, user_message
                 )
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
+
+                # Feed the per-run budget tracker. Raises RunBudgetExceededError
+                # if we've blown through MAX_TOKENS_PER_RUN — caught at the
+                # orchestrator level which marks the run as failed. Runs
+                # BEFORE JSON extraction so a catastrophic reply doesn't also
+                # get billed into a loop.
+                _, _call_cost = _accumulate_run_tokens(
+                    run_id,
+                    self.model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation,
+                )
+                _check_run_budget(run_id)
+                _maybe_warn_no_cache_hits(run_id)
 
                 output = self._extract_json(text)
                 duration = time.time() - start_time
@@ -517,10 +771,52 @@ class BaseAgent:
                     tokens_used=total_input_tokens + total_output_tokens,
                     duration_seconds=round(duration, 2),
                 )
+                # Push the run-level cost + token totals to pipeline_runs so
+                # the UI can display current spend without needing access to
+                # the in-process _run_totals dict. Swallow DB errors — cost
+                # tracking is observability, not a hard invariant. One small
+                # write per agent completion, at most ~14/run.
+                try:
+                    _run_total = _run_totals.get(run_id) or {}
+                    _run_tokens = (
+                        _run_total.get("input", 0) + _run_total.get("output", 0)
+                    )
+                    _run_cost = round(float(_run_total.get("cost_usd", 0.0)), 4)
+                    db.update_pipeline_run(
+                        run_id,
+                        total_tokens=_run_tokens,
+                        total_cost_usd=_run_cost,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] failed to push run totals to pipeline_runs",
+                        self.stage_name,
+                        exc_info=True,
+                    )
                 return output
 
             except ClarificationNeeded:
                 raise  # Don't retry clarification requests
+
+            except RunBudgetExceededError:
+                # Don't retry budget exhaustion — that would just double-down
+                # on the failure. Let it bubble up to the orchestrator, which
+                # will mark the run as failed. Still log the stage as failed
+                # so the UI shows which stage tripped the guard.
+                duration = time.time() - start_time
+                db.update_stage_log(
+                    log_id,
+                    status="failed",
+                    error_message=(
+                        "RunBudgetExceededError: 流水线累计 token 超过 "
+                        "MAX_TOKENS_PER_RUN 上限，已强制终止以防成本失控。"
+                        "请检查是否有阶段在反复重试，或在 pipeline/config.py "
+                        "调高 MAX_TOKENS_PER_RUN。"
+                    ),
+                    tokens_used=total_input_tokens + total_output_tokens,
+                    duration_seconds=round(duration, 2),
+                )
+                raise
 
             except Exception as e:
                 last_error = e
@@ -529,7 +825,11 @@ class BaseAgent:
                     f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
                 )
                 if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                    # True exponential backoff (see config.py). For MAX_RETRIES=2
+                    # the sequence is 3s, 6s — unchanged from the old linear
+                    # path; the formula is kept exponential so MAX_RETRIES can
+                    # grow without changing the curve's shape.
+                    delay = RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
                     await asyncio.sleep(delay)
 
         # All retries exhausted — build a robust, non-empty error message
@@ -552,10 +852,21 @@ class BaseAgent:
                 f"but no error info was captured (last_error={last_error!r}, "
                 f"model={self.model})"
             )
+        # Cap to avoid blowing up the DB column; but leave an explicit marker
+        # so the UI/operator knows the tail was cut instead of silently
+        # getting 8000 chars that look complete.
+        if len(err_str) > 8000:
+            truncated_msg = (
+                err_str[:7900]
+                + "\n\n[... 错误信息被截断于 8000 字符上限，完整 traceback 请看 "
+                + "Streamlit 运行控制台日志 ...]"
+            )
+        else:
+            truncated_msg = err_str
         db.update_stage_log(
             log_id,
             status="failed",
-            error_message=err_str[:8000],  # cap to avoid blowing up the column
+            error_message=truncated_msg,
             tokens_used=total_input_tokens + total_output_tokens,
             duration_seconds=round(duration, 2),
         )

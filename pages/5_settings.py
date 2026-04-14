@@ -13,21 +13,45 @@ st.info(f"**当前版本** `{VERSION}` · {VERSION_DATE} — {VERSION_NOTES}")
 
 st.subheader("连接状态")
 
+# Auto-detect active mode: presence of GCP_PROJECT_ID means Vertex; else
+# fall back to direct/relay. This matches init_api_config()'s logic in
+# pipeline/agents/__init__.py so the page never lies about which backend
+# will actually be used at runtime.
+_gcp_project = st.secrets.get("GCP_PROJECT_ID", "")
+_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+_base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
+_active_mode = "vertex" if _gcp_project else ("direct" if _api_key else "none")
+
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("**Anthropic API**")
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
-    if api_key and api_key != "sk-ant-...":
-        st.success(f"✅ 已配置 (***{api_key[-4:]})")
-        if base_url:
-            st.info(f"🔀 中转：`{base_url}`")
+    st.markdown("**Claude 接入**")
+    if _active_mode == "vertex":
+        _region = st.secrets.get("GCP_REGION", "us-east5")
+        _has_sa = "gcp_service_account" in st.secrets
+        st.success(f"✅ Vertex AI · `{_gcp_project}` @ `{_region}`")
+        if _has_sa:
+            st.caption("🔑 Service Account 凭证已就绪")
+        else:
+            st.caption("🔑 回退到 ADC（gcloud auth / env 变量）")
+        if _api_key:
+            st.warning(
+                "⚠️ 同时检测到 `ANTHROPIC_API_KEY`，但 Vertex 模式优先，它会被忽略。"
+                "要切回 Anthropic 模式请删掉 `GCP_PROJECT_ID` 再重启。"
+            )
+    elif _active_mode == "direct":
+        st.success(f"✅ Anthropic 直连/中转 (***{_api_key[-4:]})")
+        if _base_url:
+            st.info(f"🔀 中转：`{_base_url}`")
         else:
             st.caption("直连 Anthropic 官方 API")
     else:
         st.error("❌ 未配置")
-        st.caption("在 `.streamlit/secrets.toml` 中设置 `ANTHROPIC_API_KEY`")
+        st.caption(
+            "在 `.streamlit/secrets.toml` 中**二选一**：\n"
+            "- 填 `ANTHROPIC_API_KEY`（直连/中转）\n"
+            "- 或填 `GCP_PROJECT_ID` + `gcp_service_account`（Vertex）"
+        )
 
 with col2:
     st.markdown("**Supabase**")
@@ -77,16 +101,56 @@ with st.expander("Supabase 设置步骤"):
 """
     )
 
-with st.expander("Anthropic API 设置步骤"):
+st.markdown(
+    "**Claude 接入模式二选一**。系统启动时自动探测：只要有 `GCP_PROJECT_ID`"
+    "就走 Vertex，否则走 Anthropic 直连/中转。两块**不要同时填**，"
+    "避免误判或浪费 Key。"
+)
+
+with st.expander("方式 A · Anthropic 直连/中转 设置步骤"):
     st.markdown(
         """
 1. 访问 [console.anthropic.com](https://console.anthropic.com) 创建 API Key
 2. 填入 `.streamlit/secrets.toml`：
    ```toml
    ANTHROPIC_API_KEY = "sk-ant-..."
+   # 可选，走代理/中转时填，不填就是直连官方
+   ANTHROPIC_BASE_URL = ""
    ```
 3. 重启 Streamlit 应用
 
-**注意**：本系统使用 Opus 和 Sonnet 模型，请确保你的 API 额度支持这些模型。
+**适用**：个人开发、小量调用。
+**注意**：本系统使用 Opus 和 Opus-thinking 模型，请确保你的 API 额度
+支持这些模型。如果走中转站，请确认它支持：
+- 模型名后缀 `-thinking`（思考型阶段靠它路由）
+- `cache_control: ephemeral` 字段（不支持就把 `ENABLE_PROMPT_CACHING` 关掉）
+"""
+    )
+
+with st.expander("方式 B · Vertex AI 设置步骤"):
+    st.markdown(
+        """
+1. 在 Google Cloud Console 开通 **Vertex AI API** 并申请 Claude 模型访问权限
+   （Claude on Vertex 需要白名单）
+2. 为项目创建一个 Service Account，授予 `Vertex AI User` 角色，下载 JSON Key
+3. 填入 `.streamlit/secrets.toml`：
+   ```toml
+   GCP_PROJECT_ID = "your-project-id"
+   GCP_REGION     = "asia-southeast1"  # 或其他支持 Claude 的 region
+
+   [gcp_service_account]
+   type = "service_account"
+   project_id = "..."
+   private_key_id = "..."
+   private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+   client_email = "..."
+   client_id = "..."
+   # ...其余字段按 JSON 原样铺平
+   ```
+4. 重启 Streamlit 应用
+
+**适用**：生产部署、企业合规、高配额需求。
+**注意**：adaptive thinking（让模型自行决定思考深度）只有 Vertex 原生支持；
+走 Anthropic 直连/中转则退化为固定 `budget_tokens=THINKING_BUDGET_TOKENS`。
 """
     )

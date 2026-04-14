@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.2"
-VERSION_DATE = "2026-04-13"
-VERSION_NOTES = "显式禁止工部输出 + 终审检查 usage_guide/batch_rules"
+VERSION = "v0.10.2"
+VERSION_DATE = "2026-04-14"
+VERSION_NOTES = "schema.sql 幂等化 + README 补迁移指引"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -38,11 +38,53 @@ MODELS: dict[str, str] = {
 # ── Retry & timeout ────────────────────────────────────────────────────────
 
 MAX_RETRIES = 2
-RETRY_BASE_DELAY_SECONDS = 3  # exponential backoff: 3s, 6s
+# Exponential backoff base. Delay for attempt N is
+# RETRY_BASE_DELAY_SECONDS * 2**N (so 3s after attempt 0, 6s after attempt
+# 1, 12s after attempt 2, ...). With MAX_RETRIES=2 this matches the old
+# linear 3,6 sequence; the formula is kept exponential so bumping
+# MAX_RETRIES doesn't silently change the retry curve.
+RETRY_BASE_DELAY_SECONDS = 3
+
+# ── Clarification ─────────────────────────────────────────────────────────
+# How long the pipeline waits for the user to answer a clarification
+# request before giving up. 1 hour is generous for humans to come back
+# from another tab / lunch, short enough that a truly-abandoned run gets
+# cleaned up eventually.
+CLARIFICATION_TIMEOUT_SECONDS = 3600
+# Poll interval while waiting for user response.
+CLARIFICATION_POLL_SECONDS = 5
+# Max clarification rounds per agent — if the model keeps asking, force
+# continue with whatever partial output it gave instead of looping forever.
+MAX_CLARIFICATION_PER_AGENT = 2
+
+# ── Platform demo length bounds ──────────────────────────────────────────
+# (min_chars, max_chars) for demo_output validation per platform. Keys are
+# matched via substring+case-insensitive against the cell's platform field,
+# so both Chinese and romanized variants resolve to the same range. Values
+# are approximate — the validator allows 1.5× the max as a hard ceiling.
+PLATFORM_DEMO_LENGTH_RANGES: dict[str, tuple[int, int]] = {
+    "小红书": (200, 1000),
+    "xiaohongshu": (200, 1000),
+    "抖音": (50, 500),
+    "douyin": (50, 500),
+    "b站": (150, 600),
+    "bilibili": (150, 600),
+    "知乎": (300, 2000),
+    "zhihu": (300, 2000),
+    "微博": (20, 200),
+    "weibo": (20, 200),
+}
+# Fallback when the platform isn't recognized.
+PLATFORM_DEMO_LENGTH_DEFAULT: tuple[int, int] = (50, 2000)
 
 # ── Chancellery review ─────────────────────────────────────────────────────
 
-MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
+MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3
+
+# final_review (工部产出的 prompt_matrix) 的轮次上限。第一次跑流水线 = round 1；
+# 用户每点一次「应用修订意见并重跑」round +1。超过 MAX_FINAL_REJECTIONS 后强制
+# 放行，并在 suggestions 里打风险注。防止终审无限驳回工部造成死循环。
+MAX_FINAL_REJECTIONS = 3
 
 # ── Token limits ───────────────────────────────────────────────────────────
 # max_tokens must accommodate (thinking_budget + actual_output) for thinking stages.
@@ -91,9 +133,37 @@ THINKING_STAGES: frozenset[str] = frozenset({
 THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────
-# Set to 0 for relay/direct (no rate limit needed). Increase for Vertex if
-# quota is tight.
+# Per-process throttle between API calls. 0 = no throttle. init_api_config
+# upgrades this to RELAY_MIN_SECONDS_BETWEEN_CALLS on relay mode because
+# most relays have stricter concurrency caps than direct Anthropic.
 MIN_SECONDS_BETWEEN_CALLS = 0
+# Applied automatically when a relay backend is detected. Set to 0 to
+# opt out of the auto-throttle (your relay doesn't need it).
+RELAY_MIN_SECONDS_BETWEEN_CALLS = 0.3
+
+# ── Per-run budget ───────────────────────────────────────────────────────
+# Hard ceiling on combined input + output tokens accumulated within a
+# single pipeline run. Once exceeded, the next agent call raises
+# RunBudgetExceededError and the orchestrator marks the run as failed.
+# Safety net against runaway retry loops — 14 stages × worst-case retries
+# × thinking budgets can compound quickly without a cap.
+#
+# Opus at $15/M input + $75/M output → 1M tokens ≈ $45 ceiling per run
+# (assuming roughly balanced in/out). Tune to your cost tolerance.
+MAX_TOKENS_PER_RUN = 2_000_000
+
+# ── Prompt Caching ────────────────────────────────────────────────────────
+# When True, the system prompt is sent with cache_control={"type":"ephemeral"}
+# so Anthropic caches it for ~5 minutes. Re-use across retries/batches hits
+# the cache and pays ~10% input-token rate for the system portion. Requires
+# system prompt to be ≥ 1024 tokens (small prompts silently don't cache).
+#
+# Vertex AI: native support.
+# Anthropic direct: native support.
+# Relay proxies: depends on the relay. Most pass the field through; some
+# drop it (cache just misses, no error). If your relay 400s on it, set this
+# to False.
+ENABLE_PROMPT_CACHING = True
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 

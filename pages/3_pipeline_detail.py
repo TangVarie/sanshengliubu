@@ -6,7 +6,13 @@ import time
 
 import streamlit as st
 from db.supabase_client import SupabaseClient
-from pipeline.config import PIPELINE_STAGES, POLL_INTERVAL_SECONDS
+from pipeline.agents import get_run_totals
+from pipeline.config import (
+    MAX_FINAL_REJECTIONS,
+    MAX_TOKENS_PER_RUN,
+    PIPELINE_STAGES,
+    POLL_INTERVAL_SECONDS,
+)
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
@@ -15,17 +21,28 @@ show_version_badge()
 
 def render_stage_error(log: dict) -> None:
     """Render an error message for a failed stage. Always shows something,
-    even if error_message is empty/missing — silent failures are the worst."""
+    even if error_message is empty/missing — silent failures are the worst.
+    Accepts non-string error_message (e.g. legacy rows that stored a dict)
+    and pretty-prints it as JSON instead of rendering a raw repr.
+    """
     msg = (log or {}).get("error_message")
-    if msg and str(msg).strip():
-        st.error(msg)
-    else:
-        st.error(
-            f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
-            f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
-            f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
-            f"stage_log id: `{(log or {}).get('id', '?')}`"
-        )
+    if msg:
+        if isinstance(msg, str):
+            text = msg.strip()
+        else:
+            try:
+                text = json.dumps(msg, ensure_ascii=False, indent=2)
+            except Exception:
+                text = repr(msg)
+        if text:
+            st.error(text)
+            return
+    st.error(
+        f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
+        f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
+        f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
+        f"stage_log id: `{(log or {}).get('id', '?')}`"
+    )
 
 
 def render_stage_output(output_data: dict):
@@ -75,6 +92,18 @@ STATUS_EMOJI = {
     "paused_for_review": "⏸️", "needs_revision": "📝🔁",
 }
 status = project.get("status", "draft")
+
+# Reset session-scoped busy flags once the project is no longer running.
+# Without this, a button would stay disabled in a user's tab even after
+# the pipeline completed in another tab / finished via background thread.
+if status != "running":
+    for _key in (
+        f"pipeline_busy_{project_id}",
+        f"pipeline_busy_actions_{project_id}",
+    ):
+        if st.session_state.get(_key):
+            st.session_state[_key] = False
+
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
 
@@ -93,7 +122,26 @@ if status == "needs_revision":
             _revisions = _final_review.get("mandatory_revisions", []) or []
             _dimensions = _final_review.get("review_dimensions", {}) or {}
             _suggestions = _final_review.get("suggestions", []) or []
+            # Current final-review round from _revision_context (if any)
+            _brief = (project or {}).get("brief") or {}
+            _rc = _brief.get("_revision_context") or {}
+            _current_round = int(_rc.get("round", 1)) if _rc else 1
+            _next_round = _current_round + 1 if _rc else 2
             with st.container(border=True):
+                # Round badge — shows user how close they are to force-pass
+                if _current_round >= MAX_FINAL_REJECTIONS:
+                    st.warning(
+                        f"🔔 当前终审为 **第 {_current_round} 轮**，已达硬上限 "
+                        f"({MAX_FINAL_REJECTIONS})。再次点击「应用修订意见」会触发"
+                        f"**强制通过**——意味着门下省会自动放行，建议改为人工复核产出后"
+                        f"点「📦 查看部分产出」导出。"
+                    )
+                else:
+                    st.info(
+                        f"🔁 当前终审为 **第 {_current_round} 轮 / 共 {MAX_FINAL_REJECTIONS} 轮**。"
+                        f"下次点击「应用修订意见」将触发第 {_next_round} 轮，"
+                        f"门下省会做增量评审（只看本次未解决的问题，不重复上轮已修的事）。"
+                    )
                 st.error(
                     f"📝🔁 **终审判定：{_verdict}** — 流水线已运行完毕，但门下省终审认为产出"
                     f"未达交付标准。下方「终审」tab 有完整审查报告。"
@@ -146,16 +194,23 @@ if status == "needs_revision":
                     "只重跑 工部架构 → 格子规划 → 构建 → 网感复检 → 终审，"
                     "保留前面已完成的太子/中书省/尚书省/五部，不浪费 token。"
                 )
+                _busy_key = f"pipeline_busy_{project_id}"
+                _is_busy = st.session_state.get(_busy_key, False)
                 if st.button(
                     "✅ 应用修订意见并重跑工部",
                     type="primary",
                     key="apply_revision_btn",
+                    disabled=_is_busy,
                     help="读取终审的 mandatory_revisions 和 revision_instructions，"
                          "存到 project.brief._revision_context，删除 ministry_works/"
                          "cell_planner/builder/vibe_critic/vibe_rewriter/chancellery_final 的 "
                          "stage_logs，然后触发 resume — 工部会拿到修订指令做针对性修复。",
                 ):
-                    from pipeline.orchestrator import revise_and_resume_pipeline_in_background
+                    st.session_state[_busy_key] = True
+                    from pipeline.orchestrator import (
+                        PipelineAlreadyRunningError,
+                        revise_and_resume_pipeline_in_background,
+                    )
                     from pipeline.agents import init_api_config
                     init_api_config()
                     try:
@@ -168,7 +223,11 @@ if status == "needs_revision":
                             "修订意见作为 _revision_directives 注入到工部各 agent。"
                         )
                         st.rerun()
+                    except PipelineAlreadyRunningError as _err:
+                        st.session_state[_busy_key] = False
+                        st.warning(f"⚠️ {_err}")
                     except Exception as _err:
+                        st.session_state[_busy_key] = False
                         st.error(f"应用修订失败：{_err}")
     except Exception as _e:
         st.warning(f"无法加载终审报告：{_e}")
@@ -182,10 +241,23 @@ run = runs[0]
 run_id = run["id"]
 stage_logs = db.get_stage_logs(run_id)
 
-# Build a lookup: stage_name -> log
+# If Supabase couldn't return the full payload (free-tier connection hiccups,
+# big output_data blobs), .partial flips True and we fall back to a slim
+# query without output_data. Surface it so the user isn't puzzled by empty
+# stage details after a flaky refresh.
+if getattr(stage_logs, "partial", False):
+    st.warning(
+        "⚠️ 数据未完整加载：当前表格未包含各阶段的 `output_data`（受 Supabase "
+        "连接/负载影响，系统自动降级成轻量查询）。刷新页面通常会恢复。"
+    )
+
+# Build a lookup: stage_name -> log. Skip rows missing stage_name (defensive
+# against partial writes / schema drift) instead of KeyError-ing the page.
 log_map: dict[str, dict] = {}
 for log in stage_logs:
-    log_map[log["stage_name"]] = log
+    name = log.get("stage_name")
+    if name:
+        log_map[name] = log
 
 # ── Clarification Alert ───────────────────────────────────────────────────
 
@@ -213,7 +285,8 @@ needs_input_logs = [
 ]
 for ni_log in needs_input_logs:
     output = ni_log.get("output_data", {})
-    stage_display = STAGE_DISPLAY_NAMES.get(ni_log["stage_name"], ni_log["stage_name"])
+    _ni_name = ni_log.get("stage_name", "unknown")
+    stage_display = STAGE_DISPLAY_NAMES.get(_ni_name, _ni_name)
     questions = output.get("questions", [])
     context_info = output.get("context", "")
 
@@ -488,18 +561,69 @@ with tabs[5]:
 # ── Stats footer ───────────────────────────────────────────────────────────
 
 st.divider()
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b, col_c, col_d = st.columns(4)
 
 total_tokens = sum(l.get("tokens_used", 0) for l in stage_logs)
 total_duration = sum(l.get("duration_seconds", 0) or 0 for l in stage_logs)
 completed_stages = sum(1 for l in stage_logs if l.get("status") == "completed")
 
+# Cost: prefer the DB-authoritative value on pipeline_runs.total_cost_usd
+# (updated after each agent completion via agents/__init__.py), fall back
+# to in-process _run_totals for the same-process running case, then to 0.
+_run_cost_db = 0.0
+try:
+    _run_cost_db = float(run.get("total_cost_usd", 0) or 0)
+except (TypeError, ValueError):
+    _run_cost_db = 0.0
+
+# Live per-run totals from the in-process budget tracker (only populated
+# while the thread is running in this Streamlit process). Used mainly to
+# surface cache effectiveness; falls back to stage_logs sum otherwise.
+_run_totals = get_run_totals(run_id)
+_cache_read = _run_totals.get("cache_read", 0)
+_cache_creation = _run_totals.get("cache_creation", 0)
+_calls = _run_totals.get("calls", 0)
+_cache_calls = _run_totals.get("calls_with_cache_activity", 0)
+_run_cost_live = float(_run_totals.get("cost_usd", 0.0))
+_run_cost = max(_run_cost_db, _run_cost_live)
+
 with col_a:
     st.metric("已完成环节", f"{completed_stages}/{len(PIPELINE_STAGES)}")
 with col_b:
-    st.metric("总 Token", f"{total_tokens:,}")
+    # Show budget remaining as the subtitle so the operator can eyeball how
+    # close we are to the hard cap. Uses stage_logs sum as authoritative
+    # (works across resume); in-process totals are additive during a fresh run.
+    budget_pct = (total_tokens / MAX_TOKENS_PER_RUN * 100) if MAX_TOKENS_PER_RUN else 0
+    st.metric(
+        "总 Token",
+        f"{total_tokens:,}",
+        f"{budget_pct:.0f}% of budget",
+        delta_color="off",
+    )
 with col_c:
+    # Cost is best-effort (unknown models → $0). The caption below states
+    # the precision so a $0.00 reading isn't mistaken for free execution.
+    st.metric("预计成本", f"${_run_cost:.2f}")
+with col_d:
     st.metric("总耗时", f"{total_duration:.1f}s")
+
+# Cache effectiveness indicator — only shown when the background thread
+# reported at least a few calls in this process. Otherwise the totals are
+# 0 because a different process/restart handled those calls.
+if _calls >= 3:
+    if _cache_read + _cache_creation == 0:
+        st.caption(
+            f"🟡 Prompt 缓存：本次 {_calls} 次调用中 0 次命中缓存。"
+            f"很可能中转站丢弃了 `cache_control` 字段——在 `pipeline/config.py` "
+            f"把 `ENABLE_PROMPT_CACHING` 改成 `False` 可以避免发送多余字段。"
+        )
+    else:
+        hit_rate = _cache_calls / _calls * 100
+        st.caption(
+            f"🟢 Prompt 缓存生效：{_cache_calls}/{_calls} 次调用命中 "
+            f"({hit_rate:.0f}%)，已累计 cache_read={_cache_read:,} / "
+            f"cache_creation={_cache_creation:,} tokens。"
+        )
 
 # ── Actions + auto-refresh ─────────────────────────────────────────────────
 
@@ -512,6 +636,10 @@ with c1:
             st.session_state["current_project_id"] = project_id
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
+# Session-scoped busy flag prevents a second click before Streamlit reruns.
+_actions_busy_key = f"pipeline_busy_actions_{project_id}"
+_actions_busy = st.session_state.get(_actions_busy_key, False)
+
 with c2:
     # Allow resume whenever not actively completed — covers failed, paused, and
     # silently-hung "running" states (e.g. background thread crashed without
@@ -519,29 +647,59 @@ with c2:
     if status != "completed":
         if st.button(
             "▶️ 继续执行",
+            disabled=_actions_busy,
             help=(
                 "从失败/中断处继续。已完成的 stage 直接跳过；工部的格子规划和构建"
                 "还会做 cell 级 resume——扫描之前成功的批次，只重跑真正还没成功的"
                 "cell，不会让已经花过 token 的产出白白重算。"
             ),
         ):
-            from pipeline.orchestrator import resume_pipeline_in_background
+            st.session_state[_actions_busy_key] = True
+            from pipeline.orchestrator import (
+                PipelineAlreadyRunningError,
+                resume_pipeline_in_background,
+            )
             from pipeline.agents import init_api_config
             init_api_config()
-            # Reset status so the orchestrator can take over again
-            db.update_project(project_id, status="running")
-            resume_pipeline_in_background(project_id, run_id, db)
-            st.rerun()
+            try:
+                # Don't pre-set project.status here; orchestrator.run() does
+                # it, and our guard checks project.status so pre-setting
+                # would make the guard reject our own call.
+                resume_pipeline_in_background(project_id, run_id, db)
+                st.rerun()
+            except PipelineAlreadyRunningError as _err:
+                st.session_state[_actions_busy_key] = False
+                st.warning(f"⚠️ {_err}")
+            except Exception as _err:
+                st.session_state[_actions_busy_key] = False
+                st.error(f"继续执行失败：{_err}")
 with c3:
     # Restart from scratch — always available except while a fresh run is healthy
-    if st.button("🔄 重跑流水线", help="完全从头开始（会创建新的 run）"):
-        from pipeline.orchestrator import start_pipeline_in_background
+    if st.button(
+        "🔄 重跑流水线",
+        disabled=_actions_busy,
+        help="完全从头开始（会创建新的 run）",
+    ):
+        st.session_state[_actions_busy_key] = True
+        from pipeline.orchestrator import (
+            PipelineAlreadyRunningError,
+            start_pipeline_in_background,
+        )
         from pipeline.agents import init_api_config
-        new_run = db.create_pipeline_run(project_id)
-        db.update_project(project_id, status="running")
         init_api_config()
-        start_pipeline_in_background(project_id, new_run["id"], db)
-        st.rerun()
+        try:
+            # create_pipeline_run + start — orchestrator sets project.status
+            # internally, so we skip the pre-emptive update that would
+            # trip our own guard.
+            new_run = db.create_pipeline_run(project_id)
+            start_pipeline_in_background(project_id, new_run["id"], db)
+            st.rerun()
+        except PipelineAlreadyRunningError as _err:
+            st.session_state[_actions_busy_key] = False
+            st.warning(f"⚠️ {_err}")
+        except Exception as _err:
+            st.session_state[_actions_busy_key] = False
+            st.error(f"重跑失败：{_err}")
 
 # Auto-refresh when running or paused for review (waiting for user input)
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):

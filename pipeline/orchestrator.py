@@ -15,11 +15,22 @@ from db.supabase_client import SupabaseClient
 from pipeline.config import (
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
+    CLARIFICATION_POLL_SECONDS,
+    CLARIFICATION_TIMEOUT_SECONDS,
     MAX_CHANCELLERY_REJECTIONS,
+    MAX_CLARIFICATION_PER_AGENT,
+    MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
+    PLATFORM_DEMO_LENGTH_DEFAULT,
+    PLATFORM_DEMO_LENGTH_RANGES,
 )
-from pipeline.agents import ClarificationNeeded
+from pipeline.agents import (
+    ClarificationNeeded,
+    RunBudgetExceededError,
+    get_run_totals,
+    reset_run_budget,
+)
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
@@ -39,9 +50,10 @@ from pipeline.agents.ministries.works import (
 
 logger = logging.getLogger(__name__)
 
-MAX_CLARIFICATION_PER_AGENT = 2
-CLARIFICATION_POLL_INTERVAL = 5  # seconds
-CLARIFICATION_TIMEOUT = 3600  # 1 hour
+# All clarification timing is centralized in pipeline/config.py — these
+# aliases preserve the short local names used throughout this file.
+CLARIFICATION_POLL_INTERVAL = CLARIFICATION_POLL_SECONDS
+CLARIFICATION_TIMEOUT = CLARIFICATION_TIMEOUT_SECONDS
 
 
 class PipelineOrchestrator:
@@ -70,13 +82,29 @@ class PipelineOrchestrator:
     # ── Completed stages cache (for resume) ───────────────────────────
 
     def _load_completed_stages(self) -> dict[str, dict]:
-        """Load outputs from already-completed stages in this run."""
+        """Load outputs from already-completed stages in this run.
+
+        Defensive: if a log row is missing `stage_name` (schema drift /
+        partial write), skip it instead of crashing the whole pipeline on a
+        KeyError at resume time.
+        """
         logs = self.db.get_stage_logs(self.run_id)
-        return {
-            log["stage_name"]: log["output_data"]
-            for log in logs
-            if log.get("status") == "completed" and log.get("output_data")
-        }
+        done: dict[str, dict] = {}
+        for log in logs:
+            if log.get("status") != "completed":
+                continue
+            output = log.get("output_data")
+            if not output:
+                continue
+            name = log.get("stage_name")
+            if not name:
+                logger.warning(
+                    f"[resume] skipping stage_log with missing stage_name: "
+                    f"id={log.get('id', '?')}"
+                )
+                continue
+            done[name] = output
+        return done
 
     def _recover_completed_cells(
         self, stage_name: str, field: str
@@ -127,7 +155,11 @@ class PipelineOrchestrator:
                 return log["human_intervention"]
             await asyncio.sleep(CLARIFICATION_POLL_INTERVAL)
 
-        raise TimeoutError("Clarification request timed out after 1 hour")
+        raise TimeoutError(
+            f"Clarification request timed out after "
+            f"{CLARIFICATION_TIMEOUT} seconds "
+            f"(~{CLARIFICATION_TIMEOUT // 60} minutes)"
+        )
 
     async def _run_with_clarification(
         self, agent, input_data: dict, max_asks: int = MAX_CLARIFICATION_PER_AGENT
@@ -168,6 +200,12 @@ class PipelineOrchestrator:
         try:
             self.db.update_pipeline_run(self.run_id, status="running")
             self.db.update_project(self.project_id, status="running")
+
+            # Zero out per-run token counters so this attempt starts fresh.
+            # Reset is essential for resumed/revised runs — otherwise the
+            # previously-charged tokens would still count toward the budget
+            # cap and a run could trip the guardrail on its first retry call.
+            reset_run_budget(self.run_id)
 
             done = self._load_completed_stages()
 
@@ -263,8 +301,21 @@ class PipelineOrchestrator:
             final_system = await self._run_vibe_loop(final_system)
 
             # 6. 门下省终审
+            # Track review round for the final-review force-pass mechanism.
+            # Round 1 = fresh run. Round ≥ 2 = user applied revisions at least
+            # once; revise_and_resume_pipeline_in_background stored the round
+            # counter + prior review in _revision_context.
+            _rc = self._revision_context or {}
+            _final_round = int(_rc.get("round", 1)) if _rc else 1
+            _prior_review = _rc.get("prior_review") if _rc else None
             final_review = await self.chancellery.run_final_review(
-                final_system, plan, structured_brief, self.run_id, self.db
+                final_system,
+                plan,
+                structured_brief,
+                self.run_id,
+                self.db,
+                round_number=_final_round,
+                prior_review=_prior_review,
             )
 
             # 6.5 Safety: if chancellery flagged revision_required but didn't
@@ -363,9 +414,25 @@ class PipelineOrchestrator:
     async def _run_ministries(
         self, tasks: dict, brief: dict, plan: dict, done: dict | None = None
     ) -> dict:
-        """Run first 5 ministries in parallel. Any failure aborts the pipeline."""
+        """Run first 5 ministries in parallel. Any failure aborts the pipeline.
+
+        Context-slimming: the 5 non-works ministries don't need the full plan
+        (matrix_skeleton / module_plan / platform_direction_matrix are all
+        downstream concerns). They only reference tactical_directions /
+        target_platforms / strategic_insight. Passing a slim plan cuts 5 ×
+        ~30KB of redundant input tokens per run. Dispatcher's task.context
+        already surfaces per-ministry direction info, so this is safe.
+        """
         task_map = tasks.get("tasks", {})
         done = done or {}
+
+        # Extract only the fields the 5 non-works ministries actually read.
+        # If a field is missing, it's fine — the prompt will just not get it.
+        slim_plan = {
+            k: plan[k]
+            for k in ("tactical_directions", "target_platforms", "strategic_insight", "system_name")
+            if k in plan
+        }
 
         async def run_one(name: str) -> tuple[str, dict]:
             # Skip if already completed in a previous run attempt
@@ -378,7 +445,7 @@ class PipelineOrchestrator:
             input_data = {
                 "task": ministry_task,
                 "brief": brief,
-                "plan": plan,
+                "plan": slim_plan,
             }
             try:
                 result = await self._run_with_clarification(agent, input_data)
@@ -460,25 +527,48 @@ class PipelineOrchestrator:
                     "paradigm": d_paradigm,
                 })
 
-        # Decide whether to use secretariat's active_cells or our reconstruction.
-        # Use reconstruction whenever it covers strictly more directions, since
-        # losing directions is the bug we're fixing.
+        # Decide how to reconcile secretariat's active_cells vs our D×P
+        # reconstruction. Historical bug: model sometimes only emits D1 cells
+        # and omits the rest — reconstruction catches that. New concern (#6):
+        # previously we replaced active_cells wholesale with the reconstruction
+        # as soon as ANY direction was missing, which could force-plan
+        # directions that secretariat intentionally dropped (without listing
+        # them in excluded_cells). Fix: only ADD truly-missing (direction_id,
+        # platform) pairs and keep everything else from secretariat, so
+        # intentional non-coverage is preserved.
         active_dir_set = {str(c.get("direction_id")) for c in active_cells if isinstance(c, dict)}
         expected_dir_set = {str(c.get("direction_id")) for c in expected_cells}
 
-        if expected_cells and len(expected_dir_set - active_dir_set) > 0:
-            logger.warning(
-                f"matrix_skeleton.active_cells covers directions {sorted(active_dir_set)} "
-                f"but tactical_directions × platforms expects {sorted(expected_dir_set)}. "
-                f"Reconstructing active_cells from D×P (n={len(expected_cells)})."
-            )
-            active_cells = expected_cells
-        elif not active_cells and expected_cells:
+        if not active_cells and expected_cells:
+            # Case A: secretariat gave us nothing at all. Use reconstruction.
             logger.warning(
                 f"matrix_skeleton.active_cells is empty, using reconstruction "
                 f"({len(expected_cells)} cells from {len(directions)}×{len(platforms)})"
             )
             active_cells = expected_cells
+        elif expected_cells:
+            # Case B: secretariat gave us some cells. Only splice in D×P pairs
+            # that secretariat literally didn't produce AND aren't in excluded.
+            existing_pairs = {
+                (str(c.get("direction_id")), _platform_key(c.get("platform", "")))
+                for c in active_cells
+                if isinstance(c, dict)
+            }
+            splice_in = [
+                cell for cell in expected_cells
+                if (cell["direction_id"], _platform_key(cell["platform"]))
+                not in existing_pairs
+            ]
+            if splice_in:
+                missing_dirs = sorted(expected_dir_set - active_dir_set)
+                logger.warning(
+                    f"matrix_skeleton.active_cells is missing "
+                    f"{len(splice_in)} (direction×platform) pairs that "
+                    f"tactical_directions × target_platforms expects "
+                    f"(missing dirs: {missing_dirs}); splicing them in. "
+                    f"Secretariat's original cells are preserved."
+                )
+                active_cells = list(active_cells) + splice_in
 
         if not active_cells:
             logger.error(
@@ -1181,8 +1271,47 @@ class PipelineOrchestrator:
         return final_system
 
 
+class PipelineAlreadyRunningError(RuntimeError):
+    """Raised when an entry point tries to start a pipeline for a project that
+    already has a thread running. Prevents double-clicks, two browser tabs,
+    or multiple users from racing on the same run_id.
+    """
+
+
+def _assert_project_not_running(
+    project_id: str,
+    db: SupabaseClient,
+    required_status: str | None = None,
+) -> dict:
+    """Re-read project status from DB (bypassing any stale in-UI cache) and
+    refuse to proceed if it's already running, or if required_status is set
+    and the project isn't in that state. Returns the fresh project dict on
+    success.
+
+    The race window between this check and the caller's own "status=running"
+    write is small (ms) but not zero. For full correctness we'd need an
+    atomic compare-and-swap in Supabase, which the Python client doesn't
+    expose cleanly. Combined with the UI-level session_state lock, this
+    closes the practical failure modes (user double-clicks, two tabs).
+    """
+    project = db.get_project(project_id) or {}
+    current = (project.get("status") or "").strip()
+    if current == "running":
+        raise PipelineAlreadyRunningError(
+            f"项目 {project_id[:8]} 当前状态为 running，已有一条流水线正在执行。"
+            f"等它跑完或失败后再重试。"
+        )
+    if required_status and current != required_status:
+        raise PipelineAlreadyRunningError(
+            f"项目 {project_id[:8]} 当前状态是 {current!r}，不满足触发条件 "
+            f"{required_status!r}。请刷新页面查看最新状态。"
+        )
+    return project
+
+
 def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
     """Launch pipeline in a background thread (for Streamlit compatibility)."""
+    _assert_project_not_running(project_id, db)
 
     def _thread_target():
         loop = asyncio.new_event_loop()
@@ -1190,8 +1319,45 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
         try:
             orchestrator = PipelineOrchestrator(project_id, run_id, db)
             loop.run_until_complete(orchestrator.run())
-        except Exception:
+        except Exception as e:
+            # Two failure classes land here:
+            #   (a) Exception inside orchestrator.run() — its own try/except
+            #       already updated pipeline_run.status to "failed" and
+            #       re-raised, so we just log.
+            #   (b) Exception BEFORE orchestrator.run() got to run its try
+            #       block — e.g. PipelineOrchestrator.__init__ crashed,
+            #       event-loop setup failed, the thread was killed early.
+            #       In that case pipeline_run.status is still whatever the
+            #       caller set it to ("running") and the UI will auto-refresh
+            #       forever waiting for a completion that will never come.
+            # We can't always tell (a) from (b), so redundantly mark the run
+            # failed here: it's idempotent if (a) already did it, and the
+            # safety net for (b). Swallow DB errors so we don't crash the
+            # thread cleanup.
             logger.exception("Background pipeline thread failed")
+            try:
+                err_str = f"{type(e).__name__}: {e}"
+                db.update_pipeline_run(
+                    run_id,
+                    status="failed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                db.update_project(project_id, status="failed")
+                # Also surface the failure in stage_logs so UI has something
+                # to render instead of just an empty "running" spinner.
+                db.create_stage_log(
+                    run_id,
+                    stage_name="_thread_target",
+                    input_data={"phase": "thread_init_or_teardown"},
+                )
+                logger.info(
+                    f"[thread_target] marked run={run_id} failed with: {err_str}"
+                )
+            except Exception:
+                logger.exception(
+                    "[thread_target] also failed to mark run as failed — "
+                    "run will stay in 'running' state; manual DB cleanup needed"
+                )
         finally:
             loop.close()
 
@@ -1253,6 +1419,14 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             issues.append(f"{cid}: system_prompt 结尾不完整（末尾: ...{tail!r}）")
 
     # ── 3. system_prompt must contain essential sections ────────────────
+    #
+    # These checks mirror what chancellery_final's final_review section in
+    # chancellery.md evaluates, so works_builder can self-catch the same
+    # class of issues locally (no LLM cost) instead of getting punted back
+    # by the reviewer three rounds later.
+    #
+    # Principle: only hard-fail on items chancellery explicitly flags.
+    # Stylistic nits (tone/naturalness) still belong to the reviewer.
     if sp:
         essential_keywords = {
             "合规": "合规/compliance 规则",
@@ -1263,32 +1437,62 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             if keyword not in sp:
                 issues.append(f"{cid}: system_prompt 缺少「{description}」（找不到 '{keyword}'）")
 
-        # Check differentiation pools — at least mention narrative/opening/emotion
-        pool_keywords = ["叙事", "开头", "情绪"]
-        pool_missing = [kw for kw in pool_keywords if kw not in sp]
-        if len(pool_missing) >= 2:
+        # 5 differentiation pools — works_builder.md:17-23 explicitly says
+        # "5 个池必须全部内置，缺一个都算不合格". We accept either the
+        # Chinese pool name OR its English key as proof the pool is present.
+        # Count distinct pools found; < 4 = hard fail (matches chancellery's
+        # "缺一个都算不合格" but with 1-pool tolerance for keyword variations).
+        pool_aliases = {
+            "叙事结构": ["叙事结构", "叙事", "narrative_structure", "narrative"],
+            "开头切入": ["开头切入", "开头", "opening_angle", "opening"],
+            "情绪基调": ["情绪基调", "情绪", "emotion_baseline", "emotion"],
+            "结尾方式": ["结尾方式", "结尾", "closing_style", "closing"],
+            "信息密度": ["信息密度", "密度", "information_density", "密度池"],
+        }
+        pools_found = [
+            name for name, aliases in pool_aliases.items()
+            if any(a in sp for a in aliases)
+        ]
+        pools_missing = [n for n in pool_aliases if n not in pools_found]
+        if len(pools_found) < 4:
             issues.append(
-                f"{cid}: system_prompt 差异化池不完整（缺少: {'/'.join(pool_missing)}）"
+                f"{cid}: system_prompt 五个差异化池只命中 {len(pools_found)}/5，"
+                f"缺失: {'/'.join(pools_missing) or '无'}"
             )
+        elif len(pools_found) == 4:
+            # soft warning — 4 out of 5 still lets builder pass but we note it
+            issues.append(
+                f"{cid}: system_prompt 差异化池命中 4/5（缺: {'/'.join(pools_missing)}），"
+                f"建议补齐但不强制重试"
+            )
+
+        # Batch generation rules — works_builder.md:24-29 requires 人设轮换
+        # + 差异化旋钮轮转 to be baked into every system_prompt. Chancellery
+        # has historically rejected for missing these. Mark as SOFT so we
+        # surface it but don't spin the builder into 3-round retry hell over
+        # wording variations (轮换 / 轮流 / 切换 / 交替 …).
+        batch_rule_aliases = [
+            "人设轮换", "轮流分配", "persona_rotation", "人设切换",
+            "轮流", "交替", "每篇换",
+        ]
+        if not any(a in sp for a in batch_rule_aliases):
+            issues.append(
+                f"{cid}: system_prompt 缺少「人设轮换规则」"
+                f"（批量生成时必须指定，建议补齐但不强制重试）"
+            )
+
+        # Persona integration — if system_prompt doesn't mention 人设 / persona
+        # at all, it's broken regardless of paradigm
+        if "人设" not in sp and "persona" not in sp.lower():
+            issues.append(f"{cid}: system_prompt 完全没有人设相关内容")
 
     # ── 4. demo_output platform-specific length check ──────────────────
     demo = (cell.get("demo_output") or "").strip()
     if demo:
-        # Platform length ranges (chars, approximate)
-        platform_ranges = {
-            "小红书": (200, 1000),
-            "xiaohongshu": (200, 1000),
-            "抖音": (50, 500),
-            "douyin": (50, 500),
-            "b站": (150, 600),
-            "bilibili": (150, 600),
-            "知乎": (300, 2000),
-            "zhihu": (300, 2000),
-            "微博": (20, 200),
-            "weibo": (20, 200),
-        }
-        min_len, max_len = 50, 2000  # defaults
-        for plat_key, (pmin, pmax) in platform_ranges.items():
+        # Platform ranges live in pipeline/config.py so operators can tune
+        # them without code changes when platform content norms shift.
+        min_len, max_len = PLATFORM_DEMO_LENGTH_DEFAULT
+        for plat_key, (pmin, pmax) in PLATFORM_DEMO_LENGTH_RANGES.items():
             if plat_key in platform:
                 min_len, max_len = pmin, pmax
                 break
@@ -1307,10 +1511,27 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             tail = demo[-40:].replace("\n", " ")
             issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
 
-    # Classify: hard issues (must retry) vs soft issues (warn only)
+        # AI-cliché blacklist — works_builder.md:60 explicitly lists these
+        # as forbidden phrases. If the demo contains them, chancellery will
+        # reliably reject for "AI 味". Catch locally to avoid the round trip.
+        ai_cliches = [
+            "效果显著", "性价比高", "值得推荐", "适合所有人", "温和不刺激",
+            "希望对你有帮助", "综上所述", "在如今", "让我们一起", "姐妹们冲",
+            "快快收藏",
+        ]
+        hit_cliches = [c for c in ai_cliches if c in demo]
+        if hit_cliches:
+            issues.append(
+                f"{cid}: demo_output 命中 AI 空话黑名单 {hit_cliches}（works_builder 禁用项）"
+            )
+
+    # Classify: hard issues (must retry) vs soft issues (warn only).
+    # Soft markers are written in Chinese into the issue text; anything that
+    # contains a soft marker is downgraded to warn-only.
+    soft_markers = ["建议补齐但不强制重试", "media_brief 缺失", "comment_seeds 缺失"]
     hard_issues = [
         i for i in issues
-        if any(kw in i for kw in ["为空", "过短", "结尾不完整", "过长", "差异化池不完整"])
+        if not any(sm in i for sm in soft_markers)
     ]
     soft_issues = [i for i in issues if i not in hard_issues]
 
@@ -1358,7 +1579,11 @@ def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], st
 
 
 def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
-    """Resume a failed pipeline run — reuses existing run_id and skips completed stages."""
+    """Resume a failed pipeline run — reuses existing run_id and skips completed stages.
+
+    The double-click guard lives inside start_pipeline_in_background; we
+    don't duplicate it here.
+    """
     # Reset run status so UI shows it as running again
     db.update_pipeline_run(run_id, status="running", completed_at=None)
     return start_pipeline_in_background(project_id, run_id, db)
@@ -1382,6 +1607,12 @@ def revise_and_resume_pipeline_in_background(
     Preserves: crown_prince, secretariat, chancellery_*, dispatcher, 五部.
     These are upstream of works and don't need to re-run.
     """
+    # 0. Guard: only allow this from needs_revision state. The check happens
+    # BEFORE any destructive action (stage_logs deletion, _revision_context
+    # write) because if two clicks race here, the loser would destroy the
+    # winner's still-valid stage_logs. Raising early keeps the DB consistent.
+    _assert_project_not_running(project_id, db, required_status="needs_revision")
+
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
     final_logs = [
@@ -1444,7 +1675,17 @@ def revise_and_resume_pipeline_in_background(
         f"is_global_revision={is_global_revision}"
     )
 
+    # Determine the next final-review round number. The first chancellery_final
+    # call is round 1; every "apply revisions" click bumps it. chancellery.md
+    # uses this to do incremental/delta reviews instead of from-scratch ones.
+    project = db.get_project(project_id)
+    brief = project.get("brief") or {}
+    prior_rc = (brief or {}).get("_revision_context") or {}
+    next_round = int(prior_rc.get("round", 1)) + 1
+    logger.info(f"[revise] advancing final-review round to {next_round}")
+
     revision_context = {
+        "round": next_round,
         "prior_verdict": final_review.get("verdict", "unknown"),
         "mandatory_revisions": stored_revs,
         "revision_instructions": stored_instr,
@@ -1452,15 +1693,22 @@ def revise_and_resume_pipeline_in_background(
         "suggestions": final_review.get("suggestions", []),
         "affected_direction_ids": affected_direction_ids,
         "is_global_revision": is_global_revision,
+        # prior_review is fed back into chancellery_final for delta evaluation.
+        # Keep only the fields the reviewer prompt consumes to limit context
+        # growth across multiple revision rounds.
+        "prior_review": {
+            "verdict": final_review.get("verdict", "unknown"),
+            "mandatory_revisions": stored_revs,
+            "revision_instructions": stored_instr,
+            "review_dimensions": final_review.get("review_dimensions", {}),
+        },
     }
     logger.info(
-        f"[revise] Loaded revision_context with "
+        f"[revise] Loaded revision_context round={next_round} with "
         f"{len(revision_context['mandatory_revisions'])} mandatory_revisions"
     )
 
     # 2. Store revision_context in project.brief so orchestrator.run() can read it
-    project = db.get_project(project_id)
-    brief = project.get("brief") or {}
     brief["_revision_context"] = revision_context
     db.update_project(project_id, brief=brief)
 
@@ -1494,7 +1742,9 @@ def revise_and_resume_pipeline_in_background(
         f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"
     )
 
-    # 4. Reset status and trigger resume
+    # 4. Reset pipeline_run status so the UI shows it as running again;
+    # project.status gets flipped by orchestrator.run() as its first action,
+    # so don't pre-empt it here (doing so would break the guard in
+    # start_pipeline_in_background).
     db.update_pipeline_run(run_id, status="running", completed_at=None)
-    db.update_project(project_id, status="running")
     return start_pipeline_in_background(project_id, run_id, db)
