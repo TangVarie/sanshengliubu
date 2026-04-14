@@ -107,7 +107,7 @@ class PipelineOrchestrator:
         return done
 
     def _recover_completed_cells(
-        self, stage_name: str, field: str
+        self, stage_name: str, field: str, validate: bool = False,
     ) -> tuple[dict[str, dict], list[dict]]:
         """Scan stage_logs for all successful batches of the given stage_name
         in this run, and collect every {cell_id: cell_dict} that was produced.
@@ -118,11 +118,21 @@ class PipelineOrchestrator:
         extracts the cells from output_data[field], and de-duplicates by
         cell_id (later successful log wins).
 
+        When `validate=True` (builder recovery path), cells are pushed through
+        `_validate_prompt_cell` before being accepted — a log marked
+        `status=completed` can still hold a cell that's empty/truncated/
+        corrupt (validation was best-effort on round 3 of the builder
+        retry loop, see _run_works_builders). Skipping invalid recovered
+        cells forces a rebuild instead of propagating broken content into
+        the final matrix, which was the root cause of the "D4 is empty in
+        final output" class of bugs.
+
         Returns: (recovered_cells_by_id, recovered_demo_outputs)
         """
         logs = self.db.get_stage_logs(self.run_id)
         recovered: dict[str, dict] = {}
         demo_outputs: list[dict] = []
+        rejected = 0
         for log in logs:
             if log.get("stage_name") != stage_name:
                 continue
@@ -130,12 +140,24 @@ class PipelineOrchestrator:
                 continue
             output = log.get("output_data") or {}
             for item in output.get(field, []) or []:
-                if isinstance(item, dict) and item.get("cell_id"):
-                    recovered[item["cell_id"]] = item
+                if not isinstance(item, dict) or not item.get("cell_id"):
+                    continue
+                if validate:
+                    is_valid, _issues = _validate_prompt_cell(item)
+                    if not is_valid:
+                        rejected += 1
+                        continue
+                recovered[item["cell_id"]] = item
             # demo_outputs is builder-specific but harmless to collect for planner too
             for d in output.get("demo_outputs", []) or []:
                 if isinstance(d, dict):
                     demo_outputs.append(d)
+        if rejected:
+            logger.warning(
+                f"[recover {stage_name}] rejected {rejected} cells whose prior "
+                f"'completed' stage_log held invalid/empty content — they'll "
+                f"be rebuilt instead of propagated."
+            )
         return recovered, demo_outputs
 
     # ── Clarification handling ─────────────────────────────────────────
@@ -299,6 +321,28 @@ class PipelineOrchestrator:
 
             # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
             final_system = await self._run_vibe_loop(final_system)
+
+            # 5e. Cross-cell duplicate re-check after vibe. Builder's own
+            # check (at end of _run_works_builders) catches builder-produced
+            # duplicates; this one catches rewriter-produced duplicates,
+            # which is historically the bigger source because the rewriter
+            # uses a shared reference-sample pool across all cells in a
+            # batch (see vibe_rewriter.md's 真人参照样本 list).
+            _post_vibe_dups = _find_cross_cell_duplicates(
+                final_system.get("prompt_matrix", []) or []
+            )
+            if _post_vibe_dups:
+                logger.error(
+                    "网感复检产出跨 cell 重复:\n  - %s",
+                    "\n  - ".join(_post_vibe_dups),
+                )
+                raise RuntimeError(
+                    "网感重写之后的 prompt_matrix 存在跨 cell 重复：\n- "
+                    + "\n- ".join(_post_vibe_dups)
+                    + "\n\n这是 vibe_rewriter 多个 cell 被收敛到同一参照样本导致的。"
+                    "流水线已终止以防交付重复内容。重跑一次应能抽到不同样本；"
+                    "如果反复出现同一对 cell 冲突，考虑调整 vibe_rewriter 提示词里的样本差异化约束。"
+                )
 
             # 6. 门下省终审
             # Track review round for the final-review force-pass mechanism.
@@ -851,8 +895,13 @@ class PipelineOrchestrator:
         # that already completed, so we don't re-run them.
         original_expected_order = list(cell_plans)
         expected_ids_set = {c.get("cell_id") for c in cell_plans}
+        # validate=True: re-run _validate_prompt_cell on every recovered cell.
+        # Prior-run stage_logs marked "completed" can still contain broken
+        # output (round-3 builder retry accepts best-effort cells), and
+        # silently propagating a broken D4 cell into the final matrix was
+        # the root cause of the "D4 is empty in final output" bug class.
         recovered_cells, recovered_demos = self._recover_completed_cells(
-            "ministry_works_builder", "prompt_cells"
+            "ministry_works_builder", "prompt_cells", validate=True,
         )
         recovered_cells = {
             cid: cell for cid, cell in recovered_cells.items()
@@ -1146,6 +1195,42 @@ class PipelineOrchestrator:
                 f"实际产出 {len(all_cells)} 个。缺失 cell_id: {missing}。"
             )
 
+        # Expected-id coverage: catch the case where all_cells has the right
+        # COUNT but some cell_ids are duplicated (e.g. D4 produced twice,
+        # D5 missing entirely, len() accidentally matches). This is belt-
+        # and-suspenders on top of the count check above.
+        produced_ids = {c.get("cell_id") for c in all_cells}
+        expected_ids = {c.get("cell_id") for c in original_expected_order}
+        missing_expected = expected_ids - produced_ids
+        if missing_expected:
+            raise RuntimeError(
+                f"工部·构建 cell_id 集合对不上：期望 {sorted(expected_ids)}，"
+                f"实际产出 {sorted(produced_ids)}。缺失: {sorted(missing_expected)}。"
+            )
+
+        # Cross-cell duplicate detection. Rewriter convergence (see
+        # vibe_rewriter prompt — historically shared a single reference
+        # sample list across all cells in a batch) could produce a matrix
+        # where e.g. D1 and D5 both open with the exact same first line.
+        # The loop runs AFTER the vibe stage so it catches both builder-
+        # level duplication and rewriter-introduced duplication. Raises
+        # instead of shipping a matrix where multiple cells read the same.
+        # Runs late enough that we have a full picture but before save_output.
+        dup_issues = _find_cross_cell_duplicates(all_cells)
+        if dup_issues:
+            # Log before raising so UI can surface the specific duplicates
+            # from the stage_log error_message.
+            logger.error(
+                "工部·构建跨 cell 重复检测 fail:\n  - %s",
+                "\n  - ".join(dup_issues),
+            )
+            raise RuntimeError(
+                "工部·构建产出的 prompt_matrix 存在跨 cell 重复（两个 cell "
+                "用了完全相同的 demo 或开场）：\n- " + "\n- ".join(dup_issues)
+                + "\n\n这通常是 vibe_rewriter 在同一批次内没对不同 cell "
+                "做样本差异化导致的收敛。重跑流水线应能抽到不同样本。"
+            )
+
         return {
             "prompt_matrix": all_cells,
             "matrix_dimensions": works_plan.get("matrix_dimensions", {}),
@@ -1155,22 +1240,37 @@ class PipelineOrchestrator:
         }
 
     async def _run_vibe_loop(self, final_system: dict) -> dict:
-        """Critic → Rewriter loop. Up to 2 iterations.
+        """Critic → Rewriter loop with elastic iteration count.
 
         网感不行 = system_prompt 设计有缺陷 → 重写 system_prompt（不是改 demo）。
         Round 2+ only re-evaluates cells that were rewritten, not the entire matrix.
+
+        Hard cap = 3. Initially the loop runs up to 2 rounds (same as v0.10.x).
+        If, after round 2, the failure rate is still ≥ `vibe_escalate_threshold`
+        (30% of total cells), one additional round is authorized. This
+        gives stubborn cases a last chance instead of silently shipping
+        bad taste, while still bounding worst-case token spend.
         """
-        max_iterations = 2
+        hard_cap = 3
+        initial_cap = 2
+        escalate_threshold = 0.30
         prompt_cells = final_system.get("prompt_matrix", [])
         if not prompt_cells:
             logger.warning("Vibe loop skipped: no prompt_cells")
             return final_system
 
         shared_skeleton = final_system.get("shared_skeleton", {})
-        # Track which cell_ids were rewritten so round 2 only re-evaluates those
+        # Track which cell_ids were rewritten so round 2+ only re-evaluates those
         rewritten_ids: set[str] = set()
+        # Total matrix size doesn't change across iterations (rewriter preserves
+        # cell_ids), so capture it once for the escalation-threshold math.
+        total_cells_count = max(len(prompt_cells), 1)
+        # max_iterations starts at the initial cap and may be bumped to hard_cap
+        # after round 2 if too many cells are still failing. See escalate_threshold.
+        max_iterations = initial_cap
 
-        for iteration in range(max_iterations):
+        iteration = 0
+        while iteration < max_iterations:
             logger.info(f"Vibe loop iteration {iteration + 1}/{max_iterations}")
 
             # Round 1: evaluate ALL cells. Round 2+: only evaluate rewritten cells.
@@ -1263,10 +1363,35 @@ class PipelineOrchestrator:
             ]
             final_system["prompt_matrix"] = prompt_cells
 
+            iteration += 1
+
+            # Elastic escalation: after the initial cap is hit and we'd
+            # otherwise exit, check the current failure rate. If a
+            # substantial chunk is still bad, authorize one more round
+            # (bounded by hard_cap=3). This stops the loop from silently
+            # shipping stubborn bad-taste matrices while keeping a firm
+            # ceiling on token spend.
+            if iteration == max_iterations and max_iterations < hard_cap:
+                fail_ratio = len(failed) / total_cells_count
+                if fail_ratio >= escalate_threshold:
+                    max_iterations = hard_cap
+                    logger.warning(
+                        f"Vibe loop: {len(failed)}/{total_cells_count} cells "
+                        f"still failing ({fail_ratio:.0%} ≥ {escalate_threshold:.0%}) "
+                        f"after round {iteration} — escalating cap to "
+                        f"{hard_cap} for one more rewrite pass."
+                    )
+                else:
+                    logger.info(
+                        f"Vibe loop: {len(failed)}/{total_cells_count} cells "
+                        f"still failing ({fail_ratio:.0%} < {escalate_threshold:.0%}), "
+                        f"not escalating. Exiting."
+                    )
+
         # Out of iterations
         logger.warning(
-            f"Vibe loop exhausted {max_iterations} iterations, "
-            "proceeding with remaining issues"
+            f"Vibe loop exhausted {max_iterations} iterations "
+            f"(hard cap {hard_cap}), proceeding with remaining issues"
         )
         return final_system
 
@@ -1537,6 +1662,64 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
 
     is_valid = len(hard_issues) == 0
     return is_valid, issues
+
+
+def _find_cross_cell_duplicates(cells: list[dict]) -> list[str]:
+    """Find cells that share identical content with another cell in the same
+    matrix. `_validate_prompt_cell` checks each cell in isolation; this adds
+    the cross-cell dimension.
+
+    Two different cells producing IDENTICAL demo_output text or IDENTICAL
+    first-sentence openings is almost always a rewriter convergence bug
+    (see vibe_rewriter's shared reference-sample pool — without explicit
+    diversification instructions, multiple cells rewritten in the same
+    batch tend to anchor to the same sample). Catching it here lets the
+    orchestrator raise instead of shipping a matrix where D1 and D5 read
+    the same.
+
+    Returns: list of human-readable issue strings (empty if no duplicates).
+    Matrix-level decision (hard-fail vs warn) is the caller's to make.
+    """
+    issues: list[str] = []
+    if len(cells) < 2:
+        return issues
+
+    # 1. Identical full demo_output across cells
+    demo_to_ids: dict[str, list[str]] = {}
+    for c in cells:
+        demo = (c.get("demo_output") or "").strip()
+        if len(demo) < 30:  # ignore blanks/headers
+            continue
+        demo_to_ids.setdefault(demo, []).append(c.get("cell_id", "?"))
+    for demo, ids in demo_to_ids.items():
+        if len(ids) > 1:
+            issues.append(
+                f"matrix: demo_output 完全重复：{sorted(ids)} 共用同一段内容"
+                f"（前 60 字：{demo[:60]!r}）"
+            )
+
+    # 2. Identical first sentence (up to first 。！？\n) across cells.
+    # Tolerates different bodies but flags same opening line.
+    import re as _re
+    opening_to_ids: dict[str, list[str]] = {}
+    for c in cells:
+        demo = (c.get("demo_output") or "").strip()
+        if not demo:
+            continue
+        first = _re.split(r"[。！？!?\n]", demo, maxsplit=1)[0].strip()
+        if len(first) < 8:  # too short to count as a meaningful opening
+            continue
+        opening_to_ids.setdefault(first, []).append(c.get("cell_id", "?"))
+    for opening, ids in opening_to_ids.items():
+        if len(ids) > 1:
+            # Don't double-report if already flagged as identical-full-demo
+            if any(opening in msg for msg in issues):
+                continue
+            issues.append(
+                f"matrix: 第一句完全相同：{sorted(ids)} 都以 {opening!r} 开头"
+            )
+
+    return issues
 
 
 def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], str]:

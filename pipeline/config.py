@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.10.2"
+VERSION = "v0.11.0"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "schema.sql 幂等化 + README 补迁移指引"
+VERSION_NOTES = "修 D4 缺失/demo 重复；网感硬化：跨 cell 查重 + AI 黑名单前置 + 循环可升级到 3 轮"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).

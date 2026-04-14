@@ -118,6 +118,40 @@
 
 **关键**：即使第 2 步发现了一堆问题，只要第 0 步的本能 + 第 1 步的味道对照判 pass，**这条就是 pass**。不要因为第 2 步的诊断"看起来很丰富"就把 pass 改成 fail。第 2 步是诊断，不是判决。
 
+### 第 0.5 步：AI 空话硬否决（在 gut_call 之前作为前置 filter）
+
+在做 gut_call 之前，先扫一遍 demo_output 的全文。如果**命中以下任意一条黑名单短语**，`gut_call` 直接强制写 `"不会点"`，`severity = "fail"`——不允许用"方向对但差点意思"来开脱：
+
+- "效果显著" / "性价比高" / "值得推荐" / "适合所有人" / "温和不刺激"
+- "希望对你有帮助" / "综上所述" / "总而言之"
+- "让我们一起" / "姐妹们冲" / "快快收藏"
+- "在如今 X 的时代" / "作为一个 X"
+
+这些词是 AI 腔的硬指纹，工部下游的 `_validate_prompt_cell` 已经把它们标为硬性失败。你在此处 fail 等于"提前一层把它挡下"，避免污染到用户。
+
+如果黑名单命中但其他方面看起来还行，仍然判 fail——**不给面子分**。在 `taste_match` 里补一句"AI 空话 '[具体词]' 命中硬否决"即可。
+
+### 第 3 步：跨 cell 一致性检查（batch 内必做）
+
+本次 `prompt_cells` 输入通常包含多个 cell（整批送来）。你完成每个 cell 的单体评审后，再跑一次**跨 cell 扫描**：
+
+1. 把所有 cell 的 `first_sentence` 排成列表，肉眼扫一遍
+2. 如果**两个或更多 cell 的 demo_output 完全相同** → 所有相关 cell 的 `severity` 都强制改为 `fail`，并在 `taste_match` 字段前加标签 "【跨 cell 重复】"
+3. 如果**两个或更多 cell 的第一句话完全相同**（或仅改了一两个字的轻度变化）→ 同上，全部 fail
+4. 如果多个 cell 都大量引用"真人参照样本"里的**同一条**作为主要锚点（比如 D1 和 D4 都写了一个关于"假牙"的故事）→ 至少把其中一个判为 `fail`，让重写者换样本
+
+在输出 JSON 的顶层加字段 `cross_cell_duplicates`：
+
+```json
+"cross_cell_duplicates": [
+  {"type": "identical_demo", "cell_ids": ["D1_xiaohongshu", "D4_xiaohongshu"]},
+  {"type": "identical_opening", "cell_ids": ["D2_xiaohongshu", "D5_xiaohongshu"]},
+  {"type": "same_anchor_sample", "cell_ids": ["D1", "D4"], "sample_index": 3}
+]
+```
+
+没有重复就给空数组。这份数据会被下游的重写者作为去重线索。
+
 ---
 
 ## 三档判定的实际含义
@@ -158,6 +192,9 @@
 {
   "verdict": "all_pass | some_failed",
   "summary": "本轮总结。例如：5个cell中3个 fail / 1个 borderline / 1个 pass。3个 fail 的共同根因是 system_prompt 没强制第一句的事件物证开场。",
+  "cross_cell_duplicates": [
+    {"type": "identical_demo | identical_opening | same_anchor_sample", "cell_ids": ["D1_xiaohongshu", "D4_xiaohongshu"]}
+  ],
   "cell_reviews": [
     {
       "cell_id": "D1_xiaohongshu",
@@ -201,3 +238,5 @@
 2. 我有没有因为"分析得很细致"就把 borderline 升级成 pass？分析的丰富度和味道无关。
 3. 我有没有因为"找不到 AI 信号"就 pass 一条平庸的稿子？没有 AI 信号 ≠ 有网感，可能只是平。
 4. **不要给面子分**。AI 腔的内容就是 AI 腔，写得再"工整"也是 fail。宁可全部 fail/borderline 让重写者干活，也不要放一条平庸的过去。
+5. **AI 空话黑名单**有没有扫？第 0.5 步漏扫的话，用户看到的就是 "性价比高"、"希望对你有帮助" 这种稿子被判 pass——这是最严重的失职。
+6. **跨 cell 重复**扫了吗？如果 batch 里有两条 demo 第一句一模一样，哪怕单体都 pass，整批也必须至少打下去一条。重复输出到用户手里 = 整批废稿。
