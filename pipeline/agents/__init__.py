@@ -579,10 +579,21 @@ class BaseAgent:
                 f"but no error info was captured (last_error={last_error!r}, "
                 f"model={self.model})"
             )
+        # Cap to avoid blowing up the DB column; but leave an explicit marker
+        # so the UI/operator knows the tail was cut instead of silently
+        # getting 8000 chars that look complete.
+        if len(err_str) > 8000:
+            truncated_msg = (
+                err_str[:7900]
+                + "\n\n[... 错误信息被截断于 8000 字符上限，完整 traceback 请看 "
+                + "Streamlit 运行控制台日志 ...]"
+            )
+        else:
+            truncated_msg = err_str
         db.update_stage_log(
             log_id,
             status="failed",
-            error_message=err_str[:8000],  # cap to avoid blowing up the column
+            error_message=truncated_msg,
             tokens_used=total_input_tokens + total_output_tokens,
             duration_seconds=round(duration, 2),
         )

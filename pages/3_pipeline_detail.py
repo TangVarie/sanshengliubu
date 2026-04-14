@@ -201,10 +201,13 @@ run = runs[0]
 run_id = run["id"]
 stage_logs = db.get_stage_logs(run_id)
 
-# Build a lookup: stage_name -> log
+# Build a lookup: stage_name -> log. Skip rows missing stage_name (defensive
+# against partial writes / schema drift) instead of KeyError-ing the page.
 log_map: dict[str, dict] = {}
 for log in stage_logs:
-    log_map[log["stage_name"]] = log
+    name = log.get("stage_name")
+    if name:
+        log_map[name] = log
 
 # ── Clarification Alert ───────────────────────────────────────────────────
 
@@ -232,7 +235,8 @@ needs_input_logs = [
 ]
 for ni_log in needs_input_logs:
     output = ni_log.get("output_data", {})
-    stage_display = STAGE_DISPLAY_NAMES.get(ni_log["stage_name"], ni_log["stage_name"])
+    _ni_name = ni_log.get("stage_name", "unknown")
+    stage_display = STAGE_DISPLAY_NAMES.get(_ni_name, _ni_name)
     questions = output.get("questions", [])
     context_info = output.get("context", "")
 

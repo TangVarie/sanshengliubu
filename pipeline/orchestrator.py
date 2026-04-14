@@ -71,13 +71,29 @@ class PipelineOrchestrator:
     # ── Completed stages cache (for resume) ───────────────────────────
 
     def _load_completed_stages(self) -> dict[str, dict]:
-        """Load outputs from already-completed stages in this run."""
+        """Load outputs from already-completed stages in this run.
+
+        Defensive: if a log row is missing `stage_name` (schema drift /
+        partial write), skip it instead of crashing the whole pipeline on a
+        KeyError at resume time.
+        """
         logs = self.db.get_stage_logs(self.run_id)
-        return {
-            log["stage_name"]: log["output_data"]
-            for log in logs
-            if log.get("status") == "completed" and log.get("output_data")
-        }
+        done: dict[str, dict] = {}
+        for log in logs:
+            if log.get("status") != "completed":
+                continue
+            output = log.get("output_data")
+            if not output:
+                continue
+            name = log.get("stage_name")
+            if not name:
+                logger.warning(
+                    f"[resume] skipping stage_log with missing stage_name: "
+                    f"id={log.get('id', '?')}"
+                )
+                continue
+            done[name] = output
+        return done
 
     def _recover_completed_cells(
         self, stage_name: str, field: str
