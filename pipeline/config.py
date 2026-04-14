@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.12.0"
+VERSION = "v0.12.1"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "Gemini 辅助检查上线：网感二审（分歧仲裁）+ advisory 降级"
+VERSION_NOTES = "Gemini 结构审上线：工部构建后审查 5 池/人设/合规/平台调性，hint 注入 rewriter"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -237,6 +237,8 @@ PIPELINE_STAGES = [
     ("ministry_works", "工部·架构", "🏗️"),
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
+    # advisory-only (Gemini). Skipped if Gemini isn't configured.
+    ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
     ("chancellery_final", "终审", "✅"),
 ]

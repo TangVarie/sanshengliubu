@@ -33,6 +33,10 @@ from pipeline.agents import (
     reset_run_budget,
 )
 from pipeline.agents.gemini_critic import run_gemini_critic
+from pipeline.agents.gemini_structure_reviewer import (
+    format_revision_hints as _format_gemini_structure_hints,
+    run_gemini_structure_review,
+)
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
 from pipeline.agents.chancellery import Chancellery
@@ -320,6 +324,15 @@ class PipelineOrchestrator:
                     f"工部·构建产出为空。cell_plans count: {len(cell_plans)}, "
                     f"works_plan keys: {list(works_plan.keys())}"
                 )
+
+            # 5c+. Gemini 结构审（advisory）— audits each prompt_cell for
+            # structural completeness (5 pools / persona / compliance /
+            # keywords / banlist / platform voice). Fires ONCE, between
+            # builder and vibe. Hints get merged into the rewriter's
+            # directives so the vibe stage also catches structural gaps,
+            # not just taste issues. Advisory-only: any Gemini failure →
+            # log warn, proceed with unchanged final_system.
+            await self._run_gemini_structure_review_stage(final_system)
 
             # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
             final_system = await self._run_vibe_loop(final_system)
@@ -1241,6 +1254,130 @@ class PipelineOrchestrator:
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
         }
 
+    async def _run_gemini_structure_review_stage(
+        self, final_system: dict
+    ) -> None:
+        """Gemini 结构审（advisory）— 在工部构建之后、网感复检之前跑一次。
+
+        审查每条 prompt_cell 的 5 池 / 人设 / 合规 / 关键词 / AI 禁用清单 /
+        平台调性是否结构完整。结果写成一条 stage_log（名为
+        ministry_works_structure_review）给 UI 看，并把每 cell 的结构缺失
+        hint 附到对应 cell 的 _structure_hint 字段，让下游 rewriter 和
+        chancellery_final 都能读到。
+
+        Advisory-only：Gemini 未配置 / 调用失败 / 解析失败全部 → 跳过，
+        不阻塞流水线。Gemini 的 token + 成本通过 accumulate_auxiliary_cost
+        累到 pipeline_runs.total_cost_usd 里，不占 MAX_TOKENS_PER_RUN 预算。
+        """
+        prompt_cells = final_system.get("prompt_matrix", []) or []
+        if not prompt_cells:
+            return
+
+        stage_name = "ministry_works_structure_review"
+        log = self.db.create_stage_log(
+            self.run_id,
+            stage_name,
+            {"cell_count": len(prompt_cells)},
+        )
+        log_id = log["id"]
+
+        try:
+            result = await run_gemini_structure_review(prompt_cells)
+        except Exception as e:
+            # run_gemini_structure_review swallows its own errors; if
+            # something still leaks treat as non-fatal.
+            logger.warning(
+                "[structure review] unexpected exception, skipping: %r", e
+            )
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={"_skip_reason": f"unexpected_exception: {e}"},
+            )
+            return
+
+        verdict = result.get("verdict", "skipped")
+        usage = result.get("_gemini_usage") or {}
+
+        # Cost accounting — even on skipped we may have been charged 0
+        # tokens; accumulate_auxiliary_cost is idempotent on 0.
+        if usage:
+            accumulate_auxiliary_cost(
+                self.run_id,
+                cost_usd=float(usage.get("cost_usd", 0.0)),
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                source="gemini_structure",
+            )
+
+        # Annotate cells with their per-cell structure hint so the
+        # downstream rewriter / chancellery can consume them in
+        # subsequent stages. Mutates prompt_matrix in place.
+        incomplete = result.get("cells_incomplete") or []
+        incomplete_by_id = {
+            item.get("cell_id"): item
+            for item in incomplete
+            if isinstance(item, dict) and item.get("cell_id")
+        }
+        for cell in prompt_cells:
+            cid = cell.get("cell_id")
+            if cid in incomplete_by_id:
+                item = incomplete_by_id[cid]
+                cell["_structure_hint"] = {
+                    "missing_items": item.get("missing_items", []),
+                    "revision_hint": item.get("revision_hint", ""),
+                }
+
+        # Stash the full review on final_system so chancellery_final
+        # can see the structural context and terminal UI can display.
+        final_system["_structure_review"] = {
+            "verdict": verdict,
+            "summary": result.get("summary", ""),
+            "cell_reviews": result.get("cell_reviews", []),
+            "cells_incomplete": incomplete,
+            "_model": usage.get("model"),
+        }
+
+        if verdict == "skipped":
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={
+                    "_skip_reason": result.get("_skip_reason", "unknown"),
+                },
+                tokens_used=int(usage.get("input_tokens", 0))
+                + int(usage.get("output_tokens", 0)),
+                model_used=usage.get("model"),
+            )
+            return
+
+        self.db.update_stage_log(
+            log_id,
+            status="completed",
+            output_data={
+                "verdict": verdict,
+                "summary": result.get("summary", ""),
+                "cells_incomplete": incomplete,
+                "cell_reviews": result.get("cell_reviews", []),
+            },
+            model_used=usage.get("model"),
+            tokens_used=int(usage.get("input_tokens", 0))
+            + int(usage.get("output_tokens", 0)),
+        )
+
+        if verdict == "some_incomplete":
+            logger.warning(
+                "[structure review] %d/%d cells flagged incomplete by Gemini: %s",
+                len(incomplete),
+                len(prompt_cells),
+                sorted(incomplete_by_id.keys())[:10],
+            )
+        else:
+            logger.info(
+                "[structure review] all %d cells structurally complete",
+                len(prompt_cells),
+            )
+
     async def _run_vibe_loop(self, final_system: dict) -> dict:
         """Critic → Rewriter loop with elastic iteration count.
 
@@ -1401,10 +1538,31 @@ class PipelineOrchestrator:
             # cells make it into the rewrite batch.
             failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
             critic_map = {f["cell_id"]: f for f in failed if f.get("cell_id")}
+
+            def _augment_rewrite_directives(c: dict, base: str) -> str:
+                """If an incoming cell has a Gemini structure_hint from the
+                5c+ stage, weave it into rewrite_directives so the rewriter
+                addresses taste AND structural gaps in one pass instead of
+                leaving the latter for the next chancellery round trip."""
+                hint = c.get("_structure_hint") or {}
+                missing = hint.get("missing_items") or []
+                rh = hint.get("revision_hint") or ""
+                if not missing and not rh:
+                    return base
+                addendum_parts = ["\n\n【顺带补结构】Gemini 结构审提示本 cell 还缺："]
+                if missing:
+                    addendum_parts.append(f"- {', '.join(str(m) for m in missing)}")
+                if rh:
+                    addendum_parts.append(f"- 建议：{rh}")
+                return base + "\n".join(addendum_parts)
+
             failed_full_cells = [
                 {
                     **c,
-                    "rewrite_directives": critic_map[c["cell_id"]].get("rewrite_directives", ""),
+                    "rewrite_directives": _augment_rewrite_directives(
+                        c,
+                        critic_map[c["cell_id"]].get("rewrite_directives", ""),
+                    ),
                     "severity": critic_map[c["cell_id"]].get("severity", "fail"),
                     "taste_gap": critic_map[c["cell_id"]].get("taste_gap", ""),
                 }
