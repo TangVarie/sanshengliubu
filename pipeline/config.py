@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.5"
+VERSION = "v0.9.6"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "五部改传 slim_plan + system prompt 开启 ephemeral 缓存，削减 input tokens"
+VERSION_NOTES = "配置归拢：真指数退避 + 平台长度阈值外提 + 澄清超时可配"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -38,7 +38,44 @@ MODELS: dict[str, str] = {
 # ── Retry & timeout ────────────────────────────────────────────────────────
 
 MAX_RETRIES = 2
-RETRY_BASE_DELAY_SECONDS = 3  # exponential backoff: 3s, 6s
+# Exponential backoff base. Delay for attempt N is
+# RETRY_BASE_DELAY_SECONDS * 2**N (so 3s after attempt 0, 6s after attempt
+# 1, 12s after attempt 2, ...). With MAX_RETRIES=2 this matches the old
+# linear 3,6 sequence; the formula is kept exponential so bumping
+# MAX_RETRIES doesn't silently change the retry curve.
+RETRY_BASE_DELAY_SECONDS = 3
+
+# ── Clarification ─────────────────────────────────────────────────────────
+# How long the pipeline waits for the user to answer a clarification
+# request before giving up. 1 hour is generous for humans to come back
+# from another tab / lunch, short enough that a truly-abandoned run gets
+# cleaned up eventually.
+CLARIFICATION_TIMEOUT_SECONDS = 3600
+# Poll interval while waiting for user response.
+CLARIFICATION_POLL_SECONDS = 5
+# Max clarification rounds per agent — if the model keeps asking, force
+# continue with whatever partial output it gave instead of looping forever.
+MAX_CLARIFICATION_PER_AGENT = 2
+
+# ── Platform demo length bounds ──────────────────────────────────────────
+# (min_chars, max_chars) for demo_output validation per platform. Keys are
+# matched via substring+case-insensitive against the cell's platform field,
+# so both Chinese and romanized variants resolve to the same range. Values
+# are approximate — the validator allows 1.5× the max as a hard ceiling.
+PLATFORM_DEMO_LENGTH_RANGES: dict[str, tuple[int, int]] = {
+    "小红书": (200, 1000),
+    "xiaohongshu": (200, 1000),
+    "抖音": (50, 500),
+    "douyin": (50, 500),
+    "b站": (150, 600),
+    "bilibili": (150, 600),
+    "知乎": (300, 2000),
+    "zhihu": (300, 2000),
+    "微博": (20, 200),
+    "weibo": (20, 200),
+}
+# Fallback when the platform isn't recognized.
+PLATFORM_DEMO_LENGTH_DEFAULT: tuple[int, int] = (50, 2000)
 
 # ── Chancellery review ─────────────────────────────────────────────────────
 

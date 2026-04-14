@@ -15,10 +15,15 @@ from db.supabase_client import SupabaseClient
 from pipeline.config import (
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
+    CLARIFICATION_POLL_SECONDS,
+    CLARIFICATION_TIMEOUT_SECONDS,
     MAX_CHANCELLERY_REJECTIONS,
+    MAX_CLARIFICATION_PER_AGENT,
     MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
+    PLATFORM_DEMO_LENGTH_DEFAULT,
+    PLATFORM_DEMO_LENGTH_RANGES,
 )
 from pipeline.agents import ClarificationNeeded
 from pipeline.agents.crown_prince import CrownPrince
@@ -40,9 +45,10 @@ from pipeline.agents.ministries.works import (
 
 logger = logging.getLogger(__name__)
 
-MAX_CLARIFICATION_PER_AGENT = 2
-CLARIFICATION_POLL_INTERVAL = 5  # seconds
-CLARIFICATION_TIMEOUT = 3600  # 1 hour
+# All clarification timing is centralized in pipeline/config.py — these
+# aliases preserve the short local names used throughout this file.
+CLARIFICATION_POLL_INTERVAL = CLARIFICATION_POLL_SECONDS
+CLARIFICATION_TIMEOUT = CLARIFICATION_TIMEOUT_SECONDS
 
 
 class PipelineOrchestrator:
@@ -144,7 +150,11 @@ class PipelineOrchestrator:
                 return log["human_intervention"]
             await asyncio.sleep(CLARIFICATION_POLL_INTERVAL)
 
-        raise TimeoutError("Clarification request timed out after 1 hour")
+        raise TimeoutError(
+            f"Clarification request timed out after "
+            f"{CLARIFICATION_TIMEOUT} seconds "
+            f"(~{CLARIFICATION_TIMEOUT // 60} minutes)"
+        )
 
     async def _run_with_clarification(
         self, agent, input_data: dict, max_asks: int = MAX_CLARIFICATION_PER_AGENT
@@ -1392,21 +1402,10 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
     # ── 4. demo_output platform-specific length check ──────────────────
     demo = (cell.get("demo_output") or "").strip()
     if demo:
-        # Platform length ranges (chars, approximate)
-        platform_ranges = {
-            "小红书": (200, 1000),
-            "xiaohongshu": (200, 1000),
-            "抖音": (50, 500),
-            "douyin": (50, 500),
-            "b站": (150, 600),
-            "bilibili": (150, 600),
-            "知乎": (300, 2000),
-            "zhihu": (300, 2000),
-            "微博": (20, 200),
-            "weibo": (20, 200),
-        }
-        min_len, max_len = 50, 2000  # defaults
-        for plat_key, (pmin, pmax) in platform_ranges.items():
+        # Platform ranges live in pipeline/config.py so operators can tune
+        # them without code changes when platform content norms shift.
+        min_len, max_len = PLATFORM_DEMO_LENGTH_DEFAULT
+        for plat_key, (pmin, pmax) in PLATFORM_DEMO_LENGTH_RANGES.items():
             if plat_key in platform:
                 min_len, max_len = pmin, pmax
                 break

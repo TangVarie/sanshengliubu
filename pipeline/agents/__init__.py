@@ -569,7 +569,11 @@ class BaseAgent:
                     f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
                 )
                 if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                    # True exponential backoff (see config.py). For MAX_RETRIES=2
+                    # the sequence is 3s, 6s — unchanged from the old linear
+                    # path; the formula is kept exponential so MAX_RETRIES can
+                    # grow without changing the curve's shape.
+                    delay = RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
                     await asyncio.sleep(delay)
 
         # All retries exhausted — build a robust, non-empty error message
