@@ -16,6 +16,7 @@ from pipeline.config import (
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
     MAX_CHANCELLERY_REJECTIONS,
+    MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
 )
@@ -263,8 +264,21 @@ class PipelineOrchestrator:
             final_system = await self._run_vibe_loop(final_system)
 
             # 6. 门下省终审
+            # Track review round for the final-review force-pass mechanism.
+            # Round 1 = fresh run. Round ≥ 2 = user applied revisions at least
+            # once; revise_and_resume_pipeline_in_background stored the round
+            # counter + prior review in _revision_context.
+            _rc = self._revision_context or {}
+            _final_round = int(_rc.get("round", 1)) if _rc else 1
+            _prior_review = _rc.get("prior_review") if _rc else None
             final_review = await self.chancellery.run_final_review(
-                final_system, plan, structured_brief, self.run_id, self.db
+                final_system,
+                plan,
+                structured_brief,
+                self.run_id,
+                self.db,
+                round_number=_final_round,
+                prior_review=_prior_review,
             )
 
             # 6.5 Safety: if chancellery flagged revision_required but didn't
@@ -1444,7 +1458,17 @@ def revise_and_resume_pipeline_in_background(
         f"is_global_revision={is_global_revision}"
     )
 
+    # Determine the next final-review round number. The first chancellery_final
+    # call is round 1; every "apply revisions" click bumps it. chancellery.md
+    # uses this to do incremental/delta reviews instead of from-scratch ones.
+    project = db.get_project(project_id)
+    brief = project.get("brief") or {}
+    prior_rc = (brief or {}).get("_revision_context") or {}
+    next_round = int(prior_rc.get("round", 1)) + 1
+    logger.info(f"[revise] advancing final-review round to {next_round}")
+
     revision_context = {
+        "round": next_round,
         "prior_verdict": final_review.get("verdict", "unknown"),
         "mandatory_revisions": stored_revs,
         "revision_instructions": stored_instr,
@@ -1452,15 +1476,22 @@ def revise_and_resume_pipeline_in_background(
         "suggestions": final_review.get("suggestions", []),
         "affected_direction_ids": affected_direction_ids,
         "is_global_revision": is_global_revision,
+        # prior_review is fed back into chancellery_final for delta evaluation.
+        # Keep only the fields the reviewer prompt consumes to limit context
+        # growth across multiple revision rounds.
+        "prior_review": {
+            "verdict": final_review.get("verdict", "unknown"),
+            "mandatory_revisions": stored_revs,
+            "revision_instructions": stored_instr,
+            "review_dimensions": final_review.get("review_dimensions", {}),
+        },
     }
     logger.info(
-        f"[revise] Loaded revision_context with "
+        f"[revise] Loaded revision_context round={next_round} with "
         f"{len(revision_context['mandatory_revisions'])} mandatory_revisions"
     )
 
     # 2. Store revision_context in project.brief so orchestrator.run() can read it
-    project = db.get_project(project_id)
-    brief = project.get("brief") or {}
     brief["_revision_context"] = revision_context
     db.update_project(project_id, brief=brief)
 

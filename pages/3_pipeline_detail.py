@@ -6,7 +6,7 @@ import time
 
 import streamlit as st
 from db.supabase_client import SupabaseClient
-from pipeline.config import PIPELINE_STAGES, POLL_INTERVAL_SECONDS
+from pipeline.config import MAX_FINAL_REJECTIONS, PIPELINE_STAGES, POLL_INTERVAL_SECONDS
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
@@ -93,7 +93,26 @@ if status == "needs_revision":
             _revisions = _final_review.get("mandatory_revisions", []) or []
             _dimensions = _final_review.get("review_dimensions", {}) or {}
             _suggestions = _final_review.get("suggestions", []) or []
+            # Current final-review round from _revision_context (if any)
+            _brief = (project or {}).get("brief") or {}
+            _rc = _brief.get("_revision_context") or {}
+            _current_round = int(_rc.get("round", 1)) if _rc else 1
+            _next_round = _current_round + 1 if _rc else 2
             with st.container(border=True):
+                # Round badge — shows user how close they are to force-pass
+                if _current_round >= MAX_FINAL_REJECTIONS:
+                    st.warning(
+                        f"🔔 当前终审为 **第 {_current_round} 轮**，已达硬上限 "
+                        f"({MAX_FINAL_REJECTIONS})。再次点击「应用修订意见」会触发"
+                        f"**强制通过**——意味着门下省会自动放行，建议改为人工复核产出后"
+                        f"点「📦 查看部分产出」导出。"
+                    )
+                else:
+                    st.info(
+                        f"🔁 当前终审为 **第 {_current_round} 轮 / 共 {MAX_FINAL_REJECTIONS} 轮**。"
+                        f"下次点击「应用修订意见」将触发第 {_next_round} 轮，"
+                        f"门下省会做增量评审（只看本次未解决的问题，不重复上轮已修的事）。"
+                    )
                 st.error(
                     f"📝🔁 **终审判定：{_verdict}** — 流水线已运行完毕，但门下省终审认为产出"
                     f"未达交付标准。下方「终审」tab 有完整审查报告。"

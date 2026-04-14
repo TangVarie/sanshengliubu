@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.9.2"
-VERSION_DATE = "2026-04-13"
-VERSION_NOTES = "显式禁止工部输出 + 终审检查 usage_guide/batch_rules"
+VERSION = "v0.9.3"
+VERSION_DATE = "2026-04-14"
+VERSION_NOTES = "终审加轮次上限 + 增量评审，防止反复驳回死循环"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
@@ -42,7 +42,12 @@ RETRY_BASE_DELAY_SECONDS = 3  # exponential backoff: 3s, 6s
 
 # ── Chancellery review ─────────────────────────────────────────────────────
 
-MAX_CHANCELLERY_REJECTIONS = 2  # force pass on round 3
+MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3
+
+# final_review (工部产出的 prompt_matrix) 的轮次上限。第一次跑流水线 = round 1；
+# 用户每点一次「应用修订意见并重跑」round +1。超过 MAX_FINAL_REJECTIONS 后强制
+# 放行，并在 suggestions 里打风险注。防止终审无限驳回工部造成死循环。
+MAX_FINAL_REJECTIONS = 3
 
 # ── Token limits ───────────────────────────────────────────────────────────
 # max_tokens must accommodate (thinking_budget + actual_output) for thinking stages.
