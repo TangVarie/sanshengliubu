@@ -15,17 +15,28 @@ show_version_badge()
 
 def render_stage_error(log: dict) -> None:
     """Render an error message for a failed stage. Always shows something,
-    even if error_message is empty/missing — silent failures are the worst."""
+    even if error_message is empty/missing — silent failures are the worst.
+    Accepts non-string error_message (e.g. legacy rows that stored a dict)
+    and pretty-prints it as JSON instead of rendering a raw repr.
+    """
     msg = (log or {}).get("error_message")
-    if msg and str(msg).strip():
-        st.error(msg)
-    else:
-        st.error(
-            f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
-            f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
-            f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
-            f"stage_log id: `{(log or {}).get('id', '?')}`"
-        )
+    if msg:
+        if isinstance(msg, str):
+            text = msg.strip()
+        else:
+            try:
+                text = json.dumps(msg, ensure_ascii=False, indent=2)
+            except Exception:
+                text = repr(msg)
+        if text:
+            st.error(text)
+            return
+    st.error(
+        f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
+        f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
+        f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
+        f"stage_log id: `{(log or {}).get('id', '?')}`"
+    )
 
 
 def render_stage_output(output_data: dict):
@@ -75,6 +86,18 @@ STATUS_EMOJI = {
     "paused_for_review": "⏸️", "needs_revision": "📝🔁",
 }
 status = project.get("status", "draft")
+
+# Reset session-scoped busy flags once the project is no longer running.
+# Without this, a button would stay disabled in a user's tab even after
+# the pipeline completed in another tab / finished via background thread.
+if status != "running":
+    for _key in (
+        f"pipeline_busy_{project_id}",
+        f"pipeline_busy_actions_{project_id}",
+    ):
+        if st.session_state.get(_key):
+            st.session_state[_key] = False
+
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
 
@@ -165,16 +188,23 @@ if status == "needs_revision":
                     "只重跑 工部架构 → 格子规划 → 构建 → 网感复检 → 终审，"
                     "保留前面已完成的太子/中书省/尚书省/五部，不浪费 token。"
                 )
+                _busy_key = f"pipeline_busy_{project_id}"
+                _is_busy = st.session_state.get(_busy_key, False)
                 if st.button(
                     "✅ 应用修订意见并重跑工部",
                     type="primary",
                     key="apply_revision_btn",
+                    disabled=_is_busy,
                     help="读取终审的 mandatory_revisions 和 revision_instructions，"
                          "存到 project.brief._revision_context，删除 ministry_works/"
                          "cell_planner/builder/vibe_critic/vibe_rewriter/chancellery_final 的 "
                          "stage_logs，然后触发 resume — 工部会拿到修订指令做针对性修复。",
                 ):
-                    from pipeline.orchestrator import revise_and_resume_pipeline_in_background
+                    st.session_state[_busy_key] = True
+                    from pipeline.orchestrator import (
+                        PipelineAlreadyRunningError,
+                        revise_and_resume_pipeline_in_background,
+                    )
                     from pipeline.agents import init_api_config
                     init_api_config()
                     try:
@@ -187,7 +217,11 @@ if status == "needs_revision":
                             "修订意见作为 _revision_directives 注入到工部各 agent。"
                         )
                         st.rerun()
+                    except PipelineAlreadyRunningError as _err:
+                        st.session_state[_busy_key] = False
+                        st.warning(f"⚠️ {_err}")
                     except Exception as _err:
+                        st.session_state[_busy_key] = False
                         st.error(f"应用修订失败：{_err}")
     except Exception as _e:
         st.warning(f"无法加载终审报告：{_e}")
@@ -535,6 +569,10 @@ with c1:
             st.session_state["current_project_id"] = project_id
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
+# Session-scoped busy flag prevents a second click before Streamlit reruns.
+_actions_busy_key = f"pipeline_busy_actions_{project_id}"
+_actions_busy = st.session_state.get(_actions_busy_key, False)
+
 with c2:
     # Allow resume whenever not actively completed — covers failed, paused, and
     # silently-hung "running" states (e.g. background thread crashed without
@@ -542,29 +580,59 @@ with c2:
     if status != "completed":
         if st.button(
             "▶️ 继续执行",
+            disabled=_actions_busy,
             help=(
                 "从失败/中断处继续。已完成的 stage 直接跳过；工部的格子规划和构建"
                 "还会做 cell 级 resume——扫描之前成功的批次，只重跑真正还没成功的"
                 "cell，不会让已经花过 token 的产出白白重算。"
             ),
         ):
-            from pipeline.orchestrator import resume_pipeline_in_background
+            st.session_state[_actions_busy_key] = True
+            from pipeline.orchestrator import (
+                PipelineAlreadyRunningError,
+                resume_pipeline_in_background,
+            )
             from pipeline.agents import init_api_config
             init_api_config()
-            # Reset status so the orchestrator can take over again
-            db.update_project(project_id, status="running")
-            resume_pipeline_in_background(project_id, run_id, db)
-            st.rerun()
+            try:
+                # Don't pre-set project.status here; orchestrator.run() does
+                # it, and our guard checks project.status so pre-setting
+                # would make the guard reject our own call.
+                resume_pipeline_in_background(project_id, run_id, db)
+                st.rerun()
+            except PipelineAlreadyRunningError as _err:
+                st.session_state[_actions_busy_key] = False
+                st.warning(f"⚠️ {_err}")
+            except Exception as _err:
+                st.session_state[_actions_busy_key] = False
+                st.error(f"继续执行失败：{_err}")
 with c3:
     # Restart from scratch — always available except while a fresh run is healthy
-    if st.button("🔄 重跑流水线", help="完全从头开始（会创建新的 run）"):
-        from pipeline.orchestrator import start_pipeline_in_background
+    if st.button(
+        "🔄 重跑流水线",
+        disabled=_actions_busy,
+        help="完全从头开始（会创建新的 run）",
+    ):
+        st.session_state[_actions_busy_key] = True
+        from pipeline.orchestrator import (
+            PipelineAlreadyRunningError,
+            start_pipeline_in_background,
+        )
         from pipeline.agents import init_api_config
-        new_run = db.create_pipeline_run(project_id)
-        db.update_project(project_id, status="running")
         init_api_config()
-        start_pipeline_in_background(project_id, new_run["id"], db)
-        st.rerun()
+        try:
+            # create_pipeline_run + start — orchestrator sets project.status
+            # internally, so we skip the pre-emptive update that would
+            # trip our own guard.
+            new_run = db.create_pipeline_run(project_id)
+            start_pipeline_in_background(project_id, new_run["id"], db)
+            st.rerun()
+        except PipelineAlreadyRunningError as _err:
+            st.session_state[_actions_busy_key] = False
+            st.warning(f"⚠️ {_err}")
+        except Exception as _err:
+            st.session_state[_actions_busy_key] = False
+            st.error(f"重跑失败：{_err}")
 
 # Auto-refresh when running or paused for review (waiting for user input)
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):

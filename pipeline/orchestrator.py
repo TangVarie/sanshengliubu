@@ -1260,8 +1260,47 @@ class PipelineOrchestrator:
         return final_system
 
 
+class PipelineAlreadyRunningError(RuntimeError):
+    """Raised when an entry point tries to start a pipeline for a project that
+    already has a thread running. Prevents double-clicks, two browser tabs,
+    or multiple users from racing on the same run_id.
+    """
+
+
+def _assert_project_not_running(
+    project_id: str,
+    db: SupabaseClient,
+    required_status: str | None = None,
+) -> dict:
+    """Re-read project status from DB (bypassing any stale in-UI cache) and
+    refuse to proceed if it's already running, or if required_status is set
+    and the project isn't in that state. Returns the fresh project dict on
+    success.
+
+    The race window between this check and the caller's own "status=running"
+    write is small (ms) but not zero. For full correctness we'd need an
+    atomic compare-and-swap in Supabase, which the Python client doesn't
+    expose cleanly. Combined with the UI-level session_state lock, this
+    closes the practical failure modes (user double-clicks, two tabs).
+    """
+    project = db.get_project(project_id) or {}
+    current = (project.get("status") or "").strip()
+    if current == "running":
+        raise PipelineAlreadyRunningError(
+            f"项目 {project_id[:8]} 当前状态为 running，已有一条流水线正在执行。"
+            f"等它跑完或失败后再重试。"
+        )
+    if required_status and current != required_status:
+        raise PipelineAlreadyRunningError(
+            f"项目 {project_id[:8]} 当前状态是 {current!r}，不满足触发条件 "
+            f"{required_status!r}。请刷新页面查看最新状态。"
+        )
+    return project
+
+
 def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
     """Launch pipeline in a background thread (for Streamlit compatibility)."""
+    _assert_project_not_running(project_id, db)
 
     def _thread_target():
         loop = asyncio.new_event_loop()
@@ -1269,8 +1308,45 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
         try:
             orchestrator = PipelineOrchestrator(project_id, run_id, db)
             loop.run_until_complete(orchestrator.run())
-        except Exception:
+        except Exception as e:
+            # Two failure classes land here:
+            #   (a) Exception inside orchestrator.run() — its own try/except
+            #       already updated pipeline_run.status to "failed" and
+            #       re-raised, so we just log.
+            #   (b) Exception BEFORE orchestrator.run() got to run its try
+            #       block — e.g. PipelineOrchestrator.__init__ crashed,
+            #       event-loop setup failed, the thread was killed early.
+            #       In that case pipeline_run.status is still whatever the
+            #       caller set it to ("running") and the UI will auto-refresh
+            #       forever waiting for a completion that will never come.
+            # We can't always tell (a) from (b), so redundantly mark the run
+            # failed here: it's idempotent if (a) already did it, and the
+            # safety net for (b). Swallow DB errors so we don't crash the
+            # thread cleanup.
             logger.exception("Background pipeline thread failed")
+            try:
+                err_str = f"{type(e).__name__}: {e}"
+                db.update_pipeline_run(
+                    run_id,
+                    status="failed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                db.update_project(project_id, status="failed")
+                # Also surface the failure in stage_logs so UI has something
+                # to render instead of just an empty "running" spinner.
+                db.create_stage_log(
+                    run_id,
+                    stage_name="_thread_target",
+                    input_data={"phase": "thread_init_or_teardown"},
+                )
+                logger.info(
+                    f"[thread_target] marked run={run_id} failed with: {err_str}"
+                )
+            except Exception:
+                logger.exception(
+                    "[thread_target] also failed to mark run as failed — "
+                    "run will stay in 'running' state; manual DB cleanup needed"
+                )
         finally:
             loop.close()
 
@@ -1492,7 +1568,11 @@ def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], st
 
 
 def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
-    """Resume a failed pipeline run — reuses existing run_id and skips completed stages."""
+    """Resume a failed pipeline run — reuses existing run_id and skips completed stages.
+
+    The double-click guard lives inside start_pipeline_in_background; we
+    don't duplicate it here.
+    """
     # Reset run status so UI shows it as running again
     db.update_pipeline_run(run_id, status="running", completed_at=None)
     return start_pipeline_in_background(project_id, run_id, db)
@@ -1516,6 +1596,12 @@ def revise_and_resume_pipeline_in_background(
     Preserves: crown_prince, secretariat, chancellery_*, dispatcher, 五部.
     These are upstream of works and don't need to re-run.
     """
+    # 0. Guard: only allow this from needs_revision state. The check happens
+    # BEFORE any destructive action (stage_logs deletion, _revision_context
+    # write) because if two clicks race here, the loser would destroy the
+    # winner's still-valid stage_logs. Raising early keeps the DB consistent.
+    _assert_project_not_running(project_id, db, required_status="needs_revision")
+
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
     final_logs = [
@@ -1645,7 +1731,9 @@ def revise_and_resume_pipeline_in_background(
         f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"
     )
 
-    # 4. Reset status and trigger resume
+    # 4. Reset pipeline_run status so the UI shows it as running again;
+    # project.status gets flipped by orchestrator.run() as its first action,
+    # so don't pre-empt it here (doing so would break the guard in
+    # start_pipeline_in_background).
     db.update_pipeline_run(run_id, status="running", completed_at=None)
-    db.update_project(project_id, status="running")
     return start_pipeline_in_background(project_id, run_id, db)
