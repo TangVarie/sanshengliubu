@@ -363,7 +363,6 @@ class BaseAgent:
         )
 
     @staticmethod
-    @staticmethod
     def _try_repair_truncated_json(fragment: str) -> dict[str, Any] | None:
         """Repair truncated JSON by finding the last valid cut point and closing
         open containers in proper nesting order.
