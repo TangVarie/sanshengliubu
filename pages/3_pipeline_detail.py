@@ -45,6 +45,44 @@ def render_stage_error(log: dict) -> None:
     )
 
 
+def render_stage_meta(log: dict | None) -> None:
+    """Show a compact caption at the top of each stage tab with the key
+    observability fields: model actually used (including [thinking ✓]
+    tag when applicable), duration, total tokens. This is how users
+    answer 'did thinking actually fire on this stage?' without needing
+    to dig into raw DB rows.
+    """
+    if not log:
+        return
+    bits: list[str] = []
+    mu = log.get("model_used")
+    if mu:
+        # Color the thinking indicator so ✓/✗ is easy to skim.
+        if "[thinking ✓]" in str(mu):
+            mu_disp = str(mu).replace(
+                "[thinking ✓]", "**`[thinking ✓]`**"
+            )
+        elif "[thinking ✗]" in str(mu):
+            mu_disp = str(mu).replace(
+                "[thinking ✗]",
+                "**`[thinking ✗ — 中转站忽略了 thinking JSON]`**",
+            )
+        else:
+            mu_disp = str(mu)
+        bits.append(f"模型 {mu_disp}")
+    tokens = log.get("tokens_used")
+    if tokens:
+        bits.append(f"tokens {int(tokens):,}")
+    dur = log.get("duration_seconds")
+    if dur:
+        bits.append(f"耗时 {float(dur):.1f}s")
+    status = log.get("status")
+    if status and status not in ("completed",):
+        bits.append(f"状态 {status}")
+    if bits:
+        st.caption(" · ".join(bits))
+
+
 def render_stage_output(output_data: dict):
     """Render stage output with uncertainty annotations separated out."""
     uncertainties = output_data.get("_uncertainty", [])
@@ -404,6 +442,7 @@ tabs = st.tabs(tab_names)
 # Tab 0: Crown Prince
 with tabs[0]:
     log = log_map.get("crown_prince")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         render_stage_output(log["output_data"])
     elif log:
@@ -420,6 +459,7 @@ with tabs[0]:
     if ts_log:
         st.divider()
         st.markdown("**🔭 Gemini 趋势取样（pre-secretariat）**")
+        render_stage_meta(ts_log)
         ts_status = ts_log.get("status", "pending")
         ts_out = ts_log.get("output_data") or {}
         if ts_status == "skipped":
@@ -475,6 +515,7 @@ with tabs[1]:
     if sec_logs:
         for sl in sec_logs:
             with st.expander(f"方案 (轮次 {sec_logs.index(sl) + 1})", expanded=(sl == sec_logs[-1])):
+                render_stage_meta(sl)
                 if sl.get("output_data"):
                     render_stage_output(sl["output_data"])
                 elif sl.get("status") == "failed":
@@ -492,6 +533,7 @@ with tabs[2]:
         for cl in chan_logs:
             round_label = cl["stage_name"].replace("chancellery_", "第") + "轮审议"
             with st.expander(round_label, expanded=(cl == chan_logs[-1])):
+                render_stage_meta(cl)
                 output = cl.get("output_data", {})
                 if output:
                     verdict = output.get("verdict", "unknown")
@@ -534,6 +576,7 @@ with tabs[2]:
 # Tab 3: Dispatcher
 with tabs[3]:
     log = log_map.get("dispatcher")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         render_stage_output(log["output_data"])
     elif log:
@@ -552,6 +595,7 @@ with tabs[4]:
     ]
     def _render_stage_log(stage_key: str, label: str = ""):
         log = log_map.get(stage_key)
+        render_stage_meta(log)
         if log and log.get("output_data"):
             render_stage_output(log["output_data"])
         elif log:
@@ -620,6 +664,7 @@ with tabs[4]:
                 if sr_log:
                     st.divider()
                     st.markdown("**🔎 Gemini 结构审**")
+                    render_stage_meta(sr_log)
                     sr_status = sr_log.get("status", "pending")
                     sr_out = sr_log.get("output_data") or {}
                     if sr_status == "skipped":
@@ -684,6 +729,7 @@ with tabs[4]:
 # Tab 5: Final Review
 with tabs[5]:
     log = log_map.get("chancellery_final")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         output = log["output_data"]
         verdict = output.get("verdict", "unknown")

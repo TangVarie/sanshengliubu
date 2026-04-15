@@ -62,14 +62,43 @@ def _strip_summaries(data: dict) -> dict:
 
 
 def _validate_post(post: Any, required_domain: str = "xiaohongshu.com") -> dict | None:
-    """Accept a post dict only if it has a URL pointing to the required
-    domain. Trims the post to the whitelisted fields we care about so
-    the model can't leak analysis text through extra fields."""
+    """Accept a post dict only if it has a URL that looks like Xiaohongshu
+    content. Trims the post to the whitelisted fields we care about so
+    the model can't leak analysis text through extra fields.
+
+    URL acceptance is broader than a single-domain check because Google's
+    index of xiaohongshu.com proper is very thin; we accept:
+      - xiaohongshu.com        (canonical domain)
+      - xhslink.com            (official share links)
+      - any URL with `xhs` substring except known false-positives
+    Plus a fallback: the model may flag _suspect_repost for posts found
+    on weibo/tieba/etc. that quoted a xhs original — we keep those so
+    the user can decide.
+    """
     if not isinstance(post, dict):
         return None
     url = str(post.get("url", "")).strip()
-    if not url or required_domain not in url:
+    if not url:
         return None
+    url_lower = url.lower()
+
+    # Known false-positive substrings we DON'T want even though "xhs"
+    # appears in them (e.g. "xhsshop" is a taobao store brand, not xhs).
+    _xhs_blocklist = ("xhsshop", "xhsoutlet")
+
+    is_xhs_url = (
+        "xiaohongshu.com" in url_lower
+        or "xhslink.com" in url_lower
+        or (
+            "xhs" in url_lower
+            and not any(b in url_lower for b in _xhs_blocklist)
+        )
+    )
+    is_acceptable_repost = bool(post.get("_suspect_repost", False))
+
+    if not is_xhs_url and not is_acceptable_repost:
+        return None
+
     title = str(post.get("title", "")).strip()
     snippet = str(post.get("snippet", "")).strip()
     if not title and not snippet:
@@ -80,6 +109,7 @@ def _validate_post(post: Any, required_domain: str = "xiaohongshu.com") -> dict 
         "snippet": snippet,
         "cover_image_url": str(post.get("cover_image_url", "")).strip(),
         "_suspect_analysis": bool(post.get("_suspect_analysis", False)),
+        "_suspect_repost": is_acceptable_repost,
     }
 
 
