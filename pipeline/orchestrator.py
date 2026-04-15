@@ -17,6 +17,9 @@ from pipeline.config import (
     CELL_PLANNER_CONCURRENCY,
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
+    ENABLE_GEMINI_TREND_SCOUT_POST,
+    ENABLE_GEMINI_TREND_SCOUT_PRE,
+    GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
     MAX_FINAL_REJECTIONS,
@@ -36,6 +39,10 @@ from pipeline.agents.gemini_critic import run_gemini_critic
 from pipeline.agents.gemini_structure_reviewer import (
     format_revision_hints as _format_gemini_structure_hints,
     run_gemini_structure_review,
+)
+from pipeline.agents.gemini_trend_scout import (
+    format_trend_intel_for_prompt,
+    run_trend_scout,
 )
 from pipeline.agents.crown_prince import CrownPrince
 from pipeline.agents.secretariat import Secretariat
@@ -263,6 +270,12 @@ class PipelineOrchestrator:
                 }
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
                 self.db.update_project(self.project_id, brief=structured_brief)
+
+            # 1b. Gemini 趋势取样（advisory, A1）— 在策略规划之前拉一批当前
+            # 平台的真实帖子（标题 + snippet 原文），注入到 structured_brief
+            # 的 _trend_intel 字段。这些是**原文样本**不是趋势分析。
+            # 失败时跳过不阻塞。
+            await self._run_gemini_trend_scout_pre(structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
             if "secretariat" in done:
@@ -1253,6 +1266,127 @@ class PipelineOrchestrator:
             "shared_skeleton": works_plan.get("shared_skeleton", {}),
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
         }
+
+    async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
+        """A1: pre-secretariat trend scout. Pulls current real Xiaohongshu
+        post samples (titles + snippets verbatim) via Gemini + Google
+        Search, mutates brief['_trend_intel'] in place. Advisory-only.
+
+        The strict contract enforced inside run_trend_scout + its prompt
+        is that output is RAW POSTS ONLY, no trend summaries — see the
+        module docstring of pipeline/agents/gemini_trend_scout.py.
+        """
+        if not ENABLE_GEMINI_TREND_SCOUT_PRE:
+            return
+
+        # Build keyword list from the brief. Priority: product_name +
+        # category; fall back to raw_materials snippet. We want high-
+        # recall terms so Google surfaces actual posts.
+        keywords = []
+        for k in ("product_name", "product_category", "core_claim"):
+            v = brief.get(k)
+            if v and isinstance(v, str) and v.strip():
+                keywords.append(v.strip())
+        if not keywords:
+            # Nothing specific to search — skip rather than firing a
+            # garbage query against Google.
+            logger.info(
+                "[trend_scout pre] skipping — no product_name / category / "
+                "core_claim in brief"
+            )
+            return
+
+        platforms = brief.get("target_platforms") or []
+        platform = platforms[0] if platforms else "小红书"
+
+        stage_name = "gemini_trend_scout_pre"
+        log = self.db.create_stage_log(
+            self.run_id,
+            stage_name,
+            {"keywords": keywords, "platform": platform},
+        )
+        log_id = log["id"]
+
+        try:
+            result = await run_trend_scout(
+                keywords,
+                platform=platform,
+                target_count=GEMINI_TREND_SCOUT_TARGET_COUNT,
+            )
+        except Exception as e:
+            logger.warning(
+                "[trend_scout pre] unexpected exception, skipping: %r", e
+            )
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={"_skip_reason": f"unexpected_exception: {e}"},
+            )
+            return
+
+        usage = result.get("_gemini_usage") or {}
+        if usage:
+            accumulate_auxiliary_cost(
+                self.run_id,
+                cost_usd=float(usage.get("cost_usd", 0.0)),
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                source="gemini_trend_scout_pre",
+            )
+
+        verdict = result.get("verdict", "skipped")
+        if verdict == "skipped":
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={
+                    "_skip_reason": result.get("_skip_reason", "unknown"),
+                    "queries_used": result.get("queries_used", []),
+                    "_gemini_usage": usage,
+                },
+                tokens_used=int(usage.get("input_tokens", 0))
+                + int(usage.get("output_tokens", 0)),
+                model_used=usage.get("model"),
+            )
+            logger.info(
+                "[trend_scout pre] skipped: %s",
+                result.get("_skip_reason", "unknown"),
+            )
+            return
+
+        # Inject raw posts into brief so secretariat sees them. Store
+        # both the structured list (for UI + downstream programmatic
+        # access) and a formatted block (for direct prompt injection).
+        brief["_trend_intel"] = {
+            "posts": result.get("posts", []),
+            "queries_used": result.get("queries_used", []),
+            "grounding_urls": result.get("grounding_urls", []),
+            "formatted_block": format_trend_intel_for_prompt(result),
+        }
+        self.db.update_project(self.project_id, brief=brief)
+
+        self.db.update_stage_log(
+            log_id,
+            status="completed",
+            output_data={
+                "verdict": verdict,
+                "posts": result.get("posts", []),
+                "queries_used": result.get("queries_used", []),
+                "grounding_urls": result.get("grounding_urls", []),
+                "_rejected_off_domain_count": result.get(
+                    "_rejected_off_domain_count", 0
+                ),
+                "_not_found_reason": result.get("_not_found_reason"),
+            },
+            model_used=usage.get("model"),
+            tokens_used=int(usage.get("input_tokens", 0))
+            + int(usage.get("output_tokens", 0)),
+        )
+        logger.info(
+            "[trend_scout pre] captured %d raw posts for keywords=%s",
+            len(result.get("posts", [])),
+            keywords,
+        )
 
     async def _run_gemini_structure_review_stage(
         self, final_system: dict

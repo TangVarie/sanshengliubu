@@ -239,8 +239,9 @@ st.caption(
 # Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
 # 这里列出"Gemini 会介入"的阶段，而不是"Gemini 是主判"的阶段。
 GEMINI_ASSIST_STAGES: dict[str, str] = {
+    "gemini_trend_scout_pre": "主判（Gemini-only，Google 搜小红书原文）",
     "vibe_critic": "二审（Claude 判 pass 的 cell 再过 Gemini）",
-    "ministry_works_structure_review": "主判（Gemini-only）",
+    "ministry_works_structure_review": "主判（Gemini-only，结构完整性）",
 }
 
 for stage_key, stage_label, stage_icon in PIPELINE_STAGES:

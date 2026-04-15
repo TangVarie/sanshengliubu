@@ -189,6 +189,8 @@ def call_gemini_json(
     *,
     model: str | None = None,
     max_output_tokens: int | None = None,
+    enable_search: bool = False,
+    enable_url_context: bool = False,
 ) -> dict[str, Any]:
     """Run one Gemini call and parse the response as JSON.
 
@@ -198,6 +200,12 @@ def call_gemini_json(
       - "output_tokens": int
       - "cost_usd": float, this-call cost estimate
       - "model": the model ID that was called
+      - "grounding_urls": list[str], URLs Gemini actually cited via the
+        Google Search tool (only populated when enable_search=True).
+        Useful as a verification layer: if Gemini claims to have seen
+        posts X/Y/Z, the URLs should be in this list. Empty list means
+        grounding produced no citations (search returned nothing or
+        Gemini chose not to cite).
 
     Raises GeminiNotConfigured / GeminiCallFailed on any failure. Never
     raises from JSON parse failures — falls back to wrapping the raw
@@ -205,32 +213,64 @@ def call_gemini_json(
     decide whether to ignore or treat as a soft-fail.
 
     Shape is deliberately JSON-oriented because every current caller
-    (critic, structure reviewer) needs structured output. Tasks that
-    want free-form text should add a call_gemini_text variant later.
+    (critic, structure reviewer, trend scout) needs structured output.
+    Tasks that want free-form text should add a call_gemini_text variant.
+
+    enable_search=True attaches Google Search as a tool so Gemini can
+    run live searches mid-response. Citations come back in
+    grounding_urls. Note that JSON mime type + grounding can conflict
+    with some models — if the response comes back as prose instead of
+    JSON, _extract_json falls back through ```json``` fence / outermost
+    braces before giving up.
+
+    enable_url_context=True lets Gemini fetch specific URLs the user
+    mentions in the prompt and include their content as context. Useful
+    for "analyze this specific post" workflows.
     """
     client = _get_client()
     model_id = model or GEMINI_MODEL
     max_tokens = max_output_tokens or GEMINI_MAX_OUTPUT_TOKENS
 
     try:
-        # google-genai uses `contents` for the user turn and a separate
-        # `system_instruction` in config. JSON mode is requested via
-        # response_mime_type; the model will (best-effort) emit a single
-        # valid JSON object. We still run _extract_json as a safety net
-        # because Gemini occasionally wraps JSON in prose anyway.
         from google.genai import types  # type: ignore
+
+        # Tool list — only attached when at least one is enabled, because
+        # empty tools=[] can confuse some models.
+        tools: list[Any] = []
+        if enable_search:
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+        if enable_url_context:
+            # url_context is a separate tool that lets the model fetch
+            # specific URLs mentioned in the prompt. Graceful: the type
+            # may not exist on older SDK versions — guard the import.
+            try:
+                tools.append(types.Tool(url_context=types.UrlContext()))
+            except AttributeError:
+                logger.warning(
+                    "[gemini] url_context tool not available in installed "
+                    "google-genai SDK; continuing without it"
+                )
+
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system_prompt,
+            "max_output_tokens": max_tokens,
+            # Lower temperature for critic/reviewer/scout — consistent
+            # judgment, not creative variation.
+            "temperature": 0.3,
+        }
+        # response_mime_type=application/json and grounding tools conflict
+        # on some model IDs (grounding pushes response into natural text).
+        # Only request JSON mime when grounding is OFF. With grounding ON,
+        # we rely on _extract_json's markdown-fence / brace fallback.
+        if not tools:
+            config_kwargs["response_mime_type"] = "application/json"
+        if tools:
+            config_kwargs["tools"] = tools
 
         response = client.models.generate_content(
             model=model_id,
             contents=user_message,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                max_output_tokens=max_tokens,
-                # Lower temperature for critic/reviewer roles — we want
-                # consistent judgment, not creative variation.
-                temperature=0.3,
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
     except Exception as e:
         raise GeminiCallFailed(
@@ -253,12 +293,33 @@ def call_gemini_json(
 
     parsed = _extract_json(raw_text)
 
+    # Extract grounding citations when search was enabled. Gemini puts
+    # them on the first candidate's grounding_metadata.grounding_chunks.
+    grounding_urls: list[str] = []
+    if enable_search:
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                gm = getattr(candidates[0], "grounding_metadata", None)
+                chunks = getattr(gm, "grounding_chunks", None) or [] if gm else []
+                for ch in chunks:
+                    web = getattr(ch, "web", None)
+                    if web:
+                        uri = getattr(web, "uri", None)
+                        if uri:
+                            grounding_urls.append(str(uri))
+        except Exception as e:
+            logger.debug(
+                "[gemini] failed to extract grounding metadata: %r", e
+            )
+
     return {
         "data": parsed,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": _estimate_cost_usd(input_tokens, output_tokens),
         "model": model_id,
+        "grounding_urls": grounding_urls,
     }
 
 

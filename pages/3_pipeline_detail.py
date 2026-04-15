@@ -263,6 +263,8 @@ for log in stage_logs:
 
 STAGE_DISPLAY_NAMES = {
     "crown_prince": "太子",
+    "gemini_trend_scout_pre": "趋势取样·Gemini",
+    "gemini_trend_scout_post": "网感对标·Gemini",
     "secretariat": "中书省",
     "chancellery": "门下省",
     "dispatcher": "尚书省",
@@ -409,6 +411,61 @@ with tabs[0]:
             render_stage_error(log)
     else:
         st.caption("等待执行...")
+
+    # Gemini trend scout (pre-secretariat) — surface the raw posts
+    # that got injected into brief._trend_intel so the user sees
+    # exactly what secretariat received as calibration samples.
+    ts_log = log_map.get("gemini_trend_scout_pre")
+    if ts_log:
+        st.divider()
+        st.markdown("**🔭 Gemini 趋势取样（pre-secretariat）**")
+        ts_status = ts_log.get("status", "pending")
+        ts_out = ts_log.get("output_data") or {}
+        if ts_status == "skipped":
+            reason = str(ts_out.get("_skip_reason", "unknown"))
+            if "not_configured" in reason:
+                st.warning(
+                    "⚠️ 跳过（Gemini 未配置）——配置好 `VERTEX_EXPRESS_API_KEY` "
+                    "且 `ENABLE_GEMINI_TREND_SCOUT_PRE=True` 后下次生效。"
+                )
+            else:
+                st.info(f"⏭️ 跳过：`{reason}`")
+        elif ts_status == "completed":
+            posts = ts_out.get("posts") or []
+            queries = ts_out.get("queries_used") or []
+            rejected = ts_out.get("_rejected_off_domain_count", 0)
+            if posts:
+                st.success(
+                    f"✅ 拉到 {len(posts)} 条小红书原文帖子"
+                    + (f"（过滤掉 {rejected} 条非 xiaohongshu 域名）" if rejected else "")
+                )
+                for i, p in enumerate(posts, 1):
+                    title = p.get("title") or "(无标题)"
+                    snippet = p.get("snippet") or ""
+                    url = p.get("url", "")
+                    flag = " ⚠️ 疑似分析文" if p.get("_suspect_analysis") else ""
+                    with st.expander(f"#{i} 《{title}》{flag}"):
+                        if snippet:
+                            st.markdown(f"**片段**：{snippet}")
+                        if url:
+                            st.markdown(f"**URL**：[{url}]({url})")
+                        if p.get("cover_image_url"):
+                            st.image(
+                                p["cover_image_url"],
+                                caption="封面（来自 Google 缩略图）",
+                                width=200,
+                            )
+                if queries:
+                    with st.expander("🔍 Gemini 用到的搜索查询", expanded=False):
+                        for q in queries:
+                            st.markdown(f"- `{q}`")
+            else:
+                nf = ts_out.get("_not_found_reason") or "搜索返回空"
+                st.warning(f"⚠️ 没找到真实原文帖子：{nf}")
+        elif ts_status == "failed":
+            render_stage_error(ts_log)
+        else:
+            st.caption(f"状态：{ts_status}")
 
 # Tab 1: Secretariat
 with tabs[1]:

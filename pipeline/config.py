@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.14.3"
+VERSION = "v0.15.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "再次修正 GEMINI_MODEL：Google 用点号分版本号，正确 ID 是 gemini-3.1-pro-preview"
+VERSION_NOTES = "趋势取样：Gemini+Google 搜 site:xiaohongshu.com 原文帖子，注入 secretariat"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -247,6 +247,27 @@ ENABLE_GEMINI_ASSIST = True
 #   - gemini-2.5-flash              (cheapest, fine for critic role)
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
+# Trend scout — when True, Gemini runs a live Google Search
+# (site:xiaohongshu.com) in two places:
+#   - PRE: before secretariat, to enrich the brief with real current
+#          post samples (titles + snippets) so strategy is calibrated
+#          against concrete examples, not abstract assumptions.
+#   - POST: after chancellery_final, per direction, for side-by-side
+#           comparison with our produced demos. Advisory, non-blocking.
+# Costs: Google Search grounding is billed separately by Google
+# (~$35 / 1000 queries). PRE is 1 query/run; POST is 1 query per
+# direction (~5-8/run). Budget ~$0.30 extra per full run.
+#
+# IMPORTANT CONTRACT — scout output is forced to be RAW POSTS ONLY,
+# never trend analysis. See pipeline/prompts/gemini_trend_scout.md +
+# pipeline/agents/gemini_trend_scout.py _FORBIDDEN_SUMMARY_KEYS.
+ENABLE_GEMINI_TREND_SCOUT_PRE = True
+ENABLE_GEMINI_TREND_SCOUT_POST = True
+# How many posts to ask the scout to pull per invocation. Each post is
+# ~150 chars in the output, so 10 is a reasonable default — gives
+# secretariat meaningful calibration without ballooning the prompt.
+GEMINI_TREND_SCOUT_TARGET_COUNT = 10
+
 # Max output tokens per Gemini call. Gemini's output cap is per-model;
 # 8K is safe across 2.5 Pro and most preview tiers.
 GEMINI_MAX_OUTPUT_TOKENS = 8192
@@ -294,6 +315,12 @@ POLL_INTERVAL_SECONDS = 3
 
 PIPELINE_STAGES = [
     ("crown_prince", "太子", "📋"),
+    # advisory-only (Gemini). Skipped if Gemini isn't configured.
+    # Runs between crown_prince and secretariat: pulls real current
+    # Xiaohongshu post samples via Google Search, injects raw titles +
+    # snippets into brief._trend_intel so secretariat's strategy is
+    # calibrated against concrete current examples, not abstract guesses.
+    ("gemini_trend_scout_pre", "趋势取样·Gemini", "🔭"),
     ("secretariat", "中书省", "📜"),
     ("chancellery", "门下省", "🔍"),
     ("dispatcher", "尚书省", "📋"),
@@ -305,7 +332,6 @@ PIPELINE_STAGES = [
     ("ministry_works", "工部·架构", "🏗️"),
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
-    # advisory-only (Gemini). Skipped if Gemini isn't configured.
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
     ("chancellery_final", "终审", "✅"),
