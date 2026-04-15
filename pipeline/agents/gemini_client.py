@@ -92,7 +92,29 @@ def _get_client():
         )
 
     try:
-        client = genai.Client(api_key=api_key)
+        # Gemini 3.x + Google Search grounding + 24K max_tokens single-
+        # call latency can easily hit 2-3 minutes (grounding adds an
+        # internal search+summarize step on top of normal generation).
+        # google-genai's default HTTP timeout (~60s at the time of
+        # writing) fires early and we get a client-side 499 CANCELLED
+        # before the model ever finishes. Set a generous 10-minute
+        # ceiling — longer than any reasonable single call.
+        try:
+            from google.genai.types import HttpOptions  # type: ignore
+            client = genai.Client(
+                api_key=api_key,
+                http_options=HttpOptions(timeout=600000),  # ms
+            )
+        except (ImportError, TypeError):
+            # Older SDK versions that don't accept http_options or
+            # lack HttpOptions — fall back to default timeout.
+            client = genai.Client(api_key=api_key)
+            logger.warning(
+                "[gemini] installed google-genai version doesn't support "
+                "HttpOptions timeout; grounding calls may hit default "
+                "client timeout and 499 CANCELLED. Upgrade google-genai "
+                "to >=0.3.0 if you see repeated cancellations."
+            )
     except Exception as e:
         raise GeminiNotConfigured(
             f"Failed to construct google-genai Client: {e}"
