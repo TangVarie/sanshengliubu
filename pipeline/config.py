@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.17.2"
+VERSION = "v0.18.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "修 Settings 页识别 claude_relay_presets 新格式（之前误判为「未配置」）"
+VERSION_NOTES = "支持后缀型中转（tdyun）：per-preset model_overrides + thinking_via_model_suffix"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

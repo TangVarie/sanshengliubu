@@ -198,6 +198,33 @@ def init_api_config():
             cfg["supports_adaptive_thinking"]
         )
 
+    # Some relays (e.g. tdyun.ai) don't understand the `thinking` JSON
+    # parameter at all and use a model-name suffix convention instead
+    # (claude-opus-4-6-thinking / -high / -medium / -low / -max). When
+    # this flag is true, _call_claude:
+    #   1. Does NOT send the `thinking` JSON parameter
+    #   2. Relies on the model name (resolved via model_overrides below)
+    #      to carry thinking-tier information
+    _api_config["thinking_via_model_suffix"] = bool(
+        cfg.get("thinking_via_model_suffix", False)
+    )
+
+    # Per-stage model override. Takes precedence over config.py MODELS
+    # when the active preset has an entry for that stage. Useful for
+    # suffix-convention relays where different stages need different
+    # thinking tiers: e.g. tdyun
+    #   secretariat = "claude-opus-4-6-high"     (deep reasoning)
+    #   crown_prince = "claude-opus-4-6-thinking" (medium)
+    #   dispatcher = "claude-opus-4-6"            (no thinking)
+    # Stages not listed fall back to the global MODELS default.
+    raw_overrides = cfg.get("model_overrides") or {}
+    try:
+        _api_config["model_overrides"] = {
+            str(k): str(v) for k, v in dict(raw_overrides).items()
+        }
+    except Exception:
+        _api_config["model_overrides"] = {}
+
     # Refresh the shared rate limiter to match this preset. Any in-flight
     # calls continue under the old limits until they finish; new calls
     # made after this point respect the new values.
@@ -207,7 +234,8 @@ def init_api_config():
 
     logger.info(
         f"[init_api_config] Direct/relay mode preset=%r (%s): "
-        f"base_url=%s, RPM=%d, concurrent=%d, cache=%s, adaptive_thinking=%s",
+        f"base_url=%s, RPM=%d, concurrent=%d, cache=%s, adaptive_thinking=%s, "
+        f"thinking_via_suffix=%s, model_overrides=%d stages",
         active_name,
         _api_config["active_label"],
         "(default)" if not base_url else base_url,
@@ -215,6 +243,8 @@ def init_api_config():
         _api_config["max_concurrent"],
         _api_config["supports_cache"],
         _api_config["supports_adaptive_thinking"],
+        _api_config["thinking_via_model_suffix"],
+        len(_api_config["model_overrides"]),
     )
 
 
@@ -703,8 +733,17 @@ class BaseAgent:
         else:
             system_block = system_prompt
 
+        # Resolve effective model. Per-preset model_overrides take
+        # precedence over the global config.py MODELS — required for
+        # relays like tdyun.ai that signal thinking tier via model name
+        # suffix (claude-opus-4-6-thinking / -high / -medium / etc).
+        # Stage names not in the override map fall back to self.model
+        # (which was set from MODELS at agent construction time).
+        _model_overrides = _api_config.get("model_overrides") or {}
+        effective_model = _model_overrides.get(self.stage_name) or self.model
+
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": effective_model,
             "max_tokens": self.max_tokens,
             "system": system_block,
             "messages": messages,
@@ -721,18 +760,26 @@ class BaseAgent:
         #
         # Older models (4.1, 4.5) don't support adaptive yet, so keep
         # the explicit budget_tokens form as fallback.
-        # Adaptive vs fixed-budget: per-preset toggle. Modern relays
-        # (and native Anthropic) pass `adaptive` straight through for
-        # Opus 4.6+ and the model picks its own budget, which Anthropic
-        # says gives measurably better results. Older relays don't
-        # recognize `adaptive` and reject the whole call; those presets
-        # set supports_adaptive_thinking=false so we send the explicit
-        # enabled+budget_tokens form instead.
+        # Three thinking-control conventions across backends:
+        #
+        #   1. `thinking_via_model_suffix=True` (e.g. tdyun.ai):
+        #      Don't send the JSON `thinking` parameter AT ALL. The
+        #      relay infers thinking tier from the model name suffix
+        #      (claude-opus-4-6-thinking / -high / -medium / etc),
+        #      which is set via model_overrides per stage.
+        #
+        #   2. `supports_adaptive_thinking=True` (mux, native Anthropic,
+        #      Vertex Opus 4.6): pass {"type":"adaptive"} so the model
+        #      picks its own budget — Anthropic-recommended for 4.6+.
+        #
+        #   3. Fallback (older relays / older models): pass
+        #      {"type":"enabled","budget_tokens":N} explicit form.
+        _preset_uses_suffix = _api_config.get("thinking_via_model_suffix", False)
         _preset_supports_adaptive = _api_config.get(
             "supports_adaptive_thinking", True
         )
-        if self._use_thinking:
-            if "4-6" in self.model and _preset_supports_adaptive:
+        if self._use_thinking and not _preset_uses_suffix:
+            if "4-6" in effective_model and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {
@@ -1056,7 +1103,14 @@ class BaseAgent:
                     _thinking_tag = " [thinking ✓]" if thinking_fired else " [thinking ✗]"
                 else:
                     _thinking_tag = ""
-                model_label = f"{self.model}{_thinking_tag}"
+                # Use the EFFECTIVE model name (which may be a per-preset
+                # override like "claude-opus-4-6-high") so the UI shows
+                # what the relay actually saw, not the global default.
+                _model_overrides_for_label = _api_config.get("model_overrides") or {}
+                _effective_model_for_label = (
+                    _model_overrides_for_label.get(self.stage_name) or self.model
+                )
+                model_label = f"{_effective_model_for_label}{_thinking_tag}"
 
                 # Feed the per-run budget tracker. Raises RunBudgetExceededError
                 # if we've blown through MAX_TOKENS_PER_RUN — caught at the

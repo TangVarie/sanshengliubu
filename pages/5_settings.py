@@ -174,6 +174,33 @@ if _active_mode == "direct":
                     f"{_presets.get(_active_now, {}).get('label', _active_now)}"
                 )
 
+            # Show per-stage model overrides for the SELECTED preset (not
+            # necessarily the active one) so the user sees how stages map
+            # to model names. Useful for relays like tdyun.ai that use
+            # the model-name suffix for thinking tier.
+            _picked_overrides = _picked_cfg.get("model_overrides") or {}
+            if _picked_overrides:
+                with st.expander(
+                    f"🎯 `{_picked}` 的逐阶段模型映射"
+                    f"（{len(_picked_overrides)} 个 stage 被覆盖）",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "下面列出的 stage 用 preset 里指定的模型；其他 stage 用 "
+                        "`pipeline/config.py` 里 MODELS dict 的默认值。"
+                    )
+                    _override_rows = [
+                        {"stage": k, "model_used": v}
+                        for k, v in _picked_overrides.items()
+                    ]
+                    st.dataframe(_override_rows, use_container_width=True)
+                if _picked_cfg.get("thinking_via_model_suffix"):
+                    st.caption(
+                        "ℹ️ 此 preset `thinking_via_model_suffix=true`：不发 JSON "
+                        "thinking 参数，靠模型名后缀（-thinking / -high / -medium / "
+                        "-low / -max）传递思考档位。"
+                    )
+
             with st.expander("📋 所有 preset 配置对比（只读）"):
                 _rows = [
                     {
