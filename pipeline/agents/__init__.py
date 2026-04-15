@@ -43,12 +43,83 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 _api_config: dict[str, str] = {}
 
 
+def _list_claude_relay_presets() -> dict[str, dict]:
+    """Read all [claude_relay_presets.xxx] sections from secrets.toml
+    into a plain dict keyed by preset name. Empty if none defined.
+
+    Falls back to a single synthesized preset named "default" when the
+    user has only the legacy top-level ANTHROPIC_API_KEY / BASE_URL set
+    — keeps backward compat with secrets.toml files written before the
+    multi-preset feature.
+    """
+    raw = st.secrets.get("claude_relay_presets")
+    presets: dict[str, dict] = {}
+    if raw:
+        for name, cfg in dict(raw).items():
+            cfg_d = dict(cfg)
+            presets[str(name)] = cfg_d
+
+    if not presets:
+        # Legacy fallback: if user hasn't migrated to multi-preset yet,
+        # wrap their top-level ANTHROPIC_API_KEY into a synthetic preset
+        # so the rest of the plumbing (init_api_config / settings page)
+        # has a uniform structure to work with.
+        legacy_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if legacy_key:
+            presets["default"] = {
+                "label": "默认（来自顶层 ANTHROPIC_API_KEY）",
+                "api_key": legacy_key,
+                "base_url": st.secrets.get("ANTHROPIC_BASE_URL", ""),
+                "rpm_limit": None,  # use global defaults
+                "max_concurrent": None,
+                "supports_cache": None,  # use ENABLE_PROMPT_CACHING
+                "supports_adaptive_thinking": None,  # infer from model
+            }
+    return presets
+
+
+def get_available_claude_relay_presets() -> dict[str, dict]:
+    """Public accessor for UI callers. Same as internal helper."""
+    return _list_claude_relay_presets()
+
+
+def get_active_claude_relay_name() -> str:
+    """Return the preset name currently in effect. Priority:
+      1. Streamlit session override (set by the Settings page's switch
+         button; only persists within the current Streamlit process)
+      2. secrets.toml top-level ACTIVE_CLAUDE_RELAY
+      3. First preset key in secrets.toml alphabetical order
+      4. "" if no presets at all (Vertex mode or totally unconfigured)
+    """
+    # Session override takes precedence so the UI switch button works
+    # without needing a restart.
+    try:
+        override = st.session_state.get("_active_claude_relay_override")
+        if override:
+            return str(override)
+    except Exception:
+        # Not in a Streamlit context (e.g. called from a background
+        # thread before init_api_config has cached anything). Fall
+        # through to the secrets lookup.
+        pass
+
+    presets = _list_claude_relay_presets()
+    if not presets:
+        return ""
+    default = st.secrets.get("ACTIVE_CLAUDE_RELAY", "")
+    if default and default in presets:
+        return str(default)
+    return next(iter(presets.keys()))
+
+
 def init_api_config():
     """Call from Streamlit main thread to cache API secrets for background use.
 
-    Supports two modes (auto-detected from secrets.toml):
-    - Vertex AI:  GCP_PROJECT_ID + GCP_REGION (+ optional gcp_service_account section)
-    - Relay/Direct: ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL)
+    Two backends (auto-detected):
+      - Vertex AI: GCP_PROJECT_ID + GCP_REGION (+ gcp_service_account)
+      - Relay/Direct: one of the [claude_relay_presets.*] in secrets,
+        picked by ACTIVE_CLAUDE_RELAY or session override. Falls back
+        to legacy top-level ANTHROPIC_API_KEY when no presets defined.
     """
     # Vertex AI mode
     if st.secrets.get("GCP_PROJECT_ID"):
@@ -76,20 +147,75 @@ def init_api_config():
                 f"[init_api_config] Vertex AI mode (ADC): "
                 f"project={_api_config['project_id']}, region={_api_config['region']}"
             )
-    else:
-        # Legacy relay / direct Anthropic mode
-        _api_config["mode"] = "direct"
-        _api_config["api_key"] = st.secrets["ANTHROPIC_API_KEY"]
-        base_url = st.secrets.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-        _api_config["base_url"] = base_url
-        logger.info(
-            f"[init_api_config] Direct/relay mode: "
-            f"base_url={'(default)' if not base_url else base_url}, "
-            f"rate limit: {CLAUDE_RPM_LIMIT}/min, "
-            f"max concurrent: {CLAUDE_MAX_CONCURRENT}"
+        return
+
+    # ── Relay / direct mode ──────────────────────────────────────────
+    presets = _list_claude_relay_presets()
+    active_name = get_active_claude_relay_name()
+
+    if not presets or not active_name:
+        raise RuntimeError(
+            "找不到可用的 Claude 接入配置：既没有 Vertex（GCP_PROJECT_ID），"
+            "也没有 [claude_relay_presets.*] 或 ANTHROPIC_API_KEY。"
+            "请补齐 .streamlit/secrets.toml。"
         )
+
+    cfg = presets[active_name]
+    _api_config["mode"] = "direct"
+    _api_config["active_preset"] = active_name
+    _api_config["active_label"] = str(cfg.get("label", active_name))
+    _api_config["api_key"] = str(cfg.get("api_key", "") or "")
+
+    base_url = str(cfg.get("base_url", "") or "").rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    _api_config["base_url"] = base_url
+
+    # Per-preset behavioral flags. None means "use the global default".
+    _api_config["rpm_limit"] = (
+        int(cfg["rpm_limit"])
+        if cfg.get("rpm_limit") not in (None, "")
+        else int(CLAUDE_RPM_LIMIT)
+    )
+    _api_config["max_concurrent"] = (
+        int(cfg["max_concurrent"])
+        if cfg.get("max_concurrent") not in (None, "")
+        else int(CLAUDE_MAX_CONCURRENT)
+    )
+    # supports_cache defaults to the global ENABLE_PROMPT_CACHING flag
+    # so the existing config surface still works when a preset omits it.
+    if cfg.get("supports_cache") is None:
+        _api_config["supports_cache"] = bool(ENABLE_PROMPT_CACHING)
+    else:
+        _api_config["supports_cache"] = bool(cfg["supports_cache"])
+    if cfg.get("supports_adaptive_thinking") is None:
+        # Previously-assumed default: adaptive for Opus 4.6+, which is
+        # what most modern relays support. Legacy relays that want the
+        # old budget_tokens form set this to false explicitly.
+        _api_config["supports_adaptive_thinking"] = True
+    else:
+        _api_config["supports_adaptive_thinking"] = bool(
+            cfg["supports_adaptive_thinking"]
+        )
+
+    # Refresh the shared rate limiter to match this preset. Any in-flight
+    # calls continue under the old limits until they finish; new calls
+    # made after this point respect the new values.
+    _relay_limiter.reconfigure(
+        _api_config["rpm_limit"], _api_config["max_concurrent"]
+    )
+
+    logger.info(
+        f"[init_api_config] Direct/relay mode preset=%r (%s): "
+        f"base_url=%s, RPM=%d, concurrent=%d, cache=%s, adaptive_thinking=%s",
+        active_name,
+        _api_config["active_label"],
+        "(default)" if not base_url else base_url,
+        _api_config["rpm_limit"],
+        _api_config["max_concurrent"],
+        _api_config["supports_cache"],
+        _api_config["supports_adaptive_thinking"],
+    )
 
 
 # ── Sliding-window rate limiter ───────────────────────────────────────────
@@ -123,6 +249,22 @@ class _SlidingWindowLimiter:
         # threading.Semaphore is process-wide and works across asyncio
         # to_thread-spawned threads.
         self._concurrency_sem = threading.Semaphore(self.max_concurrent)
+
+    def reconfigure(self, max_per_minute: int, max_concurrent: int) -> None:
+        """Update the rate caps live — called by init_api_config when
+        the active relay preset changes (each preset carries its own
+        RPM / concurrency). Safe to call concurrently with slot()
+        acquisitions: RPM limit check reads `self.max_per_minute` under
+        the lock, so an update lands atomically between calls. The
+        concurrency semaphore is REPLACED with a fresh one sized to the
+        new cap — in-flight holders keep the old semaphore until they
+        release it; after the swap, new acquisitions see the new cap.
+        """
+        with self._lock:
+            self.max_per_minute = int(max_per_minute)
+            if int(max_concurrent) != self.max_concurrent:
+                self.max_concurrent = int(max_concurrent)
+                self._concurrency_sem = threading.Semaphore(self.max_concurrent)
 
     def _wait_for_window(self, stage_name: str) -> None:
         """Block until our timestamp can be appended to the rolling
@@ -540,14 +682,17 @@ class BaseAgent:
         user_content = self._build_content_blocks(user_message)
         messages = [{"role": "user", "content": user_content}]
 
-        # Structured system prompt with ephemeral cache control. Anthropic
-        # caches the system portion for ~5 minutes — subsequent calls within
-        # the window pay ~10% input rate for it. Foundation + agent prompt
-        # together are ~5-15KB per agent, and we call each agent multiple
-        # times per run (strategy loop, retry rounds, batch retries), so the
-        # cache hit rate is high. Falls back to plain string when caching is
-        # disabled (e.g. for relays that 400 on cache_control).
-        if ENABLE_PROMPT_CACHING:
+        # Structured system prompt with ephemeral cache control. Cache
+        # support is a per-preset flag: new_relay might support it,
+        # old_relay might silently drop the cache_control field and
+        # just pay full price. The active preset's supports_cache flag
+        # (set in init_api_config) overrides the global
+        # ENABLE_PROMPT_CACHING constant, so switching relays via the
+        # settings page immediately adjusts this behavior.
+        _preset_supports_cache = _api_config.get(
+            "supports_cache", ENABLE_PROMPT_CACHING
+        )
+        if _preset_supports_cache:
             system_block: Any = [
                 {
                     "type": "text",
@@ -576,8 +721,18 @@ class BaseAgent:
         #
         # Older models (4.1, 4.5) don't support adaptive yet, so keep
         # the explicit budget_tokens form as fallback.
+        # Adaptive vs fixed-budget: per-preset toggle. Modern relays
+        # (and native Anthropic) pass `adaptive` straight through for
+        # Opus 4.6+ and the model picks its own budget, which Anthropic
+        # says gives measurably better results. Older relays don't
+        # recognize `adaptive` and reject the whole call; those presets
+        # set supports_adaptive_thinking=false so we send the explicit
+        # enabled+budget_tokens form instead.
+        _preset_supports_adaptive = _api_config.get(
+            "supports_adaptive_thinking", True
+        )
         if self._use_thinking:
-            if "4-6" in self.model:
+            if "4-6" in self.model and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {

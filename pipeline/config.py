@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.16.0"
+VERSION = "v0.17.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "趋势取样改搜「爆款格式」而非品牌词：vibe_hints 作为软过滤，搜查 xhs 素人爆款样本"
+VERSION_NOTES = "多中转 preset 一键切换 + 每 preset 独立配置 cache/thinking/RPM"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
