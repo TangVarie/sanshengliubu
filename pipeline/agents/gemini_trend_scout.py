@@ -204,9 +204,16 @@ async def run_trend_scout(
 
     raw_data = result.get("data")
     if not isinstance(raw_data, dict) or "_parse_error" in raw_data:
+        # Extract whatever Gemini actually said so the UI can show it.
+        # When grounding is on, Gemini often ignores JSON-mode and emits
+        # a narrative answer; surfacing the first 500 chars lets the
+        # user / developer diagnose without digging into server logs.
+        _preview = ""
+        if isinstance(raw_data, dict):
+            _preview = str(raw_data.get("_raw_text", ""))[:500]
         logger.warning(
-            "[trend_scout] output parse failed: %s",
-            str(raw_data)[:300],
+            "[trend_scout] output parse failed. Gemini raw output preview: %s",
+            _preview[:300] or "(no preview)",
         )
         return {
             "verdict": "skipped",
@@ -214,6 +221,7 @@ async def run_trend_scout(
             "queries_used": [],
             "grounding_urls": result.get("grounding_urls", []),
             "_skip_reason": "parse_error",
+            "_raw_text_preview": _preview,
             "_gemini_usage": {
                 "input_tokens": result.get("input_tokens", 0),
                 "output_tokens": result.get("output_tokens", 0),

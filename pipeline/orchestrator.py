@@ -1347,6 +1347,7 @@ class PipelineOrchestrator:
                 status="skipped",
                 output_data={
                     "_skip_reason": result.get("_skip_reason", "unknown"),
+                    "_raw_text_preview": result.get("_raw_text_preview", ""),
                     "_gemini_usage": usage,
                 },
                 tokens_used=int(usage.get("input_tokens", 0))
@@ -1463,6 +1464,7 @@ class PipelineOrchestrator:
                 output_data={
                     "_skip_reason": result.get("_skip_reason", "unknown"),
                     "queries_used": result.get("queries_used", []),
+                    "_raw_text_preview": result.get("_raw_text_preview", ""),
                     "_gemini_usage": usage,
                 },
                 tokens_used=int(usage.get("input_tokens", 0))
@@ -1752,6 +1754,7 @@ class PipelineOrchestrator:
                 status="skipped",
                 output_data={
                     "_skip_reason": result.get("_skip_reason", "unknown"),
+                    "_raw_text_preview": result.get("_raw_text_preview", ""),
                 },
                 tokens_used=int(usage.get("input_tokens", 0))
                 + int(usage.get("output_tokens", 0)),

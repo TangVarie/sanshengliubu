@@ -113,14 +113,18 @@ async def run_gemini_structure_review(
 
     parsed = result["data"]
     if not isinstance(parsed, dict) or "_parse_error" in parsed:
+        _preview = ""
+        if isinstance(parsed, dict):
+            _preview = str(parsed.get("_raw_text", ""))[:500]
         logger.warning(
             "[gemini_structure] output was not valid JSON, skipping. Raw: %s",
-            str(parsed)[:300],
+            _preview[:300] or "(no preview)",
         )
         return {
             "verdict": "skipped",
             "cells_incomplete": [],
             "_skip_reason": "parse_error",
+            "_raw_text_preview": _preview,
         }
 
     parsed.setdefault("verdict", "unknown")

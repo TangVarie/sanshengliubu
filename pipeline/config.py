@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.18.0"
+VERSION = "v0.18.1"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "支持后缀型中转（tdyun）：per-preset model_overrides + thinking_via_model_suffix"
+VERSION_NOTES = "Gemini 输出非 JSON 时 UI 展示原文前 500 字 + 提示词末尾强 JSON-only 约束"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

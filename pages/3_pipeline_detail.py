@@ -553,6 +553,17 @@ with tabs[0]:
                     "⚠️ 跳过（Gemini 未配置）——配置好 `VERTEX_EXPRESS_API_KEY` "
                     "且 `ENABLE_GEMINI_TREND_SCOUT_PRE=True` 后下次生效。"
                 )
+            elif "parse_error" in reason:
+                _raw = ts_out.get("_raw_text_preview", "")
+                st.error(
+                    f"❌ Gemini 输出非 JSON，无法解析（`{reason}`）。"
+                    "Google Search grounding 经常让 Gemini 改口用自然语言叙述。"
+                    "下面是它实际返回的前 500 字："
+                )
+                if _raw:
+                    st.code(_raw, language="text")
+                else:
+                    st.caption("（没抓到原文预览，试试 Reboot 或换 GEMINI_MODEL。）")
             else:
                 st.info(f"⏭️ 跳过：`{reason}`")
         elif ts_status == "completed":
@@ -771,11 +782,20 @@ with tabs[4]:
                                 "（常见：`gemini-2.5-pro` / `gemini-2.5-flash`）。"
                             )
                         elif "parse_error" in str(reason):
+                            _raw = sr_out.get("_raw_text_preview", "")
                             st.error(
                                 f"❌ 输出非 JSON：`{reason}`\n\n"
                                 "Gemini 返回的内容没法解析成 JSON——"
-                                "可能被安全过滤，或模型能力不够。换个模型 ID 试试。"
+                                "可能被安全过滤，或 Google Search 工具接管了响应格式。"
+                                "下面是它实际返回的前 500 字，看看它到底说了什么："
                             )
+                            if _raw:
+                                st.code(_raw, language="text")
+                            else:
+                                st.caption(
+                                    "（没抓到原文预览——可能响应完全空，"
+                                    "换个 `GEMINI_MODEL` 或关掉 `ENABLE_GEMINI_TREND_SCOUT_*` 试试。）"
+                                )
                         else:
                             st.info(f"⏭️ 跳过：`{reason}`")
                     elif sr_status == "completed":

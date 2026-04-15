@@ -135,14 +135,18 @@ async def run_reference_analyzer(
 
     raw_data = result.get("data")
     if not isinstance(raw_data, dict) or "_parse_error" in raw_data:
+        _preview = ""
+        if isinstance(raw_data, dict):
+            _preview = str(raw_data.get("_raw_text", ""))[:500]
         logger.warning(
-            "[ref_analyzer] output parse failed: %s",
-            str(raw_data)[:300],
+            "[ref_analyzer] output parse failed. Gemini raw output preview: %s",
+            _preview[:300] or "(no preview)",
         )
         return {
             "verdict": "skipped",
             "posts": [],
             "_skip_reason": "parse_error",
+            "_raw_text_preview": _preview,
             "_gemini_usage": {
                 "input_tokens": result.get("input_tokens", 0),
                 "output_tokens": result.get("output_tokens", 0),
