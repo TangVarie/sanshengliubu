@@ -114,40 +114,52 @@ def _validate_post(post: Any, required_domain: str = "xiaohongshu.com") -> dict 
 
 
 async def run_trend_scout(
-    keywords: list[str],
+    vibe_hints: list[str] | None = None,
     *,
     platform: str = "小红书",
     target_count: int = 10,
     required_domain: str = "xiaohongshu.com",
+    # Legacy alias: older callers passed `keywords` as a positional
+    # product-brand list. The new scout does NOT search brand terms
+    # (that returns software-ads + analysis instead of raw viral posts);
+    # keywords=... is accepted only as a loose soft filter and the
+    # scout's prompt explicitly tells it never to search the brand.
+    keywords: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Fetch real current posts from Google (site:xiaohongshu.com).
+    """Pull RAW CURRENT VIRAL Xiaohongshu samples as vibe-calibration
+    references for the downstream copy-writing pipeline.
+
+    **Important design note**: this used to search product/brand keywords
+    (e.g. "珂润精华液") which returned software ads + analysis articles
+    — the opposite of what we need. We want素人真实爆款 format samples:
+    the first-sentences and hooks that actually stop scrollers right
+    now, regardless of topic. So the prompt instructs Gemini to search
+    FORMAT anchors (反差 / 社死 / 身份标签 / "不是广" / reposts on weibo
+    etc.) NOT brand terms. The `vibe_hints` param is a soft preference
+    for result sorting only — demographic hints like "30 岁女性职场人" to
+    help it pick the more relevant viral example among many, never fed
+    as a direct search term.
 
     Returns:
-      {
-        "verdict": "all_pass | no_posts_found | skipped",
-        "posts": [...validated raw posts...],
-        "queries_used": [...],
-        "grounding_urls": [...actually-cited URLs from Google Search...],
-        "_skip_reason": null | "...",
-        "_gemini_usage": {...},
-      }
+      {"verdict": "all_pass | no_posts_found | skipped",
+       "posts": [...validated raw posts, possibly with _suspect_repost=True
+                 for weibo/douban etc. that quoted xhs originals...],
+       "queries_used": [...],
+       "grounding_urls": [...],
+       "_skip_reason": null | "...",
+       "_gemini_usage": {...}}
 
-    No summary fields. No trend analysis. If the scout couldn't find
-    anything usable (all results were analysis blogs, or search was
-    blocked), verdict is "no_posts_found" with an explanation in
-    _not_found_reason (passed through from the model).
+    No summary fields ever survive post-processing (see
+    _FORBIDDEN_SUMMARY_KEYS + _strip_summaries).
     """
-    if not keywords:
-        return {
-            "verdict": "skipped",
-            "posts": [],
-            "queries_used": [],
-            "grounding_urls": [],
-            "_skip_reason": "no keywords provided",
-        }
+    # Backward compat: if a caller still passes keywords=, map to vibe_hints
+    # but drop them into the prompt with the soft-filter-only semantics.
+    effective_hints = list(vibe_hints or [])
+    if keywords and not effective_hints:
+        effective_hints = list(keywords)
 
     user_payload = {
-        "keywords": keywords,
+        "vibe_hints": effective_hints,
         "platform": platform,
         "target_count": int(target_count),
     }

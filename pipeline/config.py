@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.15.3"
+VERSION = "v0.16.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "强制终止卡死任务按钮 + 自动卡死检测（≥5 分钟无活动）"
+VERSION_NOTES = "趋势取样改搜「爆款格式」而非品牌词：vibe_hints 作为软过滤，搜查 xhs 素人爆款样本"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

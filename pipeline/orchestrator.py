@@ -1383,32 +1383,39 @@ class PipelineOrchestrator:
 
     async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
         """A1: pre-secretariat trend scout. Pulls current real Xiaohongshu
-        post samples (titles + snippets verbatim) via Gemini + Google
-        Search, mutates brief['_trend_intel'] in place. Advisory-only.
+        VIRAL素人 post samples (not product-relevant; just "what's hot
+        right now") via Gemini + Google Search to calibrate downstream
+        copy writing against current platform voice. Advisory-only.
 
-        The strict contract enforced inside run_trend_scout + its prompt
-        is that output is RAW POSTS ONLY, no trend summaries — see the
-        module docstring of pipeline/agents/gemini_trend_scout.py.
+        Design note: we deliberately do NOT search product/brand
+        keywords here. Searching "珂润精华液" returns 软广 + 分析 articles
+        that have no素人 vibe at all. Instead we pass the brief's
+        target_audience snippet as a soft "vibe_hints" — the scout's
+        prompt tells Gemini to use it for sorting results (prefer viral
+        posts that feel like they target the same demographic), never
+        as a direct search term. The scout's queries are format-anchored
+        (反差 / 社死 / 身份标签 / reposts on weibo) so what comes back
+        is a set of raw current viral first-sentences we can calibrate
+        against, regardless of topic.
         """
         if not ENABLE_GEMINI_TREND_SCOUT_PRE:
             return
 
-        # Build keyword list from the brief. Priority: product_name +
-        # category; fall back to raw_materials snippet. We want high-
-        # recall terms so Google surfaces actual posts.
-        keywords = []
-        for k in ("product_name", "product_category", "core_claim"):
+        # vibe_hints: demographic/audience context used by the scout
+        # only for soft sorting of results. Never searched directly.
+        # We deliberately exclude product_name / product_category /
+        # core_claim — those lead to ads and analysis articles.
+        vibe_hints: list[str] = []
+        for k in ("target_audience", "campaign_objective"):
             v = brief.get(k)
             if v and isinstance(v, str) and v.strip():
-                keywords.append(v.strip())
-        if not keywords:
-            # Nothing specific to search — skip rather than firing a
-            # garbage query against Google.
-            logger.info(
-                "[trend_scout pre] skipping — no product_name / category / "
-                "core_claim in brief"
-            )
-            return
+                vibe_hints.append(v.strip())
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str) and item.strip():
+                        vibe_hints.append(item.strip())
+        # Empty vibe_hints is fine — the scout falls back to generic
+        # "current xhs viral" queries.
 
         platforms = brief.get("target_platforms") or []
         platform = platforms[0] if platforms else "小红书"
@@ -1417,13 +1424,13 @@ class PipelineOrchestrator:
         log = self.db.create_stage_log(
             self.run_id,
             stage_name,
-            {"keywords": keywords, "platform": platform},
+            {"vibe_hints": vibe_hints, "platform": platform},
         )
         log_id = log["id"]
 
         try:
             result = await run_trend_scout(
-                keywords,
+                vibe_hints=vibe_hints,
                 platform=platform,
                 target_count=GEMINI_TREND_SCOUT_TARGET_COUNT,
             )
@@ -1497,9 +1504,9 @@ class PipelineOrchestrator:
             + int(usage.get("output_tokens", 0)),
         )
         logger.info(
-            "[trend_scout pre] captured %d raw posts for keywords=%s",
+            "[trend_scout pre] captured %d raw viral posts for vibe_hints=%s",
             len(result.get("posts", [])),
-            keywords,
+            vibe_hints,
         )
 
     async def _run_gemini_trend_scout_post(
@@ -1543,30 +1550,32 @@ class PipelineOrchestrator:
             d_name = str(direction.get("direction_name", "")).strip()
             if not d_id:
                 return "", {}
-            # Keywords = direction name + any paradigm hint. Avoid
-            # overloading with product name here — for A2 we want
-            # direction-specific samples, not product-specific.
-            keywords: list[str] = []
+            # vibe_hints = soft context about this direction's flavor.
+            # Like the pre-scout, the scout prompt will NOT search these
+            # directly — it uses them to sort results among viral-format
+            # query returns. direction_name + paradigm tells Gemini
+            # "among all current viral xhs posts, prefer ones that
+            # match this particular flavor" without hard-filtering.
+            vibe_hints: list[str] = []
             if d_name:
-                keywords.append(d_name)
-            # Also add a couple of taxonomy hints from paradigm
+                vibe_hints.append(d_name)
             paradigm = direction.get("paradigm", "")
             if paradigm == "A_emotional_hook":
-                keywords.append("爆款笔记")
+                vibe_hints.append("情绪钩子型")
             elif paradigm == "B_meta_response":
-                keywords.append("成分党")
+                vibe_hints.append("成分党元评论体")
 
             async with semaphore:
                 stage_name = f"gemini_trend_scout_post_{d_id}"
                 log = self.db.create_stage_log(
                     self.run_id,
                     stage_name,
-                    {"direction_id": d_id, "keywords": keywords},
+                    {"direction_id": d_id, "vibe_hints": vibe_hints},
                 )
                 log_id = log["id"]
                 try:
                     result = await run_trend_scout(
-                        keywords,
+                        vibe_hints=vibe_hints,
                         platform=platform,
                         target_count=per_direction_count,
                     )
