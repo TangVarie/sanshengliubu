@@ -2,42 +2,87 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.13.1"
+VERSION = "v0.14.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "清掉价目表里的 claude-opus-4-6-thinking 残留条目"
+VERSION_NOTES = "thinking \u2713/\u2717 可见 + Gemini skip 原因可见 + 测试按钮 + MODEL_PRESET 开关（Sonnet 可选）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# All stages use the same Claude Opus model name. Whether thinking is
-# enabled is controlled per-call via the standard Anthropic API
+# All stages use the same Claude model family. Whether thinking is enabled
+# is controlled per-call via the standard Anthropic API
 # `thinking={"type":"enabled","budget_tokens":N}` parameter — see
 # THINKING_STAGES below + agents/__init__.py::_call_claude.
 #
-# Why one model name everywhere: Anthropic native, modern relay proxies,
-# and Vertex all accept the standard JSON `thinking` parameter. The old
-# convention of using a `-thinking` suffix in the model name was a
-# relay-specific routing hack; new relays + native API don't need it.
-# Keeping a single model name makes prompt caching cache across thinking
-# and non-thinking stages (same system prompt, same model = same cache key).
+# Why one model name in most presets: Anthropic native, modern relay
+# proxies, and Vertex all accept the standard JSON `thinking` parameter.
+# The old convention of using a `-thinking` suffix in the model name was
+# a relay-specific routing hack. Keeping a single model name also makes
+# prompt caching cache across thinking and non-thinking stages (same
+# system prompt + same model = same cache key).
+#
+# ── MODEL_PRESET options ─────────────────────────────────────────────
+# Change this string to switch strategy/content model split without
+# editing MODELS directly:
+#
+#   "all_opus"      (default, current behavior) — every stage on Opus.
+#                   Deepest reasoning; most expensive; Opus has a slightly
+#                   more "精致/端正" voice that some reviewers call AI-toned.
+#
+#   "content_sonnet" — Strategy + review stages stay on Opus; content-
+#                   producing stages (works_builder, vibe_critic,
+#                   vibe_rewriter) switch to Sonnet 4.6. Rationale:
+#                   Sonnet's demo output tends to read more "松弛/人味",
+#                   and critic-style tasks benefit from a lighter tone.
+#                   Cheaper + faster on the content-heavy stages.
+#                   RECOMMENDED for experimentation if output still feels
+#                   AI-toned after vibe rewriter.
+#
+#   "all_sonnet"   — Everything on Sonnet. Cheapest, fastest, but
+#                   reasoning-heavy stages (secretariat, chancellery,
+#                   chancellery_final) may produce lower-quality plans.
+#                   Mostly useful for dev loops / cost-tight pilots.
 
 OPUS_MODEL = "claude-opus-4-6"
+SONNET_MODEL = "claude-sonnet-4-6"
 
-MODELS: dict[str, str] = {
-    "crown_prince": OPUS_MODEL,
-    "secretariat": OPUS_MODEL,
-    "chancellery": OPUS_MODEL,
-    "ministry_works": OPUS_MODEL,
-    "chancellery_final": OPUS_MODEL,
-    "dispatcher": OPUS_MODEL,
-    "ministry_personnel": OPUS_MODEL,
-    "ministry_revenue": OPUS_MODEL,
-    "ministry_rites": OPUS_MODEL,
-    "ministry_war": OPUS_MODEL,
-    "ministry_justice": OPUS_MODEL,
-    "ministry_works_cell_planner": OPUS_MODEL,
-    "ministry_works_builder": OPUS_MODEL,
-    "vibe_critic": OPUS_MODEL,
-    "vibe_rewriter": OPUS_MODEL,
+MODEL_PRESET = "all_opus"
+
+_STAGE_ROLES = {
+    # Strategy / review: needs reasoning depth
+    "crown_prince": "strategy",
+    "secretariat": "strategy",
+    "chancellery": "strategy",
+    "chancellery_final": "strategy",
+    "ministry_works": "strategy",
+    # Structured planning: Opus preferred for stability
+    "dispatcher": "planning",
+    "ministry_personnel": "planning",
+    "ministry_revenue": "planning",
+    "ministry_rites": "planning",
+    "ministry_war": "planning",
+    "ministry_justice": "planning",
+    "ministry_works_cell_planner": "planning",
+    # Content generation + taste judgment: voice quality matters
+    "ministry_works_builder": "content",
+    "vibe_critic": "content",
+    "vibe_rewriter": "content",
 }
+
+
+def _resolve_models(preset: str) -> dict[str, str]:
+    """Assemble the MODELS dict from role tags + preset. Returning a dict
+    keeps consumers (logging, cost accounting, settings UI) unchanged."""
+    if preset == "all_sonnet":
+        return {k: SONNET_MODEL for k in _STAGE_ROLES}
+    if preset == "content_sonnet":
+        return {
+            k: (SONNET_MODEL if role == "content" else OPUS_MODEL)
+            for k, role in _STAGE_ROLES.items()
+        }
+    # Default / fallback: all_opus
+    return {k: OPUS_MODEL for k in _STAGE_ROLES}
+
+
+MODELS: dict[str, str] = _resolve_models(MODEL_PRESET)
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
 

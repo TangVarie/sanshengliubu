@@ -370,7 +370,19 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
         elif s == "failed":
             st.error(f"{stage_icon}\n{stage_label}")
         elif s == "skipped":
-            st.info(f"{stage_icon}\n{stage_label}")
+            # Skipped may be either (a) a resume that intentionally jumped
+            # over an already-completed stage, or (b) a Gemini advisory
+            # stage that couldn't run (not configured / API error / parse
+            # error). Surface the underlying _skip_reason when present so
+            # the user can distinguish. Abbreviate it to fit the box.
+            _skip_reason = ""
+            _out = (log or {}).get("output_data") or {}
+            if isinstance(_out, dict):
+                _skip_reason = str(_out.get("_skip_reason", ""))[:30]
+            if _skip_reason:
+                st.info(f"{stage_icon}\n{stage_label}\n_{_skip_reason}_")
+            else:
+                st.info(f"{stage_icon}\n{stage_label}")
         else:
             st.container(border=True).markdown(
                 f"<div style='text-align:center;color:#999'>{stage_icon}<br>{stage_label}</div>",
@@ -542,6 +554,74 @@ with tabs[4]:
                                 render_stage_output(bl["output_data"])
                             elif bl.get("status") == "failed":
                                 render_stage_error(bl)
+
+                # Gemini structure review (advisory, between builder and vibe).
+                # Surface the skip reason prominently when skipped — that's
+                # how the operator finds out "Gemini isn't actually running".
+                sr_log = log_map.get("ministry_works_structure_review")
+                if sr_log:
+                    st.divider()
+                    st.markdown("**🔎 Gemini 结构审**")
+                    sr_status = sr_log.get("status", "pending")
+                    sr_out = sr_log.get("output_data") or {}
+                    if sr_status == "skipped":
+                        reason = sr_out.get("_skip_reason", "unknown")
+                        if "not_configured" in str(reason):
+                            st.warning(
+                                f"⚠️ 跳过（Gemini 未配置）：`{reason}`\n\n"
+                                "检查 `.streamlit/secrets.toml` 的 "
+                                "`VERTEX_EXPRESS_API_KEY` 是否填了，"
+                                "以及 `pipeline/config.py` 的 "
+                                "`ENABLE_GEMINI_ASSIST=True`。"
+                            )
+                        elif "call_failed" in str(reason):
+                            st.error(
+                                f"❌ 调用失败：`{reason}`\n\n"
+                                "大概率是模型名 `GEMINI_MODEL` 不对（Vertex 返回 404），"
+                                "或 API key 无效、配额用光。"
+                                "去 `pipeline/config.py` 把 `GEMINI_MODEL` 改成"
+                                "你 Vertex 账户里实际可用的模型 ID "
+                                "（常见：`gemini-2.5-pro` / `gemini-2.5-flash`）。"
+                            )
+                        elif "parse_error" in str(reason):
+                            st.error(
+                                f"❌ 输出非 JSON：`{reason}`\n\n"
+                                "Gemini 返回的内容没法解析成 JSON——"
+                                "可能被安全过滤，或模型能力不够。换个模型 ID 试试。"
+                            )
+                        else:
+                            st.info(f"⏭️ 跳过：`{reason}`")
+                    elif sr_status == "completed":
+                        verdict = sr_out.get("verdict", "unknown")
+                        incomplete = sr_out.get("cells_incomplete") or []
+                        if verdict == "all_pass":
+                            st.success(
+                                f"✅ 所有 cell 结构完整 · "
+                                f"Gemini 评审通过（{len(sr_out.get('cell_reviews', []))} 条）"
+                            )
+                        elif incomplete:
+                            st.warning(
+                                f"⚠️ {len(incomplete)} 个 cell 结构不全："
+                            )
+                            for item in incomplete:
+                                cid = item.get("cell_id", "?")
+                                missing = item.get("missing_items") or []
+                                hint = item.get("revision_hint", "")
+                                with st.expander(f"📌 {cid}（缺 {len(missing)} 项）"):
+                                    if missing:
+                                        st.markdown("**缺失项：**")
+                                        for m in missing:
+                                            st.markdown(f"- {m}")
+                                    if hint:
+                                        st.markdown(f"**建议修法：** {hint}")
+                        else:
+                            st.info(f"判定：{verdict}")
+                        with st.expander("🔍 完整评审输出", expanded=False):
+                            st.json(sr_out)
+                    elif sr_status == "failed":
+                        render_stage_error(sr_log)
+                    else:
+                        st.caption(f"状态：{sr_status}")
 
 # Tab 5: Final Review
 with tabs[5]:

@@ -109,6 +109,53 @@ else:
                 "二次复核；(2) 结构审：工部构建后审查 system_prompt 的完整性。"
                 "调用失败会降级为只用 Claude 结果。"
             )
+
+            # Live ping — sends a trivial request to verify the model ID,
+            # API key, and network path all work end-to-end. Crucial for
+            # diagnosing "why does Gemini always show as skipped".
+            if st.button(
+                "🧪 测试 Gemini 连接",
+                help="实发一条最小请求到 Vertex，验证模型名/API key/网络都 OK",
+            ):
+                import time as _time
+                with st.spinner(f"正在调用 `{GEMINI_MODEL}` ..."):
+                    t0 = _time.time()
+                    try:
+                        from pipeline.agents.gemini_client import (
+                            GeminiCallFailed,
+                            GeminiNotConfigured,
+                            call_gemini_json,
+                        )
+                        result = call_gemini_json(
+                            system_prompt=(
+                                "You are a terse JSON emitter. Output exactly "
+                                '{"ok": true, "model": "<model id>"}'
+                            ),
+                            user_message='Please reply with {"ok": true}.',
+                            max_output_tokens=128,
+                        )
+                        elapsed = _time.time() - t0
+                        st.success(
+                            f"✅ 调用成功 · {elapsed:.2f}s · "
+                            f"输入 {result['input_tokens']} tok / "
+                            f"输出 {result['output_tokens']} tok · "
+                            f"费用 ${result['cost_usd']:.4f}"
+                        )
+                        st.json(result["data"])
+                    except GeminiNotConfigured as err:
+                        st.error(f"❌ 未配置：{err}")
+                    except GeminiCallFailed as err:
+                        st.error(
+                            f"❌ 调用失败：\n\n```\n{err}\n```\n\n"
+                            "**常见原因**：\n"
+                            f"- 模型名 `{GEMINI_MODEL}` 你的 Vertex 账户不可用"
+                            " → 去 `pipeline/config.py` 改 `GEMINI_MODEL`"
+                            "（推荐先试 `gemini-2.5-pro` 或 `gemini-2.5-flash`）\n"
+                            "- API key 对应的项目没开 Vertex AI API\n"
+                            "- 地区配额问题"
+                        )
+                    except Exception as err:
+                        st.error(f"❌ 未预期的错误：{type(err).__name__}: {err}")
         else:
             st.error("❌ Gemini 客户端初始化失败（`google-genai` 未装？）")
             st.caption(

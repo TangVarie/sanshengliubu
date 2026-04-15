@@ -510,14 +510,16 @@ class BaseAgent:
 
     def _call_claude(
         self, system_prompt: str, user_message: str
-    ) -> tuple[str, int, int, int, int]:
+    ) -> tuple[str, int, int, int, int, bool]:
         """Synchronous Claude API call.
 
         Returns (response_text, input_tokens, output_tokens,
-        cache_read_input_tokens, cache_creation_input_tokens). The last two
-        are 0 when caching isn't active or the backend doesn't report them
-        (common on relays that silently drop cache_control). They feed the
-        per-run cache-effectiveness probe.
+        cache_read_input_tokens, cache_creation_input_tokens,
+        thinking_fired). thinking_fired is True iff the model's response
+        actually contained a `thinking` content block. Compare against
+        self._use_thinking: if we asked for thinking but didn't get it,
+        the relay silently dropped the `thinking` JSON param — visible
+        as "thinking ✗" in the UI's model_used field.
 
         Three execution paths share the SAME kwargs construction (model,
         max_tokens, system, messages, thinking) — the historical "relay
@@ -618,7 +620,14 @@ class BaseAgent:
         cache_creation = int(
             getattr(response.usage, "cache_creation_input_tokens", 0) or 0
         )
-        return text, input_tokens, output_tokens, cache_read, cache_creation
+        return (
+            text,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            has_thinking,
+        )
 
     @staticmethod
     def _lenient_json_loads(text: str) -> dict[str, Any]:
@@ -834,11 +843,26 @@ class BaseAgent:
                     output_tokens,
                     cache_read,
                     cache_creation,
+                    thinking_fired,
                 ) = await asyncio.to_thread(
                     self._call_claude, system_prompt, user_message
                 )
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
+
+                # Build a human-readable model label that reveals thinking
+                # actually fired (or didn't) so the UI doesn't need to dig
+                # into server logs to answer "did this stage reason deeply?".
+                #  - `[thinking ✓]` — we asked for thinking AND the model
+                #    returned a thinking block
+                #  - `[thinking ✗]` — we asked for thinking but got none;
+                #    relay likely dropped the `thinking` JSON param
+                #  - no tag          — this stage doesn't use thinking
+                if self._use_thinking:
+                    _thinking_tag = " [thinking ✓]" if thinking_fired else " [thinking ✗]"
+                else:
+                    _thinking_tag = ""
+                model_label = f"{self.model}{_thinking_tag}"
 
                 # Feed the per-run budget tracker. Raises RunBudgetExceededError
                 # if we've blown through MAX_TOKENS_PER_RUN — caught at the
@@ -865,7 +889,7 @@ class BaseAgent:
                         log_id,
                         status="needs_input",
                         output_data=output,
-                        model_used=self.model,
+                        model_used=model_label,
                         tokens_used=total_input_tokens + total_output_tokens,
                         duration_seconds=round(duration, 2),
                     )
@@ -881,7 +905,7 @@ class BaseAgent:
                     log_id,
                     status="completed",
                     output_data=output,
-                    model_used=self.model,
+                    model_used=model_label,
                     tokens_used=total_input_tokens + total_output_tokens,
                     duration_seconds=round(duration, 2),
                 )
