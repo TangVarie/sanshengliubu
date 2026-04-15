@@ -22,13 +22,23 @@ st.info(f"**当前版本** `{VERSION}` · {VERSION_DATE} — {VERSION_NOTES}")
 st.subheader("连接状态")
 
 # Auto-detect active mode: presence of GCP_PROJECT_ID means Vertex; else
-# fall back to direct/relay. This matches init_api_config()'s logic in
-# pipeline/agents/__init__.py so the page never lies about which backend
-# will actually be used at runtime.
+# fall back to direct/relay. Direct/relay mode is considered configured
+# when EITHER a [claude_relay_presets.*] section exists OR the legacy
+# top-level ANTHROPIC_API_KEY is set (backward compat path).
 _gcp_project = st.secrets.get("GCP_PROJECT_ID", "")
 _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 _base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
-_active_mode = "vertex" if _gcp_project else ("direct" if _api_key else "none")
+# Detect new preset format — any non-empty claude_relay_presets dict
+# counts as "Claude configured" even without top-level ANTHROPIC_API_KEY.
+try:
+    _relay_presets_raw = st.secrets.get("claude_relay_presets") or {}
+    _has_relay_presets = bool(dict(_relay_presets_raw)) if _relay_presets_raw else False
+except Exception:
+    _has_relay_presets = False
+_active_mode = (
+    "vertex" if _gcp_project
+    else ("direct" if (_api_key or _has_relay_presets) else "none")
+)
 
 col1, col2 = st.columns(2)
 
@@ -42,17 +52,30 @@ with col1:
             st.caption("🔑 Service Account 凭证已就绪")
         else:
             st.caption("🔑 回退到 ADC（gcloud auth / env 变量）")
-        if _api_key:
+        if _api_key or _has_relay_presets:
             st.warning(
-                "⚠️ 同时检测到 `ANTHROPIC_API_KEY`，但 Vertex 模式优先，它会被忽略。"
+                "⚠️ 同时检测到 Anthropic 配置，但 Vertex 模式优先，它会被忽略。"
                 "要切回 Anthropic 模式请删掉 `GCP_PROJECT_ID` 再重启。"
             )
     elif _active_mode == "direct":
-        st.success(f"✅ Anthropic 直连/中转 (***{_api_key[-4:]})")
-        if _base_url:
-            st.info(f"🔀 中转：`{_base_url}`")
+        if _has_relay_presets:
+            # Multi-preset mode — let the "preset switcher" section below
+            # show the details. Here we just confirm the mode is active.
+            try:
+                _preset_count = len(dict(_relay_presets_raw))
+            except Exception:
+                _preset_count = "?"
+            st.success(
+                f"✅ Anthropic 直连/中转（多 preset · 共 {_preset_count} 个）"
+            )
+            st.caption("下方「🔀 中转 Preset 切换」可以一键切换具体 preset。")
         else:
-            st.caption("直连 Anthropic 官方 API")
+            # Legacy single top-level key mode
+            st.success(f"✅ Anthropic 直连/中转 (***{_api_key[-4:]})")
+            if _base_url:
+                st.info(f"🔀 中转：`{_base_url}`")
+            else:
+                st.caption("直连 Anthropic 官方 API")
     else:
         st.error("❌ 未配置")
         st.caption(

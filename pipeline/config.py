@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.17.1"
+VERSION = "v0.17.2"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "缓存默认 on + 自动 400 兜底：cache_control 不支持的中转会自动降级而不挂"
+VERSION_NOTES = "修 Settings 页识别 claude_relay_presets 新格式（之前误判为「未配置」）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
