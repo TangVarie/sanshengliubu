@@ -745,14 +745,47 @@ class BaseAgent:
         # CLAUDE_RPM_LIMIT (sustained) and CLAUDE_MAX_CONCURRENT (peak).
         # The limiter is held for the full call duration to enforce the
         # concurrency cap correctly.
+        #
+        # Cache-control safety net: some relays silently ignore the
+        # cache_control field, others 400 on it. We default to sending
+        # it ("万一命中了呢"), but if the backend rejects it specifically
+        # with a 400 containing "cache_control", auto-disable caching
+        # for this process and retry ONCE with plain-string system.
+        # This means a new relay-switch doesn't require a config commit
+        # just to find out whether caching works.
         limiter = _get_active_limiter()
-        if limiter is not None:
-            with limiter.slot(self.stage_name):
-                with client.messages.stream(**kwargs) as stream:
-                    response = stream.get_final_message()
-        else:
-            with client.messages.stream(**kwargs) as stream:
-                response = stream.get_final_message()
+
+        def _do_stream(call_kwargs: dict[str, Any]):
+            if limiter is not None:
+                with limiter.slot(self.stage_name):
+                    with client.messages.stream(**call_kwargs) as stream:
+                        return stream.get_final_message()
+            with client.messages.stream(**call_kwargs) as stream:
+                return stream.get_final_message()
+
+        try:
+            response = _do_stream(kwargs)
+        except anthropic.BadRequestError as e:
+            err_text = str(e)
+            is_cache_fault = (
+                _preset_supports_cache
+                and "cache_control" in err_text.lower()
+            )
+            if is_cache_fault:
+                logger.warning(
+                    "[cache-fallback] backend rejected cache_control with 400, "
+                    "auto-disabling caching for this process and retrying. "
+                    "Error: %s",
+                    err_text[:300],
+                )
+                # Flip the flag for the whole process so subsequent calls
+                # in this Streamlit instance don't keep banging into the
+                # same 400. Config files stay unchanged.
+                _api_config["supports_cache"] = False
+                kwargs["system"] = system_prompt  # plain string, no cache
+                response = _do_stream(kwargs)
+            else:
+                raise
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""

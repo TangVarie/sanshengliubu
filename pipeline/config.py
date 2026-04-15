@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.17.0"
+VERSION = "v0.17.1"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "多中转 preset 一键切换 + 每 preset 独立配置 cache/thinking/RPM"
+VERSION_NOTES = "缓存默认 on + 自动 400 兜底：cache_control 不支持的中转会自动降级而不挂"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
