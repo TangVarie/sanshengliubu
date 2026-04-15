@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.13.0"
-VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "适配新中转站：JSON thinking 参数 + 滑动窗口限速（15 RPM / 16 并发）"
+VERSION = "v0.13.1"
+VERSION_DATE = "2026-04-15"
+VERSION_NOTES = "清掉价目表里的 claude-opus-4-6-thinking 残留条目"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude Opus model name. Whether thinking is
@@ -223,14 +223,12 @@ ENABLE_PROMPT_CACHING = True
 
 COST_PER_1M_INPUT: dict[str, float] = {
     "claude-opus-4-6": 15.0,
-    "claude-opus-4-6-thinking": 15.0,
     "claude-opus-4-1": 5.0,
     "claude-sonnet-4-6": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
     "claude-opus-4-6": 75.0,
-    "claude-opus-4-6-thinking": 75.0,
     "claude-opus-4-1": 25.0,
     "claude-sonnet-4-6": 15.0,
 }
