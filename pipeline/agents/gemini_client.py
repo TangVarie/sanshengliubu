@@ -115,6 +115,64 @@ def is_available() -> bool:
         return False
 
 
+def list_available_models() -> list[dict[str, Any]]:
+    """Call the Gemini ListModels API. Returns a list of dicts, each:
+      {"id": "gemini-2.5-pro",
+       "display_name": "Gemini 2.5 Pro",
+       "input_token_limit": 2000000,
+       "output_token_limit": 8192,
+       "supported_methods": ["generateContent", ...]}
+
+    Used by the Settings page's diagnostic button to answer "what's
+    actually callable with this API key". Helps the user pick a
+    GEMINI_MODEL value that their account can reach, instead of
+    trial-and-error on the pipeline.
+
+    Raises GeminiNotConfigured / GeminiCallFailed on errors so the
+    caller can distinguish "you didn't set it up" from "the API
+    rejected the request".
+    """
+    client = _get_client()
+    try:
+        raw = list(client.models.list())
+    except Exception as e:
+        raise GeminiCallFailed(
+            f"ListModels call failed: {type(e).__name__}: {e}"
+        ) from e
+
+    out: list[dict[str, Any]] = []
+    for m in raw:
+        name = getattr(m, "name", "") or ""
+        # Normalize: the API returns "models/gemini-2.5-pro"; strip prefix.
+        short_id = name.split("/", 1)[1] if "/" in name else name
+        out.append(
+            {
+                "id": short_id,
+                "display_name": getattr(m, "display_name", "") or short_id,
+                "input_token_limit": int(
+                    getattr(m, "input_token_limit", 0) or 0
+                ),
+                "output_token_limit": int(
+                    getattr(m, "output_token_limit", 0) or 0
+                ),
+                "supported_methods": list(
+                    getattr(m, "supported_actions", None)
+                    or getattr(m, "supported_generation_methods", None)
+                    or []
+                ),
+            }
+        )
+    # Put gemini-* first, grouped by rough version (2.5 > 2.0 > 1.5) so
+    # the UI puts the most relevant models at the top.
+    out.sort(
+        key=lambda r: (
+            0 if r["id"].startswith("gemini-") else 1,
+            r["id"],
+        )
+    )
+    return out
+
+
 def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
     """Same formula as _estimate_call_cost_usd in agents/__init__.py but
     hard-wired to Gemini rates. Kept local so Gemini pricing changes

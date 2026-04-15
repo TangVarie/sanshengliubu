@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.14.0"
+VERSION = "v0.14.1"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "thinking \u2713/\u2717 可见 + Gemini skip 原因可见 + 测试按钮 + MODEL_PRESET 开关（Sonnet 可选）"
+VERSION_NOTES = "adaptive thinking 全路径生效 + ListModels 按钮 + 默认切 content_sonnet"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -44,7 +44,7 @@ VERSION_NOTES = "thinking \u2713/\u2717 可见 + Gemini skip 原因可见 + 测�
 OPUS_MODEL = "claude-opus-4-6"
 SONNET_MODEL = "claude-sonnet-4-6"
 
-MODEL_PRESET = "all_opus"
+MODEL_PRESET = "content_sonnet"
 
 _STAGE_ROLES = {
     # Strategy / review: needs reasoning depth

@@ -567,11 +567,17 @@ class BaseAgent:
 
         # Thinking control via standard Anthropic JSON `thinking` field.
         # Works on Anthropic native, modern relays, and Vertex.
+        #
+        # Opus 4.6+ → adaptive (server picks budget). Per Anthropic's own
+        # deprecation notice: `thinking.type=enabled` with a fixed
+        # budget_tokens is deprecated for 4.6-class models and gives
+        # measurably worse results than adaptive in their testing. See
+        # https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+        #
+        # Older models (4.1, 4.5) don't support adaptive yet, so keep
+        # the explicit budget_tokens form as fallback.
         if self._use_thinking:
-            if is_vertex and "4-6" in self.model:
-                # Vertex Opus 4.6 supports adaptive thinking — let the
-                # server pick the budget. Cleaner / cheaper than a fixed
-                # budget when the prompt sometimes needs less reasoning.
+            if "4-6" in self.model:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {

@@ -156,6 +156,68 @@ else:
                         )
                     except Exception as err:
                         st.error(f"❌ 未预期的错误：{type(err).__name__}: {err}")
+
+            # List models — answers "what models can this API key actually
+            # call" without needing to trial-and-error through pipeline runs.
+            if st.button(
+                "📋 列出可用 Gemini 模型",
+                help=(
+                    "调用 ListModels 接口，显示你这个 API key 能访问的所有"
+                    "模型。复制其中一个模型 ID 填到 pipeline/config.py 的 "
+                    "GEMINI_MODEL 即可切换。"
+                ),
+            ):
+                with st.spinner("正在拉取模型列表 ..."):
+                    try:
+                        from pipeline.agents.gemini_client import (
+                            GeminiCallFailed,
+                            GeminiNotConfigured,
+                            list_available_models,
+                        )
+                        models = list_available_models()
+                        if not models:
+                            st.warning("⚠️ ListModels 返回空列表——key 可能有权限问题。")
+                        else:
+                            # Flag whether the currently configured GEMINI_MODEL
+                            # is actually in the list.
+                            available_ids = {m["id"] for m in models}
+                            current_ok = GEMINI_MODEL in available_ids
+                            if current_ok:
+                                st.success(
+                                    f"✅ 当前配置的 `{GEMINI_MODEL}` "
+                                    f"在可用列表里（共 {len(models)} 个模型）"
+                                )
+                            else:
+                                st.warning(
+                                    f"⚠️ 当前配置 `{GEMINI_MODEL}` **不在**可用列表里——"
+                                    f"这就是为什么 Gemini 总是 skipped。"
+                                    f"从下表挑一个支持 `generateContent` 的模型 ID，"
+                                    f"改 `pipeline/config.py` 里的 `GEMINI_MODEL`。"
+                                )
+                            # Render compact table — most relevant columns only
+                            rows = [
+                                {
+                                    "Model ID (填到 GEMINI_MODEL)": m["id"],
+                                    "Display Name": m["display_name"],
+                                    "Input tokens": f"{m['input_token_limit']:,}"
+                                    if m["input_token_limit"]
+                                    else "?",
+                                    "Output tokens": f"{m['output_token_limit']:,}"
+                                    if m["output_token_limit"]
+                                    else "?",
+                                    "Methods": ", ".join(m["supported_methods"])
+                                    if m["supported_methods"]
+                                    else "(unknown)",
+                                }
+                                for m in models
+                            ]
+                            st.dataframe(rows, use_container_width=True)
+                    except GeminiNotConfigured as err:
+                        st.error(f"❌ 未配置：{err}")
+                    except GeminiCallFailed as err:
+                        st.error(f"❌ ListModels 失败：\n\n```\n{err}\n```")
+                    except Exception as err:
+                        st.error(f"❌ 未预期的错误：{type(err).__name__}: {err}")
         else:
             st.error("❌ Gemini 客户端初始化失败（`google-genai` 未装？）")
             st.caption(
