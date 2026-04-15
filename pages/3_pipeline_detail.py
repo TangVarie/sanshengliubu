@@ -263,6 +263,7 @@ for log in stage_logs:
 
 STAGE_DISPLAY_NAMES = {
     "crown_prince": "太子",
+    "gemini_reference_analyzer": "参考帖子·Gemini",
     "gemini_trend_scout_pre": "趋势取样·Gemini",
     "gemini_trend_scout_post": "网感对标·Gemini",
     "secretariat": "中书省",

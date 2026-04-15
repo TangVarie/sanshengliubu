@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.15.0"
+VERSION = "v0.15.1"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "趋势取样：Gemini+Google 搜 site:xiaohongshu.com 原文帖子，注入 secretariat"
+VERSION_NOTES = "A2 终审后每方向对标帖子 + B 用户贴 URL 参考帖子抓取，全部 advisory"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -315,11 +315,16 @@ POLL_INTERVAL_SECONDS = 3
 
 PIPELINE_STAGES = [
     ("crown_prince", "太子", "📋"),
-    # advisory-only (Gemini). Skipped if Gemini isn't configured.
-    # Runs between crown_prince and secretariat: pulls real current
-    # Xiaohongshu post samples via Google Search, injects raw titles +
-    # snippets into brief._trend_intel so secretariat's strategy is
-    # calibrated against concrete current examples, not abstract guesses.
+    # Advisory-only (Gemini). Skipped if user didn't paste URLs on
+    # page 2 OR if Gemini isn't configured. Fetches user-specified
+    # xiaohongshu post URLs via url_context — higher-signal than
+    # keyword search because the user directly picked the references.
+    ("gemini_reference_analyzer", "参考帖子·Gemini", "🔗"),
+    # Advisory-only (Gemini). Skipped if Gemini isn't configured.
+    # Pulls real current Xiaohongshu post samples via Google Search
+    # (site:xiaohongshu.com), injects raw titles + snippets into
+    # brief._trend_intel so secretariat's strategy is calibrated
+    # against concrete current examples, not abstract guesses.
     ("gemini_trend_scout_pre", "趋势取样·Gemini", "🔭"),
     ("secretariat", "中书省", "📜"),
     ("chancellery", "门下省", "🔍"),

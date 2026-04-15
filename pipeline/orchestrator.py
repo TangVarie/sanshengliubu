@@ -40,6 +40,7 @@ from pipeline.agents.gemini_structure_reviewer import (
     format_revision_hints as _format_gemini_structure_hints,
     run_gemini_structure_review,
 )
+from pipeline.agents.gemini_reference_analyzer import run_reference_analyzer
 from pipeline.agents.gemini_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -271,6 +272,15 @@ class PipelineOrchestrator:
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
                 self.db.update_project(self.project_id, brief=structured_brief)
 
+            # 1a. User-pasted reference posts (B) — if page 2 recorded
+            # any xiaohongshu.com URLs onto project.brief._reference_post_urls,
+            # ask Gemini to fetch each via url_context and attach the
+            # results to structured_brief._reference_posts for downstream
+            # strategy use. Runs before trend scout because user-specified
+            # references are higher-signal than generic keyword search.
+            # Advisory-only.
+            await self._run_gemini_reference_analyzer(structured_brief)
+
             # 1b. Gemini 趋势取样（advisory, A1）— 在策略规划之前拉一批当前
             # 平台的真实帖子（标题 + snippet 原文），注入到 structured_brief
             # 的 _trend_intel 字段。这些是**原文样本**不是趋势分析。
@@ -413,6 +423,13 @@ class PipelineOrchestrator:
                             "[chancellery_final] synthesized revision_instructions "
                             "from review_dimensions + suggestions"
                         )
+
+            # 6.9. Gemini 网感对标（advisory, A2）— 为每个 direction 拉一批
+            # 当前小红书真实帖子，存到 final_system._per_direction_references
+            # 让用户在产出页做"我的 demo vs 真实爆款"的肉眼对比。不改变
+            # prompt_matrix 的内容——纯观察。跑在 save_output 之前好让
+            # references 一起持久化。
+            await self._run_gemini_trend_scout_post(final_system, plan)
 
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
@@ -1267,6 +1284,103 @@ class PipelineOrchestrator:
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
         }
 
+    async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
+        """B: fetch user-pasted xiaohongshu post URLs via Gemini url_context.
+
+        URL list is pulled from either:
+          - project.brief._reference_post_urls (set by page 2 at create
+            time)
+          - brief._reference_post_urls (after crown_prince may have moved
+            it into structured brief)
+
+        Results land on brief['_reference_posts'] as raw per-URL records
+        with fetch_status, so downstream consumers can tell which posts
+        actually got content vs hit the login wall.
+        """
+        # Pull URLs from either pre- or post-crown_prince brief location.
+        project = self.db.get_project(self.project_id) or {}
+        pre_brief = project.get("brief") or {}
+        urls = (
+            brief.get("_reference_post_urls")
+            or pre_brief.get("_reference_post_urls")
+            or []
+        )
+        urls = [u for u in urls if isinstance(u, str) and u.strip()]
+        if not urls:
+            return
+
+        stage_name = "gemini_reference_analyzer"
+        log = self.db.create_stage_log(
+            self.run_id,
+            stage_name,
+            {"url_count": len(urls)},
+        )
+        log_id = log["id"]
+
+        try:
+            result = await run_reference_analyzer(urls)
+        except Exception as e:
+            logger.warning(
+                "[ref_analyzer] unexpected exception: %r", e
+            )
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={"_skip_reason": f"unexpected_exception: {e}"},
+            )
+            return
+
+        usage = result.get("_gemini_usage") or {}
+        if usage:
+            accumulate_auxiliary_cost(
+                self.run_id,
+                cost_usd=float(usage.get("cost_usd", 0.0)),
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                source="gemini_reference_analyzer",
+            )
+
+        verdict = result.get("verdict", "skipped")
+        if verdict == "skipped":
+            self.db.update_stage_log(
+                log_id,
+                status="skipped",
+                output_data={
+                    "_skip_reason": result.get("_skip_reason", "unknown"),
+                    "_gemini_usage": usage,
+                },
+                tokens_used=int(usage.get("input_tokens", 0))
+                + int(usage.get("output_tokens", 0)),
+                model_used=usage.get("model"),
+            )
+            return
+
+        brief["_reference_posts"] = {
+            "posts": result.get("posts", []),
+            "summary_stats": result.get("_summary_stats", {}),
+            "verdict": verdict,
+        }
+        self.db.update_project(self.project_id, brief=brief)
+
+        self.db.update_stage_log(
+            log_id,
+            status="completed",
+            output_data={
+                "verdict": verdict,
+                "posts": result.get("posts", []),
+                "_summary_stats": result.get("_summary_stats", {}),
+            },
+            model_used=usage.get("model"),
+            tokens_used=int(usage.get("input_tokens", 0))
+            + int(usage.get("output_tokens", 0)),
+        )
+        logger.info(
+            "[ref_analyzer] fetched %d/%d user-pasted references (verdict=%s)",
+            len(result.get("posts", [])),
+            len(urls),
+            verdict,
+        )
+
     async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
         """A1: pre-secretariat trend scout. Pulls current real Xiaohongshu
         post samples (titles + snippets verbatim) via Gemini + Google
@@ -1387,6 +1501,157 @@ class PipelineOrchestrator:
             len(result.get("posts", [])),
             keywords,
         )
+
+    async def _run_gemini_trend_scout_post(
+        self, final_system: dict, plan: dict
+    ) -> None:
+        """A2: per-direction scout after final review. For each tactical
+        direction in the strategic plan, pull 5 real current Xiaohongshu
+        posts matching that direction's theme. Result lands on
+        final_system['_per_direction_references'][direction_id] as raw
+        posts — advisory only, no prompt-matrix mutation.
+
+        Runs in parallel per direction (bounded concurrency) because
+        each direction is an independent Gemini call.
+
+        Skipped wholesale if ENABLE_GEMINI_TREND_SCOUT_POST=False or
+        Gemini's unavailable. One stage_log per direction so the UI
+        can display status independently.
+        """
+        if not ENABLE_GEMINI_TREND_SCOUT_POST:
+            return
+
+        directions = plan.get("tactical_directions") or []
+        if not directions:
+            logger.info(
+                "[trend_scout post] skipping — no tactical_directions in plan"
+            )
+            return
+
+        platforms = plan.get("target_platforms") or []
+        platform = platforms[0] if platforms else "小红书"
+
+        # Target per-direction sample count — keep smaller than pre (10)
+        # because we hit this once per direction, and too many samples
+        # overwhelm the UI comparison.
+        per_direction_count = min(GEMINI_TREND_SCOUT_TARGET_COUNT, 5)
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def _scout_one(direction: dict) -> tuple[str, dict]:
+            d_id = str(direction.get("direction_id", "")).strip()
+            d_name = str(direction.get("direction_name", "")).strip()
+            if not d_id:
+                return "", {}
+            # Keywords = direction name + any paradigm hint. Avoid
+            # overloading with product name here — for A2 we want
+            # direction-specific samples, not product-specific.
+            keywords: list[str] = []
+            if d_name:
+                keywords.append(d_name)
+            # Also add a couple of taxonomy hints from paradigm
+            paradigm = direction.get("paradigm", "")
+            if paradigm == "A_emotional_hook":
+                keywords.append("爆款笔记")
+            elif paradigm == "B_meta_response":
+                keywords.append("成分党")
+
+            async with semaphore:
+                stage_name = f"gemini_trend_scout_post_{d_id}"
+                log = self.db.create_stage_log(
+                    self.run_id,
+                    stage_name,
+                    {"direction_id": d_id, "keywords": keywords},
+                )
+                log_id = log["id"]
+                try:
+                    result = await run_trend_scout(
+                        keywords,
+                        platform=platform,
+                        target_count=per_direction_count,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[trend_scout post/%s] unexpected exception: %r",
+                        d_id,
+                        e,
+                    )
+                    self.db.update_stage_log(
+                        log_id,
+                        status="skipped",
+                        output_data={
+                            "_skip_reason": f"unexpected_exception: {e}"
+                        },
+                    )
+                    return d_id, {}
+
+                usage = result.get("_gemini_usage") or {}
+                if usage:
+                    accumulate_auxiliary_cost(
+                        self.run_id,
+                        cost_usd=float(usage.get("cost_usd", 0.0)),
+                        input_tokens=int(usage.get("input_tokens", 0)),
+                        output_tokens=int(usage.get("output_tokens", 0)),
+                        source="gemini_trend_scout_post",
+                    )
+
+                verdict = result.get("verdict", "skipped")
+                if verdict == "skipped":
+                    self.db.update_stage_log(
+                        log_id,
+                        status="skipped",
+                        output_data={
+                            "_skip_reason": result.get(
+                                "_skip_reason", "unknown"
+                            ),
+                            "_gemini_usage": usage,
+                        },
+                        tokens_used=int(usage.get("input_tokens", 0))
+                        + int(usage.get("output_tokens", 0)),
+                        model_used=usage.get("model"),
+                    )
+                    return d_id, {}
+
+                self.db.update_stage_log(
+                    log_id,
+                    status="completed",
+                    output_data={
+                        "verdict": verdict,
+                        "direction_id": d_id,
+                        "direction_name": d_name,
+                        "posts": result.get("posts", []),
+                        "queries_used": result.get("queries_used", []),
+                        "grounding_urls": result.get("grounding_urls", []),
+                        "_not_found_reason": result.get(
+                            "_not_found_reason"
+                        ),
+                    },
+                    model_used=usage.get("model"),
+                    tokens_used=int(usage.get("input_tokens", 0))
+                    + int(usage.get("output_tokens", 0)),
+                )
+                return d_id, {
+                    "direction_id": d_id,
+                    "direction_name": d_name,
+                    "posts": result.get("posts", []),
+                    "queries_used": result.get("queries_used", []),
+                }
+
+        results = await asyncio.gather(
+            *[_scout_one(d) for d in directions], return_exceptions=False
+        )
+        per_direction: dict[str, dict] = {}
+        for d_id, data in results:
+            if d_id and data:
+                per_direction[d_id] = data
+
+        if per_direction:
+            final_system["_per_direction_references"] = per_direction
+            logger.info(
+                "[trend_scout post] captured references for %d directions: %s",
+                len(per_direction),
+                sorted(per_direction.keys()),
+            )
 
     async def _run_gemini_structure_review_stage(
         self, final_system: dict

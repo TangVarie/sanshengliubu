@@ -96,6 +96,32 @@ if matrix:
                     if rewrite_summary:
                         st.info(f"🎯 网感重写：{rewrite_summary}")
 
+                    # A2: per-direction reference posts (Gemini pulled
+                    # real current Xiaohongshu content with same direction
+                    # theme). Side-by-side comparison anchor — did we
+                    # hit the right vibe or not?
+                    _refs = (prompt_system.get("_per_direction_references") or {})
+                    _cell_refs = _refs.get(cell.get("direction_id", ""), {})
+                    _ref_posts = _cell_refs.get("posts") or []
+                    if _ref_posts:
+                        st.markdown(
+                            "**🔭 对标参考**（Gemini 搜到的当前小红书真实同方向帖子）"
+                        )
+                        st.caption(
+                            "对比我们的 demo 跟下面这些真人帖子的第一句/场景感——"
+                            "如果差距很大，考虑点「应用修订意见」重跑工部。"
+                        )
+                        for rp in _ref_posts:
+                            title = rp.get("title") or "(无标题)"
+                            snippet = rp.get("snippet") or ""
+                            url = rp.get("url", "")
+                            flag = " ⚠️ 疑似分析文" if rp.get("_suspect_analysis") else ""
+                            st.markdown(f"- **《{title}》**{flag}")
+                            if snippet:
+                                st.caption(snippet)
+                            if url:
+                                st.caption(f"→ [{url}]({url})")
+
 elif templates:
     # Legacy: direction-based display for old project data
     st.subheader("Prompt 模板")

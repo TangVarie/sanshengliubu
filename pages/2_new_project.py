@@ -99,6 +99,26 @@ with tab_new:
         key="new_text",
     )
 
+    # B: user-paste reference post URLs. Gemini later tries to fetch
+    # each URL via url_context + multimodal cover analysis; results
+    # enrich the brief. Advisory, fails-open.
+    st.markdown("#### 参考帖子（可选）")
+    ref_urls_new = st.text_area(
+        "贴小红书帖子 URL，每行一个。最多 10 条。",
+        height=100,
+        placeholder=(
+            "https://www.xiaohongshu.com/explore/xxx\n"
+            "https://www.xiaohongshu.com/explore/yyy\n"
+            "..."
+        ),
+        key="new_ref_urls",
+        help=(
+            "Gemini 会尝试抓取这些帖子的封面 + 正文（尽力而为，小红书页面可能需要登录）。"
+            "比「自动搜索趋势」更精准——你直接指定要对标谁。可以和上面的"
+            "「自动趋势取样」并存。"
+        ),
+    )
+
     if st.button("🚀 启动流水线", type="primary", use_container_width=True, key="btn_new"):
         if not product_name:
             st.error("请填写产品名称。")
@@ -117,16 +137,36 @@ with tab_new:
             full_text += f"\n{free_text_new}"
             full_text += process_uploaded_files(files_new)
 
+            # Parse user-pasted reference URLs. Keep only 小红书 URLs;
+            # cap at 10 to avoid runaway Gemini costs.
+            _ref_urls: list[str] = []
+            for _raw in (ref_urls_new or "").splitlines():
+                _u = _raw.strip()
+                if "xiaohongshu.com" in _u and _u.startswith("http"):
+                    _ref_urls.append(_u)
+            _ref_urls = _ref_urls[:10]
+
             try:
                 from db.supabase_client import SupabaseClient
                 from pipeline.orchestrator import start_pipeline_in_background
                 from pipeline.agents import init_api_config
                 db = SupabaseClient.get_instance()
                 project = db.create_project(name=product_name, free_text=full_text, task_type="new_system")
+                # Persist pasted reference URLs on the project's brief so
+                # the orchestrator's reference-analyzer stage can pick them
+                # up after crown_prince structures the brief.
+                if _ref_urls:
+                    db.update_project(
+                        project["id"],
+                        brief={"_reference_post_urls": _ref_urls},
+                    )
                 run = db.create_pipeline_run(project["id"])
                 init_api_config()
                 start_pipeline_in_background(project["id"], run["id"], db)
-                st.success("✅ 流水线已启动！")
+                st.success(
+                    "✅ 流水线已启动！"
+                    + (f" 已记录 {len(_ref_urls)} 条参考帖子 URL。" if _ref_urls else "")
+                )
                 st.session_state["current_project_id"] = project["id"]
                 st.query_params["project_id"] = project["id"]
                 st.switch_page("pages/3_pipeline_detail.py")
