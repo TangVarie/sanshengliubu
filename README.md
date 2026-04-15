@@ -113,7 +113,7 @@ VERTEX_EXPRESS_API_KEY = "AIzaSy..."
 
 开关和模型在 `pipeline/config.py` 里：
 - `ENABLE_GEMINI_ASSIST = True`（默认开）
-- `GEMINI_MODEL = "gemini-3-1-pro-preview"`（替换成你账户里能用的 ID；常见可选：`gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`）
+- `GEMINI_MODEL = "gemini-3-pro-preview"`（用 Settings 页的"📋 列出可用 Gemini 模型"按钮先确认你这个 key 能访问到；常见可选：`gemini-3-pro-preview` / `gemini-3-flash-preview` / `gemini-2.5-pro` / `gemini-2.5-flash`）
 
 Gemini 做两件事：
 1. **网感二审**：Claude critic 判 pass 的 cell 再过一次 Gemini；任一判 fail → 进重写

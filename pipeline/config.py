@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.14.1"
+VERSION = "v0.14.2"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "adaptive thinking 全路径生效 + ListModels 按钮 + 默认切 content_sonnet"
+VERSION_NOTES = "修正 GEMINI_MODEL 拼写：gemini-3-1-pro-preview（不存在）→ gemini-3-pro-preview"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -232,12 +232,14 @@ MAX_TOKENS_PER_RUN = 2_000_000
 # Secrets.toml field: VERTEX_EXPRESS_API_KEY.
 ENABLE_GEMINI_ASSIST = True
 
-# Model identifier. The value below is what the user requested; if Vertex
-# returns 404 model-not-found, replace with an ID you can actually call
-# (e.g. "gemini-2.5-pro" / "gemini-2.5-flash" / "gemini-2.5-flash-lite").
-# Check available models at
-# https://cloud.google.com/vertex-ai/generative-ai/docs/models
-GEMINI_MODEL = "gemini-3-1-pro-preview"
+# Model identifier. Must be in your Vertex Express account's accessible
+# model list — use the "📋 列出可用 Gemini 模型" button on the Settings
+# page to see exactly what your key can call. Common picks:
+#   - gemini-3-pro-preview      (latest Gemini 3 Pro preview, top quality)
+#   - gemini-3-flash-preview    (fast + cheap Gemini 3 variant)
+#   - gemini-2.5-pro            (stable, always available)
+#   - gemini-2.5-flash          (cheapest option, fine for critic role)
+GEMINI_MODEL = "gemini-3-pro-preview"
 
 # Max output tokens per Gemini call. Gemini's output cap is per-model;
 # 8K is safe across 2.5 Pro and most preview tiers.
