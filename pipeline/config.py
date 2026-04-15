@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.14.2"
+VERSION = "v0.14.3"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "修正 GEMINI_MODEL 拼写：gemini-3-1-pro-preview（不存在）→ gemini-3-pro-preview"
+VERSION_NOTES = "再次修正 GEMINI_MODEL：Google 用点号分版本号，正确 ID 是 gemini-3.1-pro-preview"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -234,12 +234,18 @@ ENABLE_GEMINI_ASSIST = True
 
 # Model identifier. Must be in your Vertex Express account's accessible
 # model list — use the "📋 列出可用 Gemini 模型" button on the Settings
-# page to see exactly what your key can call. Common picks:
-#   - gemini-3-pro-preview      (latest Gemini 3 Pro preview, top quality)
-#   - gemini-3-flash-preview    (fast + cheap Gemini 3 variant)
-#   - gemini-2.5-pro            (stable, always available)
-#   - gemini-2.5-flash          (cheapest option, fine for critic role)
-GEMINI_MODEL = "gemini-3-pro-preview"
+# page to see exactly what your key can call.
+#
+# NOTE: Google uses DOTS for decimal version numbers (gemini-2.5-pro,
+# gemini-3.1-pro-preview), not dashes. `gemini-3-1-...` is wrong.
+#
+# Common picks:
+#   - gemini-3.1-pro-preview        (latest Gemini 3.1 Pro preview)
+#   - gemini-3.1-pro-preview-customtools  (same + tool-use features)
+#   - gemini-3-pro-preview          (earlier Gemini 3 Pro preview)
+#   - gemini-2.5-pro                (stable, widely available)
+#   - gemini-2.5-flash              (cheapest, fine for critic role)
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 # Max output tokens per Gemini call. Gemini's output cap is per-model;
 # 8K is safe across 2.5 Pro and most preview tiers.
