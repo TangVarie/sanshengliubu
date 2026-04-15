@@ -239,6 +239,13 @@ def call_gemini_json(
         tools: list[Any] = []
         if enable_search:
             tools.append(types.Tool(google_search=types.GoogleSearch()))
+            # Grounding adds internal thought/narrative tokens before the
+            # actual JSON output. The default 8K cap often runs out mid-
+            # JSON, producing a truncated response that fails parsing.
+            # Bump to 24K for grounded calls — pure text output of 10-15
+            # posts is typically <4K, so headroom to spare for reasoning.
+            if max_tokens < 24576:
+                max_tokens = 24576
         if enable_url_context:
             # url_context is a separate tool that lets the model fetch
             # specific URLs mentioned in the prompt. Graceful: the type
@@ -283,15 +290,65 @@ def call_gemini_json(
     input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
     output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
 
+    # Extract response text. Try response.text first (standard path);
+    # if empty (can happen when tools are active and the model returned
+    # tool calls / grounding metadata instead of plain text), manually
+    # walk the response parts and concatenate any .text fields.
     raw_text = (getattr(response, "text", "") or "").strip()
     if not raw_text:
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            pieces: list[str] = []
+            for cand in candidates:
+                content = getattr(cand, "content", None)
+                if not content:
+                    continue
+                for part in getattr(content, "parts", None) or []:
+                    t = getattr(part, "text", None)
+                    if t:
+                        pieces.append(str(t))
+            raw_text = "\n".join(pieces).strip()
+        except Exception as e:
+            logger.debug("[gemini] fallback text extraction failed: %r", e)
+
+    if not raw_text:
+        # Truly empty — log finish_reason / safety signals to help diagnosis.
+        _finish_reason = "unknown"
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                _finish_reason = str(getattr(candidates[0], "finish_reason", "unknown"))
+        except Exception:
+            pass
         raise GeminiCallFailed(
             f"Gemini returned empty text (model={model_id}, "
-            f"input_tokens={input_tokens}, output_tokens={output_tokens}). "
-            f"Likely safety-blocked or quota-limited."
+            f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
+            f"finish_reason={_finish_reason}). "
+            f"Likely safety-blocked, quota-limited, or max_tokens hit "
+            f"before any text was produced (grounding can burn 3-5K tokens "
+            f"on thought/narrative before emitting JSON)."
         )
 
+    # Always log the first 1KB of raw text to server stderr. Useful when
+    # the UI preview capture chain breaks — this gives us a fallback
+    # diagnostic path in Streamlit Cloud logs.
+    logger.info(
+        "[gemini] raw text first 1KB (model=%s, in=%d, out=%d): %s",
+        model_id,
+        input_tokens,
+        output_tokens,
+        raw_text[:1024].replace("\n", " | "),
+    )
+
     parsed = _extract_json(raw_text)
+    # If parsing failed, stuff the raw text into the return dict so
+    # downstream callers don't have to re-extract it from response.
+    # (_extract_json already does text[:2000] on failure — keep that.)
+    # Also include raw_text as a separate debug field even on SUCCESS
+    # so the UI can optionally show it for "what did Gemini actually
+    # say" debugging.
+    if isinstance(parsed, dict) and "_parse_error" not in parsed:
+        parsed.setdefault("_raw_text_debug", raw_text[:2000])
 
     # Extract grounding citations when search was enabled. Gemini puts
     # them on the first candidate's grounding_metadata.grounding_chunks.
