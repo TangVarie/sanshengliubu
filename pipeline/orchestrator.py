@@ -2066,6 +2066,99 @@ def _assert_project_not_running(
     return project
 
 
+def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
+    """Force-reset a stuck project. Marks ALL pipeline_runs currently
+    `running` for this project as `failed`, sets the project itself to
+    `failed`, and writes a marker stage_log so the UI has something to
+    render explaining what happened.
+
+    Needed because Python can't cleanly kill a hung daemon thread from
+    the outside — if a Gemini/Claude call is wedged in the networking
+    layer, the thread will block until the TCP timeout trips (could be
+    hours). The user still needs to be able to restart the pipeline.
+    Marking state = failed releases the PipelineAlreadyRunningError
+    guard so the "重跑流水线" / "继续执行" buttons become clickable.
+
+    Any zombie thread that eventually wakes up will find a pipeline_run
+    row in a terminal state; its later update_stage_log writes will
+    succeed but land on a run nobody looks at anymore. Since "重跑流水线"
+    creates a NEW run_id, there's no write collision with the new attempt.
+
+    Returns a summary dict:
+      {"cancelled_runs": int, "marker_stage_log_id": str | None}
+    """
+    summary: dict = {"cancelled_runs": 0, "marker_stage_log_id": None}
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1. Find all running pipeline_runs for this project and mark failed
+    try:
+        runs = db.get_runs_for_project(project_id) or []
+    except Exception as e:
+        logger.warning("[force_cancel] get_runs_for_project failed: %r", e)
+        runs = []
+
+    for run in runs:
+        if run.get("status") == "running":
+            rid = run.get("id")
+            if not rid:
+                continue
+            try:
+                db.update_pipeline_run(
+                    rid,
+                    status="failed",
+                    completed_at=now_iso,
+                )
+                summary["cancelled_runs"] += 1
+                # Write a marker so the UI can render "why did this
+                # stop?" without the user having to read logs.
+                try:
+                    log = db.create_stage_log(
+                        rid,
+                        "_force_cancelled",
+                        {"reason": "user_force_cancel", "cancelled_at": now_iso},
+                    )
+                    db.update_stage_log(
+                        log["id"],
+                        status="failed",
+                        error_message=(
+                            "⛔ 用户强制终止了这条流水线。"
+                            "原因通常是线程卡在某个外部调用（中转站挂起/网络超时/"
+                            "Gemini 响应死循环等）。项目状态已重置为 failed，"
+                            "可以点「重跑流水线」创建新 run 继续。"
+                        ),
+                        output_data={
+                            "reason": "user_force_cancel",
+                            "cancelled_at": now_iso,
+                        },
+                    )
+                    summary["marker_stage_log_id"] = log["id"]
+                except Exception as e:
+                    logger.warning(
+                        "[force_cancel] marker stage_log write failed: %r", e
+                    )
+            except Exception as e:
+                logger.exception(
+                    "[force_cancel] failed to mark run %s as failed: %r",
+                    rid,
+                    e,
+                )
+
+    # 2. Reset project status so the guards release
+    try:
+        db.update_project(project_id, status="failed")
+    except Exception as e:
+        logger.exception(
+            "[force_cancel] failed to reset project status: %r", e
+        )
+
+    logger.warning(
+        "[force_cancel] reset project=%s, cancelled %d running runs",
+        project_id[:8] if project_id else "?",
+        summary["cancelled_runs"],
+    )
+    return summary
+
+
 def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
     """Launch pipeline in a background thread (for Streamlit compatibility)."""
     _assert_project_not_running(project_id, db)

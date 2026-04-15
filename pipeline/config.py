@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.15.2"
+VERSION = "v0.15.3"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "趋势取样放宽域名过滤（xhs/xhslink/repost）+ 每阶段顶部显示 thinking ✓/✗ + tokens + 耗时"
+VERSION_NOTES = "强制终止卡死任务按钮 + 自动卡死检测（≥5 分钟无活动）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

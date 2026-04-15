@@ -263,7 +263,11 @@ if status == "needs_revision":
                         st.rerun()
                     except PipelineAlreadyRunningError as _err:
                         st.session_state[_busy_key] = False
-                        st.warning(f"⚠️ {_err}")
+                        st.warning(
+                            f"⚠️ {_err}\n\n"
+                            "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                            "按钮重置状态，再试。"
+                        )
                     except Exception as _err:
                         st.session_state[_busy_key] = False
                         st.error(f"应用修订失败：{_err}")
@@ -385,6 +389,86 @@ for ni_log in needs_input_logs:
                 )
 
     st.divider()
+
+# ── Stuck detection + force-cancel ────────────────────────────────────────
+# When status=running but no stage_log has updated_at in the last
+# STUCK_THRESHOLD_SECONDS, the daemon thread is almost certainly wedged
+# in an external call (relay hang, network timeout, Gemini deadlock).
+# We can't kill Python threads from outside, so instead we let the user
+# force-reset the project state — new runs can then be triggered and
+# the zombie thread is just ignored (its future writes land on a run
+# nobody looks at).
+STUCK_THRESHOLD_SECONDS = 300  # 5 minutes since last stage_log update
+
+if status == "running":
+    # Find the most recent update across stage_logs
+    _most_recent = 0.0
+    for _l in stage_logs:
+        _ts = _l.get("updated_at") or _l.get("created_at")
+        if not _ts:
+            continue
+        try:
+            from datetime import datetime as _dt
+            # Supabase timestamps are ISO8601 with timezone
+            _ts_str = str(_ts).replace("Z", "+00:00")
+            _dt_obj = _dt.fromisoformat(_ts_str)
+            _most_recent = max(_most_recent, _dt_obj.timestamp())
+        except Exception:
+            continue
+
+    if _most_recent > 0:
+        _elapsed = time.time() - _most_recent
+        _looks_stuck = _elapsed > STUCK_THRESHOLD_SECONDS
+    else:
+        _looks_stuck = False
+        _elapsed = 0.0
+
+    # Always show a cancel button when status=running (primary escape
+    # hatch). Make the stuck banner loud so the user sees why they'd
+    # click it.
+    with st.container(border=True):
+        if _looks_stuck:
+            st.error(
+                f"⚠️ **流水线疑似卡死** — 已经 {int(_elapsed // 60)} 分 "
+                f"{int(_elapsed % 60)} 秒没有任何阶段更新。"
+                f"大概率是某个外部调用（中转站 / Gemini / 网络）被 hang 住。"
+                f"Python 无法从外部杀死后台线程，但可以**强制重置状态**让你重新开始——"
+                f"点下面按钮即可。"
+            )
+        else:
+            st.info(
+                f"🔄 流水线正在执行（最近更新 {int(_elapsed)} 秒前）。"
+                f"需要中止当前任务可以点下面的强制终止。"
+            )
+
+        _force_busy_key = f"force_cancel_busy_{project_id}"
+        _force_busy = st.session_state.get(_force_busy_key, False)
+        if st.button(
+            "⛔ 强制终止卡死任务",
+            disabled=_force_busy,
+            key=f"force_cancel_btn_{project_id}",
+            type="primary" if _looks_stuck else "secondary",
+            help=(
+                "把 project.status 和所有 running 的 pipeline_run 硬标为 failed。"
+                "zombie 线程可能仍在后台消耗资源，直到下次 Streamlit Cloud Reboot "
+                "才彻底清掉——但你可以立刻点「重跑流水线」开新 run，不受旧线程干扰"
+                "（每次重跑都是新 run_id）。"
+            ),
+        ):
+            st.session_state[_force_busy_key] = True
+            try:
+                from pipeline.orchestrator import force_cancel_pipeline
+                summary = force_cancel_pipeline(project_id, db)
+                st.success(
+                    f"✅ 已强制终止 {summary['cancelled_runs']} 个 running 的 run。"
+                    f"点「重跑流水线」可以开新 run 了。"
+                )
+                time.sleep(1.5)
+                st.session_state[_force_busy_key] = False
+                st.rerun()
+            except Exception as err:
+                st.session_state[_force_busy_key] = False
+                st.error(f"强制终止失败：{type(err).__name__}: {err}")
 
 # ── Pipeline Progress Bar ──────────────────────────────────────────────────
 
@@ -854,7 +938,11 @@ with c2:
                 st.rerun()
             except PipelineAlreadyRunningError as _err:
                 st.session_state[_actions_busy_key] = False
-                st.warning(f"⚠️ {_err}")
+                st.warning(
+                    f"⚠️ {_err}\n\n"
+                    "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                    "按钮重置状态，再试。"
+                )
             except Exception as _err:
                 st.session_state[_actions_busy_key] = False
                 st.error(f"继续执行失败：{_err}")
@@ -881,7 +969,11 @@ with c3:
             st.rerun()
         except PipelineAlreadyRunningError as _err:
             st.session_state[_actions_busy_key] = False
-            st.warning(f"⚠️ {_err}")
+            st.warning(
+                f"⚠️ {_err}\n\n"
+                "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                "按钮重置状态，再试。"
+            )
         except Exception as _err:
             st.session_state[_actions_busy_key] = False
             st.error(f"重跑失败：{_err}")
