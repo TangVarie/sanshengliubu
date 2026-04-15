@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 import json
 import re
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -19,15 +22,15 @@ logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    CLAUDE_MAX_CONCURRENT,
+    CLAUDE_RPM_LIMIT,
     COST_PER_1M_INPUT,
     COST_PER_1M_OUTPUT,
     ENABLE_PROMPT_CACHING,
     MAX_RETRIES,
     MAX_TOKENS_DEFAULT,
     MAX_TOKENS_PER_RUN,
-    MIN_SECONDS_BETWEEN_CALLS,
     MODELS,
-    RELAY_MIN_SECONDS_BETWEEN_CALLS,
     RETRY_BASE_DELAY_SECONDS,
     STAGE_MAX_TOKENS,
     THINKING_BUDGET_TOKENS,
@@ -81,30 +84,107 @@ def init_api_config():
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         _api_config["base_url"] = base_url
-        # Auto-throttle on relay: most relays have tighter concurrency caps
-        # than native Anthropic (often 5 req/s). Only upgrade if the user
-        # hasn't already set an explicit MIN_SECONDS_BETWEEN_CALLS > 0.
-        if MIN_SECONDS_BETWEEN_CALLS <= 0 and RELAY_MIN_SECONDS_BETWEEN_CALLS > 0:
-            _api_config["rate_limit_seconds"] = RELAY_MIN_SECONDS_BETWEEN_CALLS
-            logger.info(
-                f"[init_api_config] Direct/relay mode: "
-                f"base_url={'(default)' if not base_url else base_url}, "
-                f"auto-throttle={RELAY_MIN_SECONDS_BETWEEN_CALLS}s between calls"
-            )
-        else:
-            _api_config["rate_limit_seconds"] = MIN_SECONDS_BETWEEN_CALLS
-            logger.info(
-                f"[init_api_config] Direct/relay mode: "
-                f"base_url={'(default)' if not base_url else base_url}, "
-                f"explicit throttle={MIN_SECONDS_BETWEEN_CALLS}s"
-            )
+        logger.info(
+            f"[init_api_config] Direct/relay mode: "
+            f"base_url={'(default)' if not base_url else base_url}, "
+            f"rate limit: {CLAUDE_RPM_LIMIT}/min, "
+            f"max concurrent: {CLAUDE_MAX_CONCURRENT}"
+        )
 
 
-def _effective_rate_limit_seconds() -> float:
-    """The throttle actually enforced per call. init_api_config sets this
-    per backend. Defaults to the static config constant if init wasn't
-    called (unit tests, tooling) or no override exists."""
-    return float(_api_config.get("rate_limit_seconds", MIN_SECONDS_BETWEEN_CALLS))
+# ── Sliding-window rate limiter ───────────────────────────────────────────
+#
+# Lives in this module because _call_claude is the chokepoint and runs in
+# threads (via asyncio.to_thread). All primitives are threading-based, not
+# asyncio-based, so they work correctly inside the thread-pool executor.
+# A single shared limiter instance per process is correct: even with
+# multiple parallel pipeline runs they all share the same backend quota.
+class _SlidingWindowLimiter:
+    """Caps API call STARTS at `max_per_minute` over a rolling 60-second
+    window AND in-flight count at `max_concurrent`. Both constraints are
+    enforced together — acquire blocks on whichever is binding.
+
+    Usage:
+        limiter = _SlidingWindowLimiter(15, 16)
+        with limiter.slot(stage_name="ministry_works"):
+            # ... actual API call ...
+
+    Concurrency slot is held for the full call duration (until the with
+    block exits). RPM slot is consumed at acquire time only — once the
+    timestamp is appended, the call counts toward the window even if it
+    later fails.
+    """
+
+    def __init__(self, max_per_minute: int, max_concurrent: int):
+        self.max_per_minute = int(max_per_minute)
+        self.max_concurrent = int(max_concurrent)
+        self._lock = threading.Lock()
+        self._history: collections.deque[float] = collections.deque()
+        # threading.Semaphore is process-wide and works across asyncio
+        # to_thread-spawned threads.
+        self._concurrency_sem = threading.Semaphore(self.max_concurrent)
+
+    def _wait_for_window(self, stage_name: str) -> None:
+        """Block until our timestamp can be appended to the rolling
+        window without exceeding max_per_minute."""
+        if self.max_per_minute <= 0:
+            return  # disabled
+        while True:
+            with self._lock:
+                now = time.time()
+                # Drop entries older than 60s
+                while self._history and now - self._history[0] >= 60.0:
+                    self._history.popleft()
+                if len(self._history) < self.max_per_minute:
+                    self._history.append(now)
+                    return
+                # +0.1s slack so we don't wake up exactly at the boundary
+                # and find the entry hasn't expired yet
+                wait_for = 60.0 - (now - self._history[0]) + 0.1
+            logger.info(
+                f"[{stage_name}] rate limiter: window full "
+                f"({self.max_per_minute}/min), sleeping {wait_for:.1f}s"
+            )
+            time.sleep(wait_for)
+
+    @contextlib.contextmanager
+    def slot(self, stage_name: str = ""):
+        """Acquire concurrency + RPM, hold concurrency until exit.
+
+        Order matters: concurrency first (cheap), then RPM (may sleep
+        for tens of seconds). If we acquired RPM first and waited 30s,
+        we'd already be holding nothing useful while other calls pile
+        up. With concurrency-first, the RPM wait happens with the
+        concurrency slot held — which IS what we want at the API
+        level (the 30s wait is "this call hasn't started yet, but
+        is queued"), preserving the 16-concurrent invariant of "no
+        more than 16 STARTED calls in flight, which includes 'about
+        to start'."
+        """
+        if self.max_concurrent > 0:
+            self._concurrency_sem.acquire()
+        try:
+            self._wait_for_window(stage_name)
+            yield
+        finally:
+            if self.max_concurrent > 0:
+                self._concurrency_sem.release()
+
+
+# Global shared limiter, one per process. Reconfigurable in init_api_config.
+_relay_limiter = _SlidingWindowLimiter(CLAUDE_RPM_LIMIT, CLAUDE_MAX_CONCURRENT)
+
+
+def _get_active_limiter() -> _SlidingWindowLimiter | None:
+    """Return the rate limiter to use for this call, or None to skip it.
+
+    Vertex backend has its own server-side quota and returns 429 we'd
+    just retry into; app-level limiting there is wasted overhead. Relay
+    + direct Anthropic both go through the shared sliding-window limiter.
+    """
+    if _api_config.get("mode") == "vertex":
+        return None
+    return _relay_limiter
 
 
 class ClarificationNeeded(Exception):
@@ -428,9 +508,6 @@ class BaseAgent:
 
         return blocks if blocks else text
 
-    # Class-level timestamp for rate limiting across all agents
-    _last_call_time: float = 0.0
-
     def _call_claude(
         self, system_prompt: str, user_message: str
     ) -> tuple[str, int, int, int, int]:
@@ -442,21 +519,18 @@ class BaseAgent:
         (common on relays that silently drop cache_control). They feed the
         per-run cache-effectiveness probe.
 
-        Two modes:
-        - Vertex AI: uses adaptive/budget thinking, system= works normally.
-        - Relay/direct: legacy path with budget_tokens thinking + proxy fallbacks.
-        """
-        # Rate limiting. The effective value is picked by init_api_config
-        # (relay mode auto-throttles even if the static config constant is 0).
-        rate_limit = _effective_rate_limit_seconds()
-        if rate_limit > 0:
-            elapsed = time.time() - BaseAgent._last_call_time
-            if elapsed < rate_limit:
-                wait = rate_limit - elapsed
-                logger.info(f"[{self.stage_name}] rate limit: waiting {wait:.2f}s")
-                time.sleep(wait)
-            BaseAgent._last_call_time = time.time()
+        Three execution paths share the SAME kwargs construction (model,
+        max_tokens, system, messages, thinking) — the historical "relay
+        doesn't support `thinking`" workaround is no longer needed.
+        Modern relays accept the standard Anthropic JSON `thinking`
+        parameter, and so do native Anthropic + Vertex.
 
+        The only path-specific bit is the Vertex Opus-4.6 adaptive-mode
+        nicety: we ask for `{"type": "adaptive"}` so Vertex picks the
+        thinking budget itself; everywhere else we pass an explicit
+        `{"type": "enabled", "budget_tokens": N}` which is the universal
+        format.
+        """
         client = self._get_client()
         is_vertex = _api_config.get("mode") == "vertex"
 
@@ -489,27 +563,30 @@ class BaseAgent:
             "messages": messages,
         }
 
-        # ── Vertex AI path: clean, no workarounds ────────────────────────
-        if is_vertex:
-            if self._use_thinking:
-                # Opus 4.6+: adaptive thinking. Older (4.1, 4.5): budget_tokens.
-                if "4-6" in self.model:
-                    kwargs["thinking"] = {"type": "adaptive"}
-                else:
-                    kwargs["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": THINKING_BUDGET_TOKENS,
-                    }
-            # Always stream on Vertex (avoids timeout for large outputs)
-            with client.messages.stream(**kwargs) as stream:
-                response = stream.get_final_message()
+        # Thinking control via standard Anthropic JSON `thinking` field.
+        # Works on Anthropic native, modern relays, and Vertex.
+        if self._use_thinking:
+            if is_vertex and "4-6" in self.model:
+                # Vertex Opus 4.6 supports adaptive thinking — let the
+                # server pick the budget. Cleaner / cheaper than a fixed
+                # budget when the prompt sometimes needs less reasoning.
+                kwargs["thinking"] = {"type": "adaptive"}
+            else:
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": THINKING_BUDGET_TOKENS,
+                }
 
-        # ── Relay / direct path ────────────────────────────────────────────
-        # IMPORTANT: relay does NOT support the `thinking` API parameter.
-        # Thinking is controlled by model NAME: relay routes "-thinking"
-        # suffix to a thinking-enabled backend. DO NOT pass `thinking={...}`
-        # — the relay returns garbage (a canned help message) when it sees it.
-        # Just use system= and messages= normally. Stream for timeout safety.
+        # Apply rate limiting. Vertex returns None (server-side quota);
+        # relay/direct gets the sliding-window limiter so we respect both
+        # CLAUDE_RPM_LIMIT (sustained) and CLAUDE_MAX_CONCURRENT (peak).
+        # The limiter is held for the full call duration to enforce the
+        # concurrency cap correctly.
+        limiter = _get_active_limiter()
+        if limiter is not None:
+            with limiter.slot(self.stage_name):
+                with client.messages.stream(**kwargs) as stream:
+                    response = stream.get_final_message()
         else:
             with client.messages.stream(**kwargs) as stream:
                 response = stream.get_final_message()

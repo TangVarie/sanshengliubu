@@ -2,37 +2,41 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.12.2"
+VERSION = "v0.13.0"
 VERSION_DATE = "2026-04-14"
-VERSION_NOTES = "设置页把 Gemini 职责显式展示；secrets.toml.example 给三组典型模板"
+VERSION_NOTES = "适配新中转站：JSON thinking 参数 + 滑动窗口限速（15 RPM / 16 并发）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# Relay mode: strategy stages use -thinking suffix (relay routes to thinking channel).
-# Execution stages use plain opus (no thinking, faster).
-# When switching to Vertex: change both to "claude-opus-4-6" (Vertex doesn't
-# use -thinking suffix, thinking is controlled by THINKING_STAGES).
+# All stages use the same Claude Opus model name. Whether thinking is
+# enabled is controlled per-call via the standard Anthropic API
+# `thinking={"type":"enabled","budget_tokens":N}` parameter — see
+# THINKING_STAGES below + agents/__init__.py::_call_claude.
+#
+# Why one model name everywhere: Anthropic native, modern relay proxies,
+# and Vertex all accept the standard JSON `thinking` parameter. The old
+# convention of using a `-thinking` suffix in the model name was a
+# relay-specific routing hack; new relays + native API don't need it.
+# Keeping a single model name makes prompt caching cache across thinking
+# and non-thinking stages (same system prompt, same model = same cache key).
 
-OPUS_THINKING = "claude-opus-4-6-thinking"
-OPUS_PLAIN = "claude-opus-4-6"
+OPUS_MODEL = "claude-opus-4-6"
 
 MODELS: dict[str, str] = {
-    # Thinking stages: relay routes -thinking suffix to thinking backend
-    "crown_prince": OPUS_THINKING,
-    "secretariat": OPUS_THINKING,
-    "chancellery": OPUS_THINKING,
-    "ministry_works": OPUS_THINKING,
-    "chancellery_final": OPUS_THINKING,
-    # Execution stages: plain opus, no thinking
-    "dispatcher": OPUS_PLAIN,
-    "ministry_personnel": OPUS_PLAIN,
-    "ministry_revenue": OPUS_PLAIN,
-    "ministry_rites": OPUS_PLAIN,
-    "ministry_war": OPUS_PLAIN,
-    "ministry_justice": OPUS_PLAIN,
-    "ministry_works_cell_planner": OPUS_PLAIN,
-    "ministry_works_builder": OPUS_PLAIN,
-    "vibe_critic": OPUS_PLAIN,
-    "vibe_rewriter": OPUS_PLAIN,
+    "crown_prince": OPUS_MODEL,
+    "secretariat": OPUS_MODEL,
+    "chancellery": OPUS_MODEL,
+    "ministry_works": OPUS_MODEL,
+    "chancellery_final": OPUS_MODEL,
+    "dispatcher": OPUS_MODEL,
+    "ministry_personnel": OPUS_MODEL,
+    "ministry_revenue": OPUS_MODEL,
+    "ministry_rites": OPUS_MODEL,
+    "ministry_war": OPUS_MODEL,
+    "ministry_justice": OPUS_MODEL,
+    "ministry_works_cell_planner": OPUS_MODEL,
+    "ministry_works_builder": OPUS_MODEL,
+    "vibe_critic": OPUS_MODEL,
+    "vibe_rewriter": OPUS_MODEL,
 }
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
@@ -133,13 +137,26 @@ THINKING_STAGES: frozenset[str] = frozenset({
 THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────
-# Per-process throttle between API calls. 0 = no throttle. init_api_config
-# upgrades this to RELAY_MIN_SECONDS_BETWEEN_CALLS on relay mode because
-# most relays have stricter concurrency caps than direct Anthropic.
-MIN_SECONDS_BETWEEN_CALLS = 0
-# Applied automatically when a relay backend is detected. Set to 0 to
-# opt out of the auto-throttle (your relay doesn't need it).
-RELAY_MIN_SECONDS_BETWEEN_CALLS = 0.3
+# Sliding-window rate limiter. The active window respects two constraints
+# simultaneously:
+#
+#   1. RPM cap (sustained):    at most CLAUDE_RPM_LIMIT call STARTS per
+#                              rolling 60-second window. When the window
+#                              fills, the next call sleeps until the
+#                              oldest entry ages out.
+#   2. Concurrency cap (peak): at most CLAUDE_MAX_CONCURRENT calls in
+#                              flight at the same instant.
+#
+# Tune these to your backend's published limits. Defaults are calibrated
+# for a typical paid relay quota (15 RPM / 16 concurrent — actually
+# observed on a real account). Set CLAUDE_RPM_LIMIT to 0 to disable the
+# rate cap entirely (e.g. on Vertex with high project quota).
+#
+# Vertex AI mode bypasses this limiter entirely — Vertex enforces quota
+# server-side and returns 429 we'd just retry into. See
+# agents/__init__.py::_get_active_limiter.
+CLAUDE_RPM_LIMIT = 15
+CLAUDE_MAX_CONCURRENT = 16
 
 # ── Per-run budget ───────────────────────────────────────────────────────
 # Hard ceiling on combined input + output tokens accumulated within a
