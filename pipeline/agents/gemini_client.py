@@ -280,6 +280,33 @@ def call_gemini_json(
                     "google-genai SDK; continuing without it"
                 )
 
+        # Safety settings: lower all available thresholds to avoid
+        # false-positive blocks. RECITATION specifically can't be
+        # disabled (it's a separate system), but relaxing all safety
+        # thresholds reduces the chance of the model being blocked
+        # for "dangerous" content when it's just quoting xhs posts.
+        try:
+            _safety = [
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="BLOCK_NONE",
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="BLOCK_NONE",
+                ),
+            ]
+        except (AttributeError, TypeError):
+            _safety = []  # SDK too old
+
         config_kwargs: dict[str, Any] = {
             "system_instruction": system_prompt,
             "max_output_tokens": max_tokens,
@@ -287,6 +314,8 @@ def call_gemini_json(
             # judgment, not creative variation.
             "temperature": 0.3,
         }
+        if _safety:
+            config_kwargs["safety_settings"] = _safety
         # response_mime_type=application/json and grounding tools conflict
         # on some model IDs (grounding pushes response into natural text).
         # Only request JSON mime when grounding is OFF. With grounding ON,

@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.19.0"
+VERSION = "v0.19.1"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "查看原始输入 + 复制并修改 + 中途补充信息/选择阶段重跑"
+VERSION_NOTES = "修 RECITATION 过滤 + 结构审 16K 不截断 + 新增网感 tab 看 Gemini 仲裁结果"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -268,9 +268,12 @@ ENABLE_GEMINI_TREND_SCOUT_POST = True
 # secretariat meaningful calibration without ballooning the prompt.
 GEMINI_TREND_SCOUT_TARGET_COUNT = 10
 
-# Max output tokens per Gemini call. Gemini's output cap is per-model;
-# 8K is safe across 2.5 Pro and most preview tiers.
-GEMINI_MAX_OUTPUT_TOKENS = 8192
+# Max output tokens per Gemini call. 16K handles 6-cell structure
+# reviews without truncation. Grounding calls auto-bump to 24K (see
+# gemini_client.py). Gemini 3.x supports up to 64K output, but 16K
+# is a good default ceiling — our critic/reviewer/scout outputs are
+# typically 2-8K so the model will stop early anyway.
+GEMINI_MAX_OUTPUT_TOKENS = 16384
 
 # Rough per-1M-token prices (USD) for cost accounting. Update when
 # Google publishes final pricing for the chosen model. These values are

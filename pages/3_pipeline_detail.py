@@ -586,7 +586,7 @@ st.divider()
 st.subheader("各环节详情")
 
 # Group stages into tabs
-tab_names = ["太子", "中书省", "门下省", "尚书省", "六部", "终审"]
+tab_names = ["太子", "中书省", "门下省", "尚书省", "六部", "网感", "终审"]
 tabs = st.tabs(tab_names)
 
 # Tab 0: Crown Prince
@@ -896,8 +896,109 @@ with tabs[4]:
                     else:
                         st.caption(f"状态：{sr_status}")
 
-# Tab 5: Final Review
+# Tab 5: Vibe (网感复检 + Gemini 仲裁)
 with tabs[5]:
+    # Vibe critic
+    _vc_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_critic"]
+    _vr_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_rewriter"]
+
+    if _vc_logs:
+        for idx, vcl in enumerate(_vc_logs):
+            with st.expander(
+                f"网感复检 轮次 {idx + 1}",
+                expanded=(vcl == _vc_logs[-1]),
+            ):
+                render_stage_meta(vcl)
+                _vc_out = vcl.get("output_data") or {}
+                if _vc_out:
+                    _vc_verdict = _vc_out.get("verdict", "unknown")
+                    _vc_failed = _vc_out.get("failed_cells") or []
+                    if _vc_verdict == "all_pass":
+                        st.success(f"✅ 全部通过（{len(_vc_out.get('cell_reviews', []))} 个 cell）")
+                    else:
+                        st.warning(
+                            f"⚠️ {_vc_verdict}：{len(_vc_failed)} 个 cell 需要重写"
+                        )
+                    # Show per-cell gut_call summary
+                    _reviews = _vc_out.get("cell_reviews") or []
+                    if _reviews:
+                        for _cr in _reviews:
+                            _cid = _cr.get("cell_id", "?")
+                            _gut = _cr.get("gut_call", "?")
+                            _gut_word = _cr.get("gut_word", "")
+                            _sev = _cr.get("severity", "")
+                            _emoji = {"pass": "✅", "borderline": "🟡", "fail": "🔴"}.get(
+                                _sev, "❓"
+                            )
+                            st.caption(
+                                f"{_emoji} **{_cid}** — gut: {_gut} · {_gut_word} · severity: {_sev}"
+                            )
+
+                    # Gemini arbitration results (if any)
+                    _ga = _vc_out.get("_gemini_arbitration") or {}
+                    if _ga and _ga.get("verdict") != "skipped":
+                        st.divider()
+                        st.markdown("**🟢 Gemini 二审（仲裁）**")
+                        _ga_failed = _ga.get("failed_cells") or []
+                        _ga_verdict = _ga.get("verdict", "unknown")
+                        _ga_usage = _ga.get("_gemini_usage") or {}
+                        if _ga_verdict == "all_pass" or not _ga_failed:
+                            st.success(
+                                "✅ Gemini 也判全部通过——Claude 和 Gemini 意见一致。"
+                            )
+                        else:
+                            st.warning(
+                                f"⚠️ Gemini 额外 flag 了 {len(_ga_failed)} 个 cell "
+                                f"（Claude 判 pass 但 Gemini 判 fail）："
+                            )
+                            for _gf in _ga_failed:
+                                _g_cid = _gf.get("cell_id", "?")
+                                _g_dir = _gf.get("rewrite_directives", "")
+                                st.caption(f"🔴 **{_g_cid}**：{_g_dir[:200]}")
+                        if _ga_usage:
+                            st.caption(
+                                f"Gemini 费用：${_ga_usage.get('cost_usd', 0):.4f} · "
+                                f"tokens {_ga_usage.get('input_tokens', 0)}+{_ga_usage.get('output_tokens', 0)}"
+                            )
+                    elif _ga and _ga.get("verdict") == "skipped":
+                        st.caption(
+                            f"ℹ️ Gemini 二审跳过：{_ga.get('_skip_reason', 'unknown')}"
+                        )
+
+                    with st.expander("🔍 完整 critic 输出", expanded=False):
+                        st.json(_vc_out)
+                elif vcl.get("status") == "failed":
+                    render_stage_error(vcl)
+                else:
+                    st.caption(f"状态：{vcl.get('status', 'pending')}")
+    else:
+        st.caption("等待执行...")
+
+    # Vibe rewriter logs (if any)
+    if _vr_logs:
+        st.divider()
+        for idx, vrl in enumerate(_vr_logs):
+            with st.expander(
+                f"网感重写 轮次 {idx + 1}",
+                expanded=False,
+            ):
+                render_stage_meta(vrl)
+                _vr_out = vrl.get("output_data") or {}
+                if _vr_out:
+                    _rewritten = _vr_out.get("prompt_cells") or []
+                    st.info(f"重写了 {len(_rewritten)} 个 cell")
+                    for _rc in _rewritten:
+                        _rc_cid = _rc.get("cell_id", "?")
+                        _rc_mode = _rc.get("rewrite_mode", "?")
+                        _rc_summary = _rc.get("rewrite_summary", "")
+                        st.caption(
+                            f"📝 **{_rc_cid}** ({_rc_mode})：{_rc_summary[:150]}"
+                        )
+                elif vrl.get("status") == "failed":
+                    render_stage_error(vrl)
+
+# Tab 6: Final Review
+with tabs[6]:
     log = log_map.get("chancellery_final")
     render_stage_meta(log)
     if log and log.get("output_data"):

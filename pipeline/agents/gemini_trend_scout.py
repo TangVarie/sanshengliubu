@@ -303,19 +303,20 @@ def format_trend_intel_for_prompt(scout_result: dict) -> str:
     if not posts:
         return ""
     lines = [
-        f"【当前小红书真实帖子取样（{len(posts)} 条原文，非分析文）】",
-        "下面是 Gemini 刚搜到的真实正在流通的帖子，请把它们当作"
-        "「目标平台当前语境」的具象参照——不要把它们泛化成规律，"
-        "而是看里面具体的人物/场景/第一句话结构，校准你自己策略的味道基准：",
+        f"【当前小红书爆款钩子模式取样（{len(posts)} 条，来自 Gemini 搜索）】",
+        "下面是 Gemini 刚搜到的真实正在流通的小红书帖子的**钩子模式描述**"
+        "（不是原文——Google 版权过滤不允许逐字复制），请把它们当作"
+        "「目标平台当前语境」的具象参照——看里面的钩子结构/情绪驱动/叙事模式，"
+        "校准你自己策略的味道基准：",
     ]
     for i, p in enumerate(posts, 1):
-        title = p.get("title") or "(无标题)"
+        title = p.get("title") or "(无描述)"
         snippet = p.get("snippet") or ""
         url = p.get("url", "")
         flag = " [⚠️ 可能是分析文]" if p.get("_suspect_analysis") else ""
-        lines.append(f"{i}. 《{title}》{flag}")
+        lines.append(f"{i}. {title}{flag}")
         if snippet:
-            lines.append(f"   片段：{snippet}")
+            lines.append(f"   钩子模式：{snippet}")
         if url:
             lines.append(f"   URL：{url}")
     return "\n".join(lines)
