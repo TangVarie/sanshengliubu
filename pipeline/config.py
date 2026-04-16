@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.23.0"
+VERSION = "v0.23.1"
 VERSION_DATE = "2026-04-16"
-VERSION_NOTES = "代码质量审计：并发安全/内存泄漏修复 + 太子保留原始素材细节不再过度摘要"
+VERSION_NOTES = "修复中书省/门下省进度条和详情显示 + 太子保留原始素材细节"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
