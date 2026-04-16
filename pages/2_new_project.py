@@ -43,6 +43,20 @@ def extract_file_content(uploaded_file) -> str:
     return f"[不支持的文件类型: {uploaded_file.name}]"
 
 
+def _launch_pipeline(db, project, success_message: str = "✅ 流水线已启动！"):
+    """Create a pipeline run, initialise API, start background pipeline, navigate."""
+    from pipeline.orchestrator import start_pipeline_in_background
+    from pipeline.agents import init_api_config
+
+    run = db.create_pipeline_run(project["id"])
+    init_api_config()
+    start_pipeline_in_background(project["id"], run["id"], db)
+    st.success(success_message)
+    st.session_state["current_project_id"] = project["id"]
+    st.query_params["project_id"] = project["id"]
+    st.switch_page("pages/3_pipeline_detail.py")
+
+
 def process_uploaded_files(files) -> str:
     """Process multiple uploaded files into a tagged text block."""
     if not files:
@@ -259,7 +273,6 @@ with tab_new:
 
             try:
                 from db.supabase_client import SupabaseClient
-                from pipeline.orchestrator import start_pipeline_in_background
                 from pipeline.agents import init_api_config
                 db = SupabaseClient.get_instance()
                 project = db.create_project(name=product_name, free_text=full_text, task_type="new_system")
@@ -321,12 +334,6 @@ with tab_new:
                 if _brief_init:
                     db.update_project(project["id"], brief=_brief_init)
 
-                run = db.create_pipeline_run(project["id"])
-                if not _screenshot_data:
-                    # Only init if not already done during screenshot analysis
-                    init_api_config()
-                start_pipeline_in_background(project["id"], run["id"], db)
-
                 _msgs = ["✅ 流水线已启动！"]
                 if _ref_urls:
                     _msgs.append(f"已记录 {len(_ref_urls)} 条 URL。")
@@ -334,10 +341,7 @@ with tab_new:
                     _msgs.append(f"已分析 {len(_screenshot_data)} 张截图。")
                 if _selected_sample_ids:
                     _msgs.append(f"已加载 {len(_selected_sample_ids)} 条历史样本。")
-                st.success(" ".join(_msgs))
-                st.session_state["current_project_id"] = project["id"]
-                st.query_params["project_id"] = project["id"]
-                st.switch_page("pages/3_pipeline_detail.py")
+                _launch_pipeline(db, project, " ".join(_msgs))
             except Exception as e:
                 st.error(f"启动失败：{e}")
 
@@ -420,15 +424,7 @@ with tab_iterate:
                             task_type=task_type_iter,
                             base_project_id=base_project_id,
                         )
-                        run = db.create_pipeline_run(project["id"])
-                        from pipeline.orchestrator import start_pipeline_in_background
-                        from pipeline.agents import init_api_config
-                        init_api_config()
-                        start_pipeline_in_background(project["id"], run["id"], db)
-                        st.success("✅ 流水线已启动！")
-                        st.session_state["current_project_id"] = project["id"]
-                        st.query_params["project_id"] = project["id"]
-                        st.switch_page("pages/3_pipeline_detail.py")
+                        _launch_pipeline(db, project)
                     except Exception as e:
                         st.error(f"启动失败：{e}")
         else:
@@ -487,16 +483,8 @@ with tab_iterate:
 
                 try:
                     from db.supabase_client import SupabaseClient
-                    from pipeline.orchestrator import start_pipeline_in_background
-                    from pipeline.agents import init_api_config
                     db = SupabaseClient.get_instance()
                     project = db.create_project(name=m_name, free_text=full_text, task_type=task_type_iter)
-                    run = db.create_pipeline_run(project["id"])
-                    init_api_config()
-                    start_pipeline_in_background(project["id"], run["id"], db)
-                    st.success("✅ 流水线已启动！")
-                    st.session_state["current_project_id"] = project["id"]
-                    st.query_params["project_id"] = project["id"]
-                    st.switch_page("pages/3_pipeline_detail.py")
+                    _launch_pipeline(db, project)
                 except Exception as e:
                     st.error(f"启动失败：{e}")

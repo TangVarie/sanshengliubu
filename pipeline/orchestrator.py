@@ -668,32 +668,19 @@ class PipelineOrchestrator:
 
         return {name: output for name, output in results}
 
-    async def _run_cell_planners(
-        self,
-        works_arch: dict,
-        ministry_outputs: dict,
-        brief: dict,
-        plan: dict,
-    ) -> list[dict]:
-        """Run WorksCellPlanner in batches to generate cell_plans.
+    def _reconstruct_active_cells(self, plan: dict) -> list[dict]:
+        """Compute the active cell list from the plan.
 
-        Splits active_cells into batches and runs them in parallel.
-        Each batch receives shared_skeleton + ministry_outputs + its cell subset.
-        Validates per-batch return count and retries with stricter prompt if short.
+        Reconciles secretariat's active_cells with the D×P (directions ×
+        platforms − excluded) reconstruction.  Historical bug: model
+        sometimes only emits D1 cells and omits the rest.  Fix: splice
+        in missing (direction_id, platform) pairs without dropping what
+        secretariat intentionally kept.
+
+        Returns the final active_cells list (may be empty).
         """
-        logger.info(
-            f"[cell_planners] plan keys: {list(plan.keys())}, "
-            f"matrix_skeleton type: {type(plan.get('matrix_skeleton'))}, "
-            f"active_cells: {plan.get('matrix_skeleton', {}).get('active_cells', 'MISSING')!r:.200s}, "
-            f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
-            f"target_platforms: {plan.get('target_platforms', [])}"
-        )
-
         active_cells = plan.get("matrix_skeleton", {}).get("active_cells", []) or []
 
-        # Compute the EXPECTED set of cells from directions × platforms − excluded.
-        # This is the source of truth — if secretariat's active_cells doesn't match,
-        # reconstruct from D × P. (Common failure: model only emits D1 cells.)
         directions = plan.get("tactical_directions", []) or []
         platforms = plan.get("target_platforms", []) or []
         excluded = (plan.get("matrix_skeleton", {}) or {}).get("excluded_cells", []) or []
@@ -732,28 +719,16 @@ class PipelineOrchestrator:
                     "paradigm": d_paradigm,
                 })
 
-        # Decide how to reconcile secretariat's active_cells vs our D×P
-        # reconstruction. Historical bug: model sometimes only emits D1 cells
-        # and omits the rest — reconstruction catches that. New concern (#6):
-        # previously we replaced active_cells wholesale with the reconstruction
-        # as soon as ANY direction was missing, which could force-plan
-        # directions that secretariat intentionally dropped (without listing
-        # them in excluded_cells). Fix: only ADD truly-missing (direction_id,
-        # platform) pairs and keep everything else from secretariat, so
-        # intentional non-coverage is preserved.
         active_dir_set = {str(c.get("direction_id")) for c in active_cells if isinstance(c, dict)}
         expected_dir_set = {str(c.get("direction_id")) for c in expected_cells}
 
         if not active_cells and expected_cells:
-            # Case A: secretariat gave us nothing at all. Use reconstruction.
             logger.warning(
                 f"matrix_skeleton.active_cells is empty, using reconstruction "
                 f"({len(expected_cells)} cells from {len(directions)}×{len(platforms)})"
             )
             active_cells = expected_cells
         elif expected_cells:
-            # Case B: secretariat gave us some cells. Only splice in D×P pairs
-            # that secretariat literally didn't produce AND aren't in excluded.
             existing_pairs = {
                 (str(c.get("direction_id")), _platform_key(c.get("platform", "")))
                 for c in active_cells
@@ -775,6 +750,30 @@ class PipelineOrchestrator:
                 )
                 active_cells = list(active_cells) + splice_in
 
+        return active_cells
+
+    async def _run_cell_planners(
+        self,
+        works_arch: dict,
+        ministry_outputs: dict,
+        brief: dict,
+        plan: dict,
+    ) -> list[dict]:
+        """Run WorksCellPlanner in batches to generate cell_plans.
+
+        Splits active_cells into batches and runs them in parallel.
+        Each batch receives shared_skeleton + ministry_outputs + its cell subset.
+        Validates per-batch return count and retries with stricter prompt if short.
+        """
+        logger.info(
+            f"[cell_planners] plan keys: {list(plan.keys())}, "
+            f"matrix_skeleton type: {type(plan.get('matrix_skeleton'))}, "
+            f"active_cells: {plan.get('matrix_skeleton', {}).get('active_cells', 'MISSING')!r:.200s}, "
+            f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
+            f"target_platforms: {plan.get('target_platforms', [])}"
+        )
+
+        active_cells = self._reconstruct_active_cells(plan)
         if not active_cells:
             logger.error(
                 "No active_cells found and could not reconstruct. "
