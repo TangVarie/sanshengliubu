@@ -71,8 +71,25 @@ CREATE INDEX IF NOT EXISTS idx_stage_logs_stage ON stage_logs(stage_name);
 CREATE INDEX IF NOT EXISTS idx_stage_logs_run_stage ON stage_logs(run_id, stage_name);
 CREATE INDEX IF NOT EXISTS idx_outputs_run ON outputs(run_id);
 
+-- 参考爆文样本库
+CREATE TABLE IF NOT EXISTS reference_samples (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL DEFAULT '未命名样本',
+    source_type TEXT DEFAULT 'screenshot',  -- screenshot | text | url
+    content_text TEXT,                       -- OCR'd text or user-pasted
+    analysis JSONB,                          -- Gemini's structured analysis
+    image_url TEXT,                          -- Supabase storage URL (optional)
+    tags TEXT[] DEFAULT '{}',                -- user tags for filtering
+    created_by TEXT DEFAULT 'default',
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_reference_samples_created
+    ON reference_samples(created_at DESC);
+
 -- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
 ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
 ALTER TABLE pipeline_runs DISABLE ROW LEVEL SECURITY;
 ALTER TABLE stage_logs DISABLE ROW LEVEL SECURITY;
 ALTER TABLE outputs DISABLE ROW LEVEL SECURITY;
+ALTER TABLE reference_samples DISABLE ROW LEVEL SECURITY;

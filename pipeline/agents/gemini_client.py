@@ -213,8 +213,14 @@ def call_gemini_json(
     max_output_tokens: int | None = None,
     enable_search: bool = False,
     enable_url_context: bool = False,
+    images: list[tuple[bytes, str]] | None = None,
 ) -> dict[str, Any]:
     """Run one Gemini call and parse the response as JSON.
+
+    images: optional list of (raw_bytes, mime_type) tuples for
+    multimodal (Vision) calls. When provided, each image is sent as
+    an inline Part alongside the text user_message. This is how we
+    send screenshots for OCR + analysis.
 
     Returns a dict with:
       - "data": the parsed JSON output (guaranteed dict on success)
@@ -325,9 +331,20 @@ def call_gemini_json(
         if tools:
             config_kwargs["tools"] = tools
 
+        # Build contents: text + optional images for multimodal calls.
+        if images:
+            _content_parts: list[Any] = [types.Part.from_text(user_message)]
+            for img_bytes, img_mime in images:
+                _content_parts.append(
+                    types.Part.from_bytes(data=img_bytes, mime_type=img_mime)
+                )
+            _contents: Any = _content_parts
+        else:
+            _contents = user_message
+
         response = client.models.generate_content(
             model=model_id,
-            contents=user_message,
+            contents=_contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
     except Exception as e:

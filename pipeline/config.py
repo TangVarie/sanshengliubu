@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.19.1"
+VERSION = "v0.20.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "修 RECITATION 过滤 + 结构审 16K 不截断 + 新增网感 tab 看 Gemini 仲裁结果"
+VERSION_NOTES = "截图分析（Gemini Vision）+ 样本库 + Google Search scout 默认关"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -261,8 +261,8 @@ GEMINI_MODEL = "gemini-3.1-pro-preview"
 # IMPORTANT CONTRACT — scout output is forced to be RAW POSTS ONLY,
 # never trend analysis. See pipeline/prompts/gemini_trend_scout.md +
 # pipeline/agents/gemini_trend_scout.py _FORBIDDEN_SUMMARY_KEYS.
-ENABLE_GEMINI_TREND_SCOUT_PRE = True
-ENABLE_GEMINI_TREND_SCOUT_POST = True
+ENABLE_GEMINI_TREND_SCOUT_PRE = False
+ENABLE_GEMINI_TREND_SCOUT_POST = False
 # How many posts to ask the scout to pull per invocation. Each post is
 # ~150 chars in the output, so 10 is a reasonable default — gives
 # secretariat meaningful calibration without ballooning the prompt.

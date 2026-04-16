@@ -224,6 +224,47 @@ class SupabaseClient:
         resp = self.client.table("outputs").select("*").eq("run_id", run_id).execute()
         return resp.data[0] if resp.data else None
 
+    # ── Reference Samples ───────────────────────────────────────────
+
+    def save_reference_sample(self, title: str, source_type: str, content_text: str, analysis: dict) -> dict:
+        resp = (
+            self.client.table("reference_samples")
+            .insert({
+                "title": title,
+                "source_type": source_type,
+                "content_text": content_text,
+                "analysis": analysis,
+            })
+            .execute()
+        )
+        return resp.data[0]
+
+    def list_reference_samples(self, limit: int = 50) -> list[dict]:
+        resp = (
+            self.client.table("reference_samples")
+            .select("id, title, source_type, content_text, analysis, created_at")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
+    def delete_reference_sample(self, sample_id: str) -> None:
+        self.client.table("reference_samples").delete().eq("id", sample_id).execute()
+
+    def get_reference_samples_by_ids(self, ids: list[str]) -> list[dict]:
+        if not ids:
+            return []
+        resp = (
+            self.client.table("reference_samples")
+            .select("*")
+            .in_("id", ids)
+            .execute()
+        )
+        return resp.data or []
+
+    # ── Outputs ────────────────────────────────────────────────────
+
     def get_latest_output_for_project(self, project_id: str) -> dict | None:
         resp = (
             self.client.table("pipeline_runs")
