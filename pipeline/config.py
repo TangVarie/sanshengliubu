@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.18.3"
+VERSION = "v0.19.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "Gemini client 超时从 60s 提到 600s：修 grounding 长调用的 499 CANCELLED"
+VERSION_NOTES = "查看原始输入 + 复制并修改 + 中途补充信息/选择阶段重跑"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

@@ -145,6 +145,72 @@ if status != "running":
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
 
+# ── A: Original input viewer ─────────────────────────────────────────────
+# Let the user see exactly what this pipeline was built from — free_text,
+# structured brief, platforms, reference URLs, etc. Solves "我当初填了什么".
+_free_text = project.get("free_text", "")
+_brief = project.get("brief") or {}
+with st.expander("📋 原始输入（查看 / 复用）", expanded=False):
+    if _free_text:
+        st.markdown("**你当初提交的原文：**")
+        st.text_area(
+            "free_text（只读）",
+            value=_free_text,
+            height=150,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+    else:
+        st.caption("（free_text 为空——可能是通过 API 直接创建的项目）")
+
+    if _brief:
+        # Show key fields from structured brief in readable format
+        _brief_highlights = []
+        for _k in (
+            "product_name", "product_category", "target_audience",
+            "target_platforms", "campaign_objective", "core_claim",
+            "competitive_context", "constraints", "task_type",
+        ):
+            _v = _brief.get(_k)
+            if _v:
+                _brief_highlights.append(f"- **{_k}**: {_v}")
+        if _brief_highlights:
+            st.markdown("**结构化 Brief（太子解析结果）：**")
+            st.markdown("\n".join(_brief_highlights))
+
+        # Reference posts / trend intel if present
+        _ref_posts = (_brief.get("_reference_posts") or {}).get("posts") or []
+        if _ref_posts:
+            st.markdown(f"**参考帖子**（{len(_ref_posts)} 条）：")
+            for _rp in _ref_posts[:5]:
+                st.caption(f"- {_rp.get('title', '?')} → {_rp.get('url', '')}")
+
+        _ref_urls = _brief.get("_reference_post_urls") or []
+        if _ref_urls:
+            st.markdown(f"**用户贴的参考 URL**（{len(_ref_urls)} 条）：")
+            for _ru in _ref_urls:
+                st.caption(f"- {_ru}")
+
+        with st.expander("🔍 完整 Brief JSON", expanded=False):
+            st.json(_brief)
+
+    # B: Copy-and-modify button
+    if st.button(
+        "📋 复制并修改（基于此项目新建）",
+        help="把这个项目的原始输入复制到「新建项目」页面，预填所有字段，你只需改你想改的部分。",
+    ):
+        st.session_state["prefill_from_project"] = {
+            "product_name": _brief.get("product_name", project.get("name", "")),
+            "product_category": _brief.get("product_category", ""),
+            "target_platforms": _brief.get("target_platforms", []),
+            "campaign_objective": _brief.get("campaign_objective", []),
+            "competitive_context": _brief.get("competitive_context", ""),
+            "constraints": _brief.get("constraints", ""),
+            "free_text": _free_text,
+            "reference_urls": _brief.get("_reference_post_urls", []),
+        }
+        st.switch_page("pages/2_new_project.py")
+
 # Banner for needs_revision: surface 终审 verdict + revision instructions immediately
 if status == "needs_revision":
     try:
@@ -913,6 +979,161 @@ if _calls >= 3:
             f"({hit_rate:.0f}%)，已累计 cache_read={_cache_read:,} / "
             f"cache_creation={_cache_creation:,} tokens。"
         )
+
+# ── C: Mid-run supplement panel ────────────────────────────────────────────
+# Let the user add new ideas / references / corrections and re-run from
+# a chosen stage without going back to page 2. Works for completed,
+# failed, and needs_revision states — basically any time the pipeline
+# isn't actively running.
+if status not in ("running",):
+    with st.expander("📝 补充信息 / 追加参考 / 部分重跑", expanded=False):
+        st.caption(
+            "在当前项目的基础上追加新信息，选择从哪个阶段开始重跑。"
+            "已完成的上游阶段会保留（不花重复 token），只有你选的阶段及其下游会被重新执行。"
+        )
+
+        _supp_text = st.text_area(
+            "补充文字（追加到原始输入，不覆盖）",
+            height=120,
+            placeholder="新想法、新卖点、对之前产出的修改意见、老板最新反馈……",
+            key="supp_text",
+        )
+
+        _supp_urls = st.text_area(
+            "补充参考帖子 URL（每行一条，追加到已有的参考列表）",
+            height=80,
+            placeholder="https://www.xiaohongshu.com/explore/xxx",
+            key="supp_urls",
+        )
+
+        _supp_files = st.file_uploader(
+            "补充文件",
+            accept_multiple_files=True,
+            type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg", "gif", "webp", "json"],
+            key="supp_files",
+        )
+
+        # Stage selector — which point to re-run from. Everything at
+        # and below the selected stage gets deleted + re-executed.
+        _rerun_stages = {
+            "crown_prince": "太子（从头解析 brief，最彻底）",
+            "secretariat": "中书省（重新制定策略方向）",
+            "ministry_works": "工部·架构（重新设计骨架，保留五部）",
+            "ministry_works_builder": "工部·构建（只重新生成 prompt）",
+            "vibe_critic": "网感复检（只重新检查味道）",
+        }
+        _selected_stage = st.selectbox(
+            "从哪个阶段开始重跑？",
+            options=list(_rerun_stages.keys()),
+            format_func=lambda k: _rerun_stages[k],
+            index=0,
+            key="supp_rerun_stage",
+        )
+
+        # Downstream stage names for deletion. Order matters — we delete
+        # everything at and below the selected stage.
+        _stage_order = [
+            "crown_prince",
+            "gemini_reference_analyzer",
+            "gemini_trend_scout_pre",
+            "secretariat",
+            "chancellery_1", "chancellery_2", "chancellery_3",
+            "dispatcher",
+            "ministry_personnel", "ministry_revenue", "ministry_rites",
+            "ministry_war", "ministry_justice",
+            "ministry_works",
+            "ministry_works_cell_planner",
+            "ministry_works_builder",
+            "ministry_works_structure_review",
+            "vibe_critic", "vibe_rewriter",
+            "chancellery_final",
+        ]
+
+        if st.button(
+            "🚀 追加并重跑",
+            type="primary",
+            key="supp_submit",
+            help="追加信息到项目 + 删除下游 stage_logs + 从选定阶段继续执行",
+        ):
+            if not _supp_text.strip() and not _supp_urls.strip() and not _supp_files:
+                st.warning("请至少填一项补充内容。")
+            else:
+                try:
+                    # 1. Append supplement to project
+                    _proj = db.get_project(project_id) or {}
+                    _old_text = _proj.get("free_text", "") or ""
+                    _new_text = _old_text
+                    if _supp_text.strip():
+                        _new_text += (
+                            f"\n\n--- 补充信息 ({time.strftime('%Y-%m-%d %H:%M')}) ---\n"
+                            + _supp_text.strip()
+                        )
+
+                    # Process uploaded files — import the helper from page 2
+                    # at call time (avoid circular import at module level).
+                    if _supp_files:
+                        try:
+                            from importlib import import_module as _im
+                            _p2 = _im("pages.2_new_project")
+                            _new_text += _p2.process_uploaded_files(_supp_files)
+                        except Exception:
+                            # Fallback: just list filenames
+                            for _f in _supp_files:
+                                _new_text += f"\n[补充文件: {_f.name}]"
+
+                    _brief_update = dict(_proj.get("brief") or {})
+                    # Append reference URLs
+                    _existing_refs = _brief_update.get("_reference_post_urls") or []
+                    for _line in (_supp_urls or "").splitlines():
+                        _u = _line.strip()
+                        if _u and "xiaohongshu.com" in _u and _u.startswith("http"):
+                            _existing_refs.append(_u)
+                    if _existing_refs:
+                        _brief_update["_reference_post_urls"] = _existing_refs[:20]
+                    # Clear stale revision context so the re-run is clean
+                    _brief_update.pop("_revision_context", None)
+
+                    db.update_project(
+                        project_id,
+                        free_text=_new_text,
+                        brief=_brief_update,
+                    )
+
+                    # 2. Delete stage_logs from selected stage downward
+                    _idx = (
+                        _stage_order.index(_selected_stage)
+                        if _selected_stage in _stage_order
+                        else 0
+                    )
+                    _to_delete = _stage_order[_idx:]
+                    # Also delete any numbered variants (chancellery_1..3)
+                    # that aren't in _stage_order
+                    _to_delete_extra = []
+                    for _sn in _to_delete:
+                        if _sn.startswith("chancellery") and not _sn.startswith("chancellery_final"):
+                            _to_delete_extra += [f"chancellery_{i}" for i in range(1, 10)]
+                    _to_delete = list(set(_to_delete + _to_delete_extra))
+                    # Also delete Gemini scout stages that depend on the
+                    # deleted Claude stages
+                    for _gs in [
+                        "gemini_trend_scout_pre",
+                        "gemini_reference_analyzer",
+                    ]:
+                        if _gs not in _to_delete and _idx <= _stage_order.index(_gs) if _gs in _stage_order else False:
+                            _to_delete.append(_gs)
+
+                    _deleted = db.delete_stage_logs_by_names(run_id, _to_delete)
+                    st.success(
+                        f"✅ 补充信息已追加，{_deleted} 个 stage_log 已清除。"
+                        f"点下方「▶️ 继续执行」从 {_rerun_stages[_selected_stage]} 重跑。"
+                    )
+                    # Reset project status so resume is allowed
+                    db.update_project(project_id, status="failed")
+                    db.update_pipeline_run(run_id, status="failed", completed_at=None)
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as _err:
+                    st.error(f"补充失败：{type(_err).__name__}: {_err}")
 
 # ── Actions + auto-refresh ─────────────────────────────────────────────────
 

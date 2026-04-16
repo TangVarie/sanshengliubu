@@ -63,24 +63,54 @@ tab_new, tab_iterate = st.tabs(["🆕 全新产品", "🔄 迭代 / 扩展"])
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab_new:
+    # ── Prefill from "复制并修改" (page 3 → session_state) ────────────
+    _prefill = st.session_state.pop("prefill_from_project", None) or {}
+    if _prefill:
+        st.info(
+            "📋 **已从上一个项目复制了输入**——下面各字段已预填，改你想改的部分然后点「启动」。"
+        )
+
     st.markdown("#### 基础信息")
     col1, col2 = st.columns(2)
     with col1:
-        product_name = st.text_input("产品名称 *", placeholder="例：XX精华液", key="new_name")
-        category = st.text_input("品类", placeholder="例：护肤、食品、3C数码", key="new_cat")
+        product_name = st.text_input(
+            "产品名称 *", placeholder="例：XX精华液", key="new_name",
+            value=_prefill.get("product_name", ""),
+        )
+        category = st.text_input(
+            "品类", placeholder="例：护肤、食品、3C数码", key="new_cat",
+            value=_prefill.get("product_category", ""),
+        )
+        _default_plat = _prefill.get("target_platforms") or ["小红书"]
+        # Ensure prefill platforms are in the option list
+        _plat_options = ["小红书", "抖音", "微博", "B站", "快手"]
+        for _p in _default_plat:
+            if _p not in _plat_options:
+                _plat_options.append(_p)
         platforms = st.multiselect(
-            "目标平台", ["小红书", "抖音", "微博", "B站", "快手"],
-            default=["小红书"], key="new_plat",
+            "目标平台", _plat_options,
+            default=_default_plat, key="new_plat",
         )
     with col2:
+        _default_obj = _prefill.get("campaign_objective") or ["种草"]
+        if isinstance(_default_obj, str):
+            _default_obj = [_default_obj]
+        _obj_options = ["种草", "搜索占位", "口碑扭转", "新品上市", "品牌认知", "其他"]
+        for _o in _default_obj:
+            if _o not in _obj_options:
+                _obj_options.append(_o)
         objective = st.multiselect(
-            "Campaign 目标（可多选）",
-            ["种草", "搜索占位", "口碑扭转", "新品上市", "品牌认知", "其他"],
-            default=["种草"],
-            key="new_obj",
+            "Campaign 目标（可多选）", _obj_options,
+            default=_default_obj, key="new_obj",
         )
-        competitor = st.text_input("主要竞品（可选）", placeholder="例：竞品A、竞品B", key="new_comp")
-        constraints = st.text_input("约束条件（可选）", placeholder="例：不提价格、不做对比", key="new_cons")
+        competitor = st.text_input(
+            "主要竞品（可选）", placeholder="例：竞品A、竞品B", key="new_comp",
+            value=_prefill.get("competitive_context", ""),
+        )
+        constraints = st.text_input(
+            "约束条件（可选）", placeholder="例：不提价格、不做对比", key="new_cons",
+            value=_prefill.get("constraints", ""),
+        )
 
     st.markdown("#### 参考资料")
     files_new = st.file_uploader(
@@ -97,12 +127,14 @@ with tab_new:
                     "聊天记录片段……写得越多越好，太子会帮你整理成结构化 brief。\n\n"
                     "不用担心格式，想到什么写什么。",
         key="new_text",
+        value=_prefill.get("free_text", ""),
     )
 
     # B: user-paste reference post URLs. Gemini later tries to fetch
     # each URL via url_context + multimodal cover analysis; results
     # enrich the brief. Advisory, fails-open.
     st.markdown("#### 参考帖子（可选）")
+    _prefill_ref_urls = "\n".join(_prefill.get("reference_urls") or [])
     ref_urls_new = st.text_area(
         "贴小红书帖子 URL，每行一个。最多 10 条。",
         height=100,
@@ -111,6 +143,7 @@ with tab_new:
             "https://www.xiaohongshu.com/explore/yyy\n"
             "..."
         ),
+        value=_prefill_ref_urls,
         key="new_ref_urls",
         help=(
             "Gemini 会尝试抓取这些帖子的封面 + 正文（尽力而为，小红书页面可能需要登录）。"
