@@ -282,6 +282,12 @@ class PipelineOrchestrator:
                     "brief": project.get("brief") or {},
                 }
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
+                # Preserve original free_text on the brief so downstream stages
+                # (especially 工部) can access rich raw materials directly,
+                # not just Crown Prince's summarized fields.
+                _raw_text = project.get("free_text", "")
+                if _raw_text:
+                    structured_brief["_raw_input_text"] = _raw_text
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             # 1a. User-pasted reference posts (B) — if page 2 recorded
