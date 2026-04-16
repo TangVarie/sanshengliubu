@@ -736,7 +736,7 @@ with tabs[2]:
                 round_label = f"策略辩论 第 {turn // 2 + 1} 轮（门下省质疑）"
             else:
                 round_label = sname.replace("chancellery_", "第") + "轮审议"
-            with st.expander(round_label, expanded=(cl == chan_logs[-1])):
+            with st.expander(round_label, expanded=(cl == all_chan_logs[-1])):
                 render_stage_meta(cl)
                 output = cl.get("output_data", {})
                 if output:
