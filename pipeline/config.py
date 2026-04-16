@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.22.0"
-VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "Multi-agent 第二轮：红蓝对抗精炼（消灭 AI 腔）+ 画像模拟审稿（用户视角）"
+VERSION = "v0.23.0"
+VERSION_DATE = "2026-04-16"
+VERSION_NOTES = "代码质量审计：并发安全/内存泄漏修复 + 太子保留原始素材细节不再过度摘要"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
