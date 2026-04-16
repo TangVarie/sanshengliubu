@@ -111,7 +111,7 @@ async def run_gemini_critic(
             "_skip_reason": f"call_failed: {e}",
         }
 
-    parsed = result["data"]
+    parsed = result.get("data")
     if not isinstance(parsed, dict) or "_parse_error" in parsed:
         logger.warning(
             "[gemini_critic] output was not valid JSON, skipping. Raw: %s",
@@ -121,6 +121,12 @@ async def run_gemini_critic(
             "verdict": "skipped",
             "failed_cells": [],
             "_skip_reason": "parse_error",
+            "_gemini_usage": {
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+                "cost_usd": result.get("cost_usd", 0.0),
+                "model": result.get("model"),
+            },
         }
 
     # Normalize — even if Gemini followed the contract, verify critical
@@ -130,13 +136,24 @@ async def run_gemini_critic(
     parsed.setdefault("cell_reviews", [])
     parsed.setdefault("cross_cell_duplicates", [])
 
+    # Validate list types for critical fields — Gemini occasionally returns
+    # strings instead of lists, which would crash downstream iteration.
+    for _list_key in ("failed_cells", "cell_reviews", "cross_cell_duplicates"):
+        if not isinstance(parsed.get(_list_key), list):
+            logger.warning(
+                "[gemini_critic] expected list for '%s', got %s — defaulting to []",
+                _list_key,
+                type(parsed.get(_list_key)).__name__,
+            )
+            parsed[_list_key] = []
+
     # Attach observability data so the orchestrator can log it + push
     # Gemini's token/cost into the pipeline_run totals.
     parsed["_gemini_usage"] = {
-        "input_tokens": result["input_tokens"],
-        "output_tokens": result["output_tokens"],
-        "cost_usd": result["cost_usd"],
-        "model": result["model"],
+        "input_tokens": result.get("input_tokens", 0),
+        "output_tokens": result.get("output_tokens", 0),
+        "cost_usd": result.get("cost_usd", 0.0),
+        "model": result.get("model"),
     }
 
     logger.info(

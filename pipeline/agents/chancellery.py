@@ -1,12 +1,5 @@
 """门下省 · Chancellery — Reviews plans and final output. Deliberately adversarial."""
 
-import json
-import asyncio
-import time
-
-import anthropic
-import streamlit as st
-
 from pipeline.agents import BaseAgent
 from pipeline.config import (
     MAX_CHANCELLERY_REJECTIONS,
@@ -83,61 +76,65 @@ class Chancellery(BaseAgent):
             infinite rejection loops when the model keeps finding new angles of
             the same structural problem.
         """
-        orig = self.stage_name
+        # Save and swap all three attributes atomically, restore in finally.
+        orig_stage = self.stage_name
+        orig_model = self.model
+        orig_max_tokens = self.max_tokens
         self.stage_name = "chancellery_final"
-        self.model = MODELS.get("chancellery_final", self.model)
+        self.model = MODELS.get("chancellery_final", orig_model)
         self.max_tokens = STAGE_MAX_TOKENS.get("chancellery_final", MAX_TOKENS_DEFAULT)
 
-        if round_number > MAX_FINAL_REJECTIONS:
-            # Force pass — log a synthetic stage_log so UI still shows the
-            # decision, and return a structured result with a risk note.
-            log = db.create_stage_log(
-                run_id,
-                "chancellery_final",
-                {
-                    "review_type": "final_review",
-                    "round_number": round_number,
-                    "force_pass": True,
-                    "prior_verdict": (prior_review or {}).get("verdict", "unknown"),
-                },
-            )
-            result = {
-                "verdict": "approved",
-                "review_dimensions": {},
-                "mandatory_revisions": [],
-                "suggestions": [
-                    f"⚠️ 终审强制通过：已达最大驳回轮次 {MAX_FINAL_REJECTIONS}。"
-                    f"上一轮 verdict={(prior_review or {}).get('verdict', 'unknown')}。"
-                    f"建议人工复核 prompt_matrix。"
-                ],
-                "revision_instructions": "",
-                "_forced_pass": True,
-                "_round_number": round_number,
-            }
-            db.update_stage_log(log["id"], status="completed", output_data=result)
-            self.stage_name = orig
-            return result
-
-        input_data = {
-            "review_type": "final_review",
-            "prompt_system": final_system,
-            "plan": plan,
-            "brief": brief,
-            "round_number": round_number,
-        }
-        if prior_review and round_number > 1:
-            # Slim prior_review to the fields the prompt cares about, avoid
-            # sending back every field (which would balloon context).
-            input_data["prior_review"] = {
-                "verdict": prior_review.get("verdict", "unknown"),
-                "mandatory_revisions": prior_review.get("mandatory_revisions", []),
-                "revision_instructions": prior_review.get(
-                    "revision_instructions", ""
-                ),
-                "review_dimensions": prior_review.get("review_dimensions", {}),
-            }
-
         try:
+            if round_number > MAX_FINAL_REJECTIONS:
+                # Force pass — log a synthetic stage_log so UI still shows the
+                # decision, and return a structured result with a risk note.
+                log = db.create_stage_log(
+                    run_id,
+                    "chancellery_final",
+                    {
+                        "review_type": "final_review",
+                        "round_number": round_number,
+                        "force_pass": True,
+                        "prior_verdict": (prior_review or {}).get("verdict", "unknown"),
+                    },
+                )
+                result = {
+                    "verdict": "approved",
+                    "review_dimensions": {},
+                    "mandatory_revisions": [],
+                    "suggestions": [
+                        f"⚠️ 终审强制通过：已达最大驳回轮次 {MAX_FINAL_REJECTIONS}。"
+                        f"上一轮 verdict={(prior_review or {}).get('verdict', 'unknown')}。"
+                        f"建议人工复核 prompt_matrix。"
+                    ],
+                    "revision_instructions": "",
+                    "_forced_pass": True,
+                    "_round_number": round_number,
+                }
+                db.update_stage_log(log["id"], status="completed", output_data=result)
+                return result
+
+            input_data = {
+                "review_type": "final_review",
+                "prompt_system": final_system,
+                "plan": plan,
+                "brief": brief,
+                "round_number": round_number,
+            }
+            if prior_review and round_number > 1:
+                input_data["prior_review"] = {
+                    "verdict": prior_review.get("verdict", "unknown"),
+                    "mandatory_revisions": prior_review.get("mandatory_revisions", []),
+                    "revision_instructions": prior_review.get(
+                        "revision_instructions", ""
+                    ),
+                    "review_dimensions": prior_review.get("review_dimensions", {}),
+                }
+
             return await self.run(input_data, run_id, db)
         finally:
-            self.stage_name = orig
+            # Restore ALL mutated attributes — prevents corruption if an
+            # exception occurs partway through the method.
+            self.stage_name = orig_stage
+            self.model = orig_model
+            self.max_tokens = orig_max_tokens
