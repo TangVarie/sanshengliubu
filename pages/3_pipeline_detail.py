@@ -1323,10 +1323,6 @@ with c3:
             st.error(f"重跑失败：{_err}")
 
 # Auto-refresh when running or paused for review (waiting for user input).
-# Use HTML meta-refresh instead of time.sleep() to avoid blocking the
-# Streamlit server thread (which would freeze all users in multi-session).
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
-    st.markdown(
-        f'<meta http-equiv="refresh" content="{POLL_INTERVAL_SECONDS}">',
-        unsafe_allow_html=True,
-    )
+    time.sleep(POLL_INTERVAL_SECONDS)
+    st.rerun()

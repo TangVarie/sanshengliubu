@@ -1,6 +1,7 @@
 """项目总览 — Dashboard page showing all projects and their status."""
 
 import streamlit as st
+import time
 from db.supabase_client import SupabaseClient
 from utils.version_badge import show_version_badge
 
@@ -85,18 +86,10 @@ try:
                         st.session_state.pop(f"confirm_del_{pid}", None)
                         st.rerun()
 
-        # Auto-refresh if any project is running — use st.auto_refresh
-        # instead of blocking the Streamlit thread with time.sleep().
+        # Auto-refresh while any project is running
         if running > 0:
-            try:
-                # Streamlit >=1.37 supports st.fragment for partial reruns;
-                # fallback to a short-interval rerun via query params.
-                st.markdown(
-                    '<meta http-equiv="refresh" content="5">',
-                    unsafe_allow_html=True,
-                )
-            except Exception:
-                pass
+            time.sleep(5)
+            st.rerun()
 
 except Exception as e:
     st.error(f"无法连接数据库。请在「设置」页面配置 Supabase 连接。\n\n错误：{e}")
