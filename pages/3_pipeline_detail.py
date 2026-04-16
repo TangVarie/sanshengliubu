@@ -552,6 +552,20 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
                 log = log_map[k]
                 break
 
+    # Strategy debate: secretariat and chancellery log under
+    # strategy_debate_0 (secretariat), strategy_debate_1 (chancellery), etc.
+    # Match the latest debate turn for each agent.
+    if not log and stage_key == "secretariat":
+        for k in sorted(log_map, reverse=True):
+            if k.startswith("strategy_debate_") and int(k.rsplit("_", 1)[-1]) % 2 == 0:
+                log = log_map[k]
+                break
+    if not log and stage_key == "chancellery":
+        for k in sorted(log_map, reverse=True):
+            if k.startswith("strategy_debate_") and int(k.rsplit("_", 1)[-1]) % 2 == 1:
+                log = log_map[k]
+                break
+
     with cols[i]:
         s = log.get("status", "pending") if log else "pending"
         if s == "completed":
