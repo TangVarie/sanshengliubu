@@ -85,11 +85,18 @@ try:
                         st.session_state.pop(f"confirm_del_{pid}", None)
                         st.rerun()
 
-        # Auto-refresh if any project is running
+        # Auto-refresh if any project is running — use st.auto_refresh
+        # instead of blocking the Streamlit thread with time.sleep().
         if running > 0:
-            import time
-            time.sleep(5)
-            st.rerun()
+            try:
+                # Streamlit >=1.37 supports st.fragment for partial reruns;
+                # fallback to a short-interval rerun via query params.
+                st.markdown(
+                    '<meta http-equiv="refresh" content="5">',
+                    unsafe_allow_html=True,
+                )
+            except Exception:
+                pass
 
 except Exception as e:
     st.error(f"无法连接数据库。请在「设置」页面配置 Supabase 连接。\n\n错误：{e}")

@@ -130,7 +130,9 @@ class SupabaseClient:
         resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
         return resp.data[0]
 
-    def get_stage_logs(self, run_id: str) -> _StageLogsList:
+    def get_stage_logs(
+        self, run_id: str, stage_name: str | None = None
+    ) -> _StageLogsList:
         """Load stage_logs for a run, EXCLUDING input_data to keep payload small.
 
         input_data contains the full shared_skeleton + ministry_outputs +
@@ -144,6 +146,11 @@ class SupabaseClient:
         The returned list carries `.partial = True` when the fallback
         triggered, so the UI can surface a warning instead of rendering
         empty stage outputs silently.
+
+        Args:
+            run_id: Pipeline run ID.
+            stage_name: Optional filter — only return logs for this stage.
+                        When set, avoids loading all stages into memory.
         """
         select_full = (
             "id, run_id, stage_name, status, output_data, error_message, "
@@ -157,13 +164,14 @@ class SupabaseClient:
         )
         for attempt, columns in enumerate([select_full, select_light]):
             try:
-                resp = (
+                query = (
                     self.client.table("stage_logs")
                     .select(columns)
                     .eq("run_id", run_id)
-                    .order("created_at")
-                    .execute()
                 )
+                if stage_name:
+                    query = query.eq("stage_name", stage_name)
+                resp = query.order("created_at").execute()
                 result = _StageLogsList(resp.data or [])
                 result.partial = attempt > 0
                 if attempt > 0:

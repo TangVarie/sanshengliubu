@@ -17,22 +17,30 @@ from pipeline.config import (
     CELL_PLANNER_CONCURRENCY,
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
+    DEFAULT_PLATFORM,
     ENABLE_GEMINI_TREND_SCOUT_POST,
     ENABLE_GEMINI_TREND_SCOUT_PRE,
     GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
+    MAX_DEBATE_TURNS,
     MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
     PLATFORM_DEMO_LENGTH_DEFAULT,
     PLATFORM_DEMO_LENGTH_RANGES,
+    RED_BLUE_CONCURRENCY,
+    TREND_SCOUT_POST_CONCURRENCY,
+    VIBE_LOOP_ESCALATE_THRESHOLD,
+    VIBE_LOOP_HARD_CAP,
+    VIBE_LOOP_INITIAL_CAP,
 )
 from pipeline.agents import (
     ClarificationNeeded,
     RunBudgetExceededError,
     accumulate_auxiliary_cost,
     get_run_totals,
+    release_run_budget,
     reset_run_budget,
 )
 from pipeline.agents.gemini_critic import run_gemini_critic
@@ -149,13 +157,11 @@ class PipelineOrchestrator:
 
         Returns: (recovered_cells_by_id, recovered_demo_outputs)
         """
-        logs = self.db.get_stage_logs(self.run_id)
+        logs = self.db.get_stage_logs(self.run_id, stage_name=stage_name)
         recovered: dict[str, dict] = {}
         demo_outputs: list[dict] = []
         rejected = 0
         for log in logs:
-            if log.get("stage_name") != stage_name:
-                continue
             if log.get("status") != "completed":
                 continue
             output = log.get("output_data") or {}
@@ -494,6 +500,9 @@ class PipelineOrchestrator:
             )
             self.db.update_project(self.project_id, status="failed")
             raise
+        finally:
+            # Release budget tracker memory for this run
+            release_run_budget(self.run_id)
 
     async def _strategy_loop(self, brief: dict) -> dict:
         """Multi-turn strategy debate between secretariat and chancellery.
@@ -513,11 +522,7 @@ class PipelineOrchestrator:
           strategy_debate_2 (secretariat responds)
           ...
         """
-        max_turns = int(getattr(
-            __import__("pipeline.config", fromlist=["MAX_DEBATE_TURNS"]),
-            "MAX_DEBATE_TURNS",
-            8,
-        ))
+        max_turns = int(MAX_DEBATE_TURNS)
         debate_history: list[dict] = []
         plan = None
 
@@ -1530,7 +1535,7 @@ class PipelineOrchestrator:
         if not prompt_cells:
             return
 
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(RED_BLUE_CONCURRENCY)
 
         async def refine_one(cell: dict) -> dict | None:
             cid = cell.get("cell_id", "?")
@@ -1607,9 +1612,9 @@ class PipelineOrchestrator:
             result = await self.persona_simulator.run(
                 {
                     "target_audience": target_audience or "未指定（请根据 brief 推断）",
-                    "platform": brief.get("target_platforms", ["小红书"])[0]
+                    "platform": brief.get("target_platforms", [DEFAULT_PLATFORM])[0]
                     if brief.get("target_platforms")
-                    else "小红书",
+                    else DEFAULT_PLATFORM,
                     "cells": slim_cells,
                 },
                 self.run_id,
@@ -1769,7 +1774,7 @@ class PipelineOrchestrator:
         # "current xhs viral" queries.
 
         platforms = brief.get("target_platforms") or []
-        platform = platforms[0] if platforms else "小红书"
+        platform = platforms[0] if platforms else DEFAULT_PLATFORM
 
         stage_name = "gemini_trend_scout_pre"
         log = self.db.create_stage_log(
@@ -1888,14 +1893,14 @@ class PipelineOrchestrator:
             return
 
         platforms = plan.get("target_platforms") or []
-        platform = platforms[0] if platforms else "小红书"
+        platform = platforms[0] if platforms else DEFAULT_PLATFORM
 
         # Target per-direction sample count — keep smaller than pre (10)
         # because we hit this once per direction, and too many samples
         # overwhelm the UI comparison.
         per_direction_count = min(GEMINI_TREND_SCOUT_TARGET_COUNT, 5)
 
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(TREND_SCOUT_POST_CONCURRENCY)
 
         async def _scout_one(direction: dict) -> tuple[str, dict]:
             d_id = str(direction.get("direction_id", "")).strip()
@@ -1999,10 +2004,14 @@ class PipelineOrchestrator:
                 }
 
         results = await asyncio.gather(
-            *[_scout_one(d) for d in directions], return_exceptions=False
+            *[_scout_one(d) for d in directions], return_exceptions=True
         )
         per_direction: dict[str, dict] = {}
-        for d_id, data in results:
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning("[trend_scout post] direction failed: %r", r)
+                continue
+            d_id, data = r
             if d_id and data:
                 per_direction[d_id] = data
 
@@ -2151,9 +2160,9 @@ class PipelineOrchestrator:
         gives stubborn cases a last chance instead of silently shipping
         bad taste, while still bounding worst-case token spend.
         """
-        hard_cap = 3
-        initial_cap = 2
-        escalate_threshold = 0.30
+        hard_cap = VIBE_LOOP_HARD_CAP
+        initial_cap = VIBE_LOOP_INITIAL_CAP
+        escalate_threshold = VIBE_LOOP_ESCALATE_THRESHOLD
         prompt_cells = final_system.get("prompt_matrix", [])
         if not prompt_cells:
             logger.warning("Vibe loop skipped: no prompt_cells")
@@ -2787,13 +2796,12 @@ def _find_cross_cell_duplicates(cells: list[dict]) -> list[str]:
 
     # 2. Identical first sentence (up to first 。！？\n) across cells.
     # Tolerates different bodies but flags same opening line.
-    import re as _re
     opening_to_ids: dict[str, list[str]] = {}
     for c in cells:
         demo = (c.get("demo_output") or "").strip()
         if not demo:
             continue
-        first = _re.split(r"[。！？!?\n]", demo, maxsplit=1)[0].strip()
+        first = re.split(r"[。！？!?\n]", demo, maxsplit=1)[0].strip()
         if len(first) < 8:  # too short to count as a meaningful opening
             continue
         opening_to_ids.setdefault(first, []).append(c.get("cell_id", "?"))

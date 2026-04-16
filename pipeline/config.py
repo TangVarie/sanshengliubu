@@ -321,6 +321,19 @@ COST_PER_1M_OUTPUT: dict[str, float] = {
     "claude-sonnet-4-6": 15.0,
 }
 
+# ── Defaults ──────────────────────────────────────────────────────────────
+
+DEFAULT_PLATFORM = "小红书"
+
+# ── Vibe loop parameters ──────────────────────────────────────────────────
+VIBE_LOOP_HARD_CAP = 3       # absolute max iterations
+VIBE_LOOP_INITIAL_CAP = 2    # start with this many rounds
+VIBE_LOOP_ESCALATE_THRESHOLD = 0.30  # failure rate to unlock extra round
+
+# ── Advisory stage concurrency ────────────────────────────────────────────
+RED_BLUE_CONCURRENCY = 3
+TREND_SCOUT_POST_CONCURRENCY = 3
+
 # ── UI polling ─────────────────────────────────────────────────────────────
 
 POLL_INTERVAL_SECONDS = 3

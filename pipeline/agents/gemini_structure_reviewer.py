@@ -111,7 +111,7 @@ async def run_gemini_structure_review(
             "_skip_reason": f"call_failed: {e}",
         }
 
-    parsed = result["data"]
+    parsed = result.get("data")
     if not isinstance(parsed, dict) or "_parse_error" in parsed:
         _preview = ""
         if isinstance(parsed, dict):
@@ -125,24 +125,32 @@ async def run_gemini_structure_review(
             "cells_incomplete": [],
             "_skip_reason": "parse_error",
             "_raw_text_preview": _preview,
+            "_gemini_usage": {
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+                "cost_usd": result.get("cost_usd", 0.0),
+                "model": result.get("model"),
+            },
         }
 
     parsed.setdefault("verdict", "unknown")
     parsed.setdefault("cells_incomplete", [])
     parsed.setdefault("cell_reviews", [])
     parsed["_gemini_usage"] = {
-        "input_tokens": result["input_tokens"],
-        "output_tokens": result["output_tokens"],
-        "cost_usd": result["cost_usd"],
-        "model": result["model"],
+        "input_tokens": result.get("input_tokens", 0),
+        "output_tokens": result.get("output_tokens", 0),
+        "cost_usd": result.get("cost_usd", 0.0),
+        "model": result.get("model"),
     }
 
     logger.info(
-        "[gemini_structure] verdict=%s, incomplete=%d/%d, cost=$%.4f",
+        "[gemini_structure] verdict=%s, incomplete=%d/%d, cost=$%.4f, tokens=%d/%d",
         parsed.get("verdict"),
         len(parsed.get("cells_incomplete") or []),
         len(prompt_cells),
-        result["cost_usd"],
+        result.get("cost_usd", 0.0),
+        result.get("input_tokens", 0),
+        result.get("output_tokens", 0),
     )
     return parsed
 

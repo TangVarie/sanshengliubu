@@ -184,7 +184,12 @@ def init_api_config():
     )
     # supports_cache defaults to the global ENABLE_PROMPT_CACHING flag
     # so the existing config surface still works when a preset omits it.
-    if cfg.get("supports_cache") is None:
+    # Check if this specific preset had caching auto-disabled by a prior
+    # 400 error (per-preset key) — if so, keep it disabled.
+    _cache_disabled_key = f"_cache_disabled_{active_name}"
+    if _api_config.get(_cache_disabled_key):
+        _api_config["supports_cache"] = False
+    elif cfg.get("supports_cache") is None:
         _api_config["supports_cache"] = bool(ENABLE_PROMPT_CACHING)
     else:
         _api_config["supports_cache"] = bool(cfg["supports_cache"])
@@ -283,18 +288,20 @@ class _SlidingWindowLimiter:
     def reconfigure(self, max_per_minute: int, max_concurrent: int) -> None:
         """Update the rate caps live — called by init_api_config when
         the active relay preset changes (each preset carries its own
-        RPM / concurrency). Safe to call concurrently with slot()
-        acquisitions: RPM limit check reads `self.max_per_minute` under
-        the lock, so an update lands atomically between calls. The
-        concurrency semaphore is REPLACED with a fresh one sized to the
-        new cap — in-flight holders keep the old semaphore until they
-        release it; after the swap, new acquisitions see the new cap.
+        RPM / concurrency).
+
+        RPM limit is updated under the lock so it lands atomically.
+
+        Concurrency semaphore: rather than swapping the semaphore object
+        (which leaves in-flight holders releasing into a dead reference),
+        we keep the same object and only update max_concurrent. The slot()
+        context manager checks the current max_concurrent value each time
+        it acquires, so the effective cap adjusts naturally as in-flight
+        calls complete.
         """
         with self._lock:
             self.max_per_minute = int(max_per_minute)
-            if int(max_concurrent) != self.max_concurrent:
-                self.max_concurrent = int(max_concurrent)
-                self._concurrency_sem = threading.Semaphore(self.max_concurrent)
+            self.max_concurrent = int(max_concurrent)
 
     def _wait_for_window(self, stage_name: str) -> None:
         """Block until our timestamp can be appended to the rolling
@@ -324,22 +331,20 @@ class _SlidingWindowLimiter:
         """Acquire concurrency + RPM, hold concurrency until exit.
 
         Order matters: concurrency first (cheap), then RPM (may sleep
-        for tens of seconds). If we acquired RPM first and waited 30s,
-        we'd already be holding nothing useful while other calls pile
-        up. With concurrency-first, the RPM wait happens with the
-        concurrency slot held — which IS what we want at the API
-        level (the 30s wait is "this call hasn't started yet, but
-        is queued"), preserving the 16-concurrent invariant of "no
-        more than 16 STARTED calls in flight, which includes 'about
-        to start'."
+        for tens of seconds). With concurrency-first, the RPM wait
+        happens with the concurrency slot held — preserving the
+        max_concurrent invariant of "no more than N calls in flight".
         """
-        if self.max_concurrent > 0:
+        # Read max_concurrent once per call; reconfigure() may update
+        # it between calls but the semaphore object stays the same.
+        cap = self.max_concurrent
+        if cap > 0:
             self._concurrency_sem.acquire()
         try:
             self._wait_for_window(stage_name)
             yield
         finally:
-            if self.max_concurrent > 0:
+            if cap > 0:
                 self._concurrency_sem.release()
 
 
@@ -382,22 +387,49 @@ class RunBudgetExceededError(RuntimeError):
 # into the same pot. Keyed by run_id to stay isolated across concurrent
 # runs (if ever). Reset at the start of orchestrator.run() via
 # reset_run_budget(run_id).
+#
+# Thread-safety: multiple agents call _accumulate_run_tokens concurrently
+# via asyncio.to_thread. Python's += is NOT atomic (read-modify-write),
+# so a lock is required to prevent lost updates.
 _run_totals: dict[str, dict[str, int]] = {}
+_run_totals_lock = threading.Lock()
+
+# Track completed run_ids for periodic cleanup to prevent memory leak.
+_COMPLETED_RUN_IDS: set[str] = set()
+_MAX_COMPLETED_RUNS_KEPT = 20
 
 
 def reset_run_budget(run_id: str) -> None:
     """Zero out token counters for a run. Called by orchestrator.run()
     before any agent executes, so resumed runs don't re-count tokens
     that were already charged in the prior attempt."""
-    _run_totals[run_id] = {
-        "input": 0,
-        "output": 0,
-        "cache_read": 0,
-        "cache_creation": 0,
-        "cost_usd": 0.0,
-        "calls": 0,
-        "calls_with_cache_activity": 0,
-    }
+    with _run_totals_lock:
+        _run_totals[run_id] = {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_creation": 0,
+            "cost_usd": 0.0,
+            "calls": 0,
+            "calls_with_cache_activity": 0,
+        }
+        # Remove this run from the completed set if it's being re-run
+        _COMPLETED_RUN_IDS.discard(run_id)
+
+
+def release_run_budget(run_id: str) -> None:
+    """Mark a run as completed and garbage-collect old entries.
+    Called by the orchestrator when a run finishes (success or failure)."""
+    with _run_totals_lock:
+        _COMPLETED_RUN_IDS.add(run_id)
+        # Keep at most _MAX_COMPLETED_RUNS_KEPT finished entries
+        if len(_COMPLETED_RUN_IDS) > _MAX_COMPLETED_RUNS_KEPT:
+            oldest = list(_COMPLETED_RUN_IDS)[
+                : len(_COMPLETED_RUN_IDS) - _MAX_COMPLETED_RUNS_KEPT
+            ]
+            for old_id in oldest:
+                _run_totals.pop(old_id, None)
+                _COMPLETED_RUN_IDS.discard(old_id)
 
 
 def _estimate_call_cost_usd(
@@ -437,7 +469,8 @@ def _estimate_call_cost_usd(
 
 def get_run_totals(run_id: str) -> dict[str, int]:
     """Expose the live counters for UI / observability."""
-    return dict(_run_totals.get(run_id, {}))
+    with _run_totals_lock:
+        return dict(_run_totals.get(run_id, {}))
 
 
 def accumulate_auxiliary_cost(
@@ -456,25 +489,24 @@ def accumulate_auxiliary_cost(
     cheaper for Flash/Pro tiers) would underflow the guard into
     irrelevance. Tokens are still tracked per-source for UI breakdown.
     """
-    totals = _run_totals.setdefault(
-        run_id,
-        {
-            "input": 0,
-            "output": 0,
-            "cache_read": 0,
-            "cache_creation": 0,
-            "cost_usd": 0.0,
-            "calls": 0,
-            "calls_with_cache_activity": 0,
-        },
-    )
-    totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + float(cost_usd)
-    # Stash per-source tokens under namespaced keys so the breakdown
-    # stays visible in the UI without polluting the budget-check path.
-    aux_tokens_key = f"aux_{source}_tokens"
-    totals[aux_tokens_key] = (
-        int(totals.get(aux_tokens_key, 0)) + int(input_tokens) + int(output_tokens)
-    )
+    with _run_totals_lock:
+        totals = _run_totals.setdefault(
+            run_id,
+            {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_creation": 0,
+                "cost_usd": 0.0,
+                "calls": 0,
+                "calls_with_cache_activity": 0,
+            },
+        )
+        totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + float(cost_usd)
+        aux_tokens_key = f"aux_{source}_tokens"
+        totals[aux_tokens_key] = (
+            int(totals.get(aux_tokens_key, 0)) + int(input_tokens) + int(output_tokens)
+        )
 
 
 def _accumulate_run_tokens(
@@ -486,41 +518,48 @@ def _accumulate_run_tokens(
     cache_creation: int = 0,
 ) -> tuple[dict, float]:
     """Accumulate one call's usage into the run-level pot. Returns
-    (run_totals_dict, this_call_cost_usd) so the caller can write the
-    per-stage cost to stage_logs without recomputing."""
-    totals = _run_totals.setdefault(
-        run_id,
-        {
-            "input": 0,
-            "output": 0,
-            "cache_read": 0,
-            "cache_creation": 0,
-            "cost_usd": 0.0,
-            "calls": 0,
-            "calls_with_cache_activity": 0,
-        },
-    )
-    totals["input"] += input_tokens
-    totals["output"] += output_tokens
-    totals["cache_read"] += cache_read
-    totals["cache_creation"] += cache_creation
-    totals["calls"] += 1
-    if cache_read > 0 or cache_creation > 0:
-        totals["calls_with_cache_activity"] += 1
+    (run_totals_snapshot, this_call_cost_usd) so the caller can write the
+    per-stage cost to stage_logs without recomputing.
+
+    Thread-safe: acquires _run_totals_lock to prevent lost-update races
+    when multiple agents call this concurrently via asyncio.to_thread.
+    """
     this_call_cost = _estimate_call_cost_usd(
         model, input_tokens, output_tokens, cache_read, cache_creation
     )
-    totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + this_call_cost
-    return totals, this_call_cost
+    with _run_totals_lock:
+        totals = _run_totals.setdefault(
+            run_id,
+            {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_creation": 0,
+                "cost_usd": 0.0,
+                "calls": 0,
+                "calls_with_cache_activity": 0,
+            },
+        )
+        totals["input"] += input_tokens
+        totals["output"] += output_tokens
+        totals["cache_read"] += cache_read
+        totals["cache_creation"] += cache_creation
+        totals["calls"] += 1
+        if cache_read > 0 or cache_creation > 0:
+            totals["calls_with_cache_activity"] += 1
+        totals["cost_usd"] = float(totals.get("cost_usd", 0.0)) + this_call_cost
+        snapshot = dict(totals)
+    return snapshot, this_call_cost
 
 
 def _check_run_budget(run_id: str) -> None:
     """Raise RunBudgetExceededError if the run has passed MAX_TOKENS_PER_RUN.
     Called right after every API response is accounted for."""
-    totals = _run_totals.get(run_id)
-    if not totals:
-        return
-    combined = totals["input"] + totals["output"]
+    with _run_totals_lock:
+        totals = _run_totals.get(run_id)
+        if not totals:
+            return
+        combined = totals["input"] + totals["output"]
     if combined > MAX_TOKENS_PER_RUN:
         raise RunBudgetExceededError(
             f"流水线 {run_id[:8]} 已累计 {combined:,} tokens "
@@ -538,9 +577,10 @@ def _maybe_warn_no_cache_hits(run_id: str) -> None:
     misses = paying full price for nothing."""
     if not ENABLE_PROMPT_CACHING:
         return
-    totals = _run_totals.get(run_id)
-    if not totals or totals["calls"] < 4:
-        return
+    with _run_totals_lock:
+        totals = _run_totals.get(run_id)
+        if not totals or totals["calls"] < 4:
+            return
     # Already warned for this run?
     if totals.get("_cache_warned"):
         return
@@ -567,6 +607,15 @@ class BaseAgent:
     def __init__(self):
         self.model = MODELS.get(self.stage_name, "claude-sonnet-4-20250514")
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
+        # Validate prompt file exists at construction time so we fail fast
+        # instead of crashing mid-pipeline after burning tokens on prior stages.
+        if self.prompt_file:
+            _prompt_path = PROMPTS_DIR / self.prompt_file
+            if not _prompt_path.exists():
+                raise FileNotFoundError(
+                    f"Agent {self.stage_name}: prompt file not found at "
+                    f"{_prompt_path}. Check pipeline/prompts/ directory."
+                )
 
     def _get_client(self) -> anthropic.Anthropic:
         if not _api_config:
@@ -814,20 +863,27 @@ class BaseAgent:
             response = _do_stream(kwargs)
         except anthropic.BadRequestError as e:
             err_text = str(e)
+            # Only treat as cache fault if we actually sent cache_control
+            # AND the error message specifically mentions it. Avoid false
+            # positives from unrelated 400s that happen to contain the word.
             is_cache_fault = (
                 _preset_supports_cache
                 and "cache_control" in err_text.lower()
             )
             if is_cache_fault:
+                _active_preset = get_active_claude_relay_name() or "_global"
                 logger.warning(
                     "[cache-fallback] backend rejected cache_control with 400, "
-                    "auto-disabling caching for this process and retrying. "
+                    "auto-disabling caching for preset '%s' and retrying. "
                     "Error: %s",
+                    _active_preset,
                     err_text[:300],
                 )
-                # Flip the flag for the whole process so subsequent calls
-                # in this Streamlit instance don't keep banging into the
-                # same 400. Config files stay unchanged.
+                # Disable caching for the CURRENT preset only. Other presets
+                # (which may support caching) are unaffected. The flag is
+                # stored under a per-preset key so switching relays via the
+                # settings page restores the correct behavior automatically.
+                _api_config[f"_cache_disabled_{_active_preset}"] = True
                 _api_config["supports_cache"] = False
                 kwargs["system"] = system_prompt  # plain string, no cache
                 response = _do_stream(kwargs)
@@ -1163,7 +1219,7 @@ class BaseAgent:
                 # tracking is observability, not a hard invariant. One small
                 # write per agent completion, at most ~14/run.
                 try:
-                    _run_total = _run_totals.get(run_id) or {}
+                    _run_total = get_run_totals(run_id)
                     _run_tokens = (
                         _run_total.get("input", 0) + _run_total.get("output", 0)
                     )
@@ -1206,17 +1262,35 @@ class BaseAgent:
 
             except Exception as e:
                 last_error = e
-                # Capture full traceback so we never end up with an empty error_message
                 logger.exception(
                     f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
                 )
-                if attempt < MAX_RETRIES:
-                    # True exponential backoff (see config.py). For MAX_RETRIES=2
-                    # the sequence is 3s, 6s — unchanged from the old linear
-                    # path; the formula is kept exponential so MAX_RETRIES can
-                    # grow without changing the curve's shape.
+                # Classify error: only retry on transient failures (rate
+                # limits, server errors, timeouts). Non-retryable errors
+                # (auth failures, malformed requests) waste tokens and time.
+                _retryable = True
+                if isinstance(e, anthropic.AuthenticationError):
+                    _retryable = False
+                elif isinstance(e, anthropic.PermissionDeniedError):
+                    _retryable = False
+                elif isinstance(e, anthropic.BadRequestError) and "cache_control" not in str(e).lower():
+                    # Bad request that isn't a cache fault is not retryable
+                    _retryable = False
+                elif isinstance(e, (ValueError, json.JSONDecodeError)):
+                    # JSON parse failures from _extract_json — retrying with
+                    # the same input rarely helps, but one retry can recover
+                    # from transient model weirdness.
+                    _retryable = attempt < 1  # allow at most 1 retry for parse errors
+
+                if _retryable and attempt < MAX_RETRIES:
                     delay = RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
                     await asyncio.sleep(delay)
+                elif not _retryable:
+                    logger.warning(
+                        f"[{self.stage_name}] non-retryable error ({type(e).__name__}), "
+                        f"skipping remaining retries"
+                    )
+                    break
 
         # All retries exhausted — build a robust, non-empty error message
         duration = time.time() - start_time
