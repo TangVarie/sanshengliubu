@@ -385,6 +385,8 @@ STAGE_DISPLAY_NAMES = {
     "ministry_works": "工部·架构",
     "ministry_works_cell_planner": "工部·格子规划",
     "ministry_works_builder": "工部·构建",
+    "red_blue_refiner": "红蓝精炼",
+    "persona_simulator": "画像模拟",
     "ministry_works_structure_review": "结构审·Gemini",
     "vibe_critic": "网感复检",
     "vibe_rewriter": "网感重写",

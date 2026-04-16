@@ -62,6 +62,8 @@ from pipeline.agents.ministries.works import (
     VibeRewriter,
 )
 from pipeline.agents.narrative_director import NarrativeDirector
+from pipeline.agents.red_blue_refiner import RedBlueRefiner
+from pipeline.agents.persona_simulator import PersonaSimulator
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,8 @@ class PipelineOrchestrator:
         self.vibe_critic = VibeCritic()
         self.vibe_rewriter = VibeRewriter()
         self.narrative_director = NarrativeDirector()
+        self.red_blue_refiner = RedBlueRefiner()
+        self.persona_simulator = PersonaSimulator()
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -355,7 +359,19 @@ class PipelineOrchestrator:
             # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
             await self._run_narrative_director(final_system, works_plan)
 
-            # 5c++. Gemini 结构审（advisory）— audits each prompt_cell for
+            # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
+            # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
+            # 直接替换回 prompt_matrix，所以后续 vibe/终审看到的是
+            # 已经被精炼过的版本。
+            await self._run_red_blue_refinement(final_system)
+
+            # 5c++++. 画像模拟审稿 — 3 个模拟读者对每个 cell 的 demo
+            # 给出 0.5 秒反应（click/skip/save）。结果存到
+            # final_system._persona_reactions 让 UI 展示，也作为
+            # vibe_critic 的补充输入。
+            await self._run_persona_simulation(final_system, structured_brief)
+
+            # 5c+++++. Gemini 结构审（advisory）— audits each prompt_cell for
             # structural completeness (5 pools / persona / compliance /
             # keywords / banlist / platform voice). Fires ONCE, between
             # builder and vibe. Hints get merged into the rewriter's
@@ -1501,6 +1517,122 @@ class PipelineOrchestrator:
                 )
 
         final_system["prompt_matrix"] = prompt_cells
+
+    async def _run_red_blue_refinement(self, final_system: dict) -> None:
+        """Red-Blue adversarial refinement: for each cell, Red Team
+        attacks AI-tone issues in demo_output, Blue Team fixes them
+        with minimal changes. Combined in a single agent call per cell.
+
+        Runs cells in parallel (bounded by rate limiter). Refined
+        demo_output replaces the original in prompt_matrix in place.
+        """
+        prompt_cells = final_system.get("prompt_matrix") or []
+        if not prompt_cells:
+            return
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def refine_one(cell: dict) -> dict | None:
+            cid = cell.get("cell_id", "?")
+            async with semaphore:
+                try:
+                    result = await self.red_blue_refiner.run(
+                        {
+                            "cell_id": cid,
+                            "direction_name": cell.get("direction_name", ""),
+                            "platform": cell.get("platform", ""),
+                            "system_prompt": (cell.get("system_prompt") or "")[:500],
+                            "demo_output": cell.get("demo_output", ""),
+                            "paradigm": cell.get("paradigm", "A_emotional_hook"),
+                        },
+                        self.run_id,
+                        self.db,
+                    )
+                    return result
+                except Exception as e:
+                    logger.warning(
+                        "[red_blue] cell %s failed: %r", cid, e
+                    )
+                    return None
+
+        results = await asyncio.gather(
+            *[refine_one(c) for c in prompt_cells]
+        )
+
+        refined_count = 0
+        for i, (cell, result) in enumerate(zip(prompt_cells, results)):
+            if not result:
+                continue
+            new_demo = result.get("refined_demo_output")
+            if new_demo and new_demo.strip():
+                prompt_cells[i]["demo_output"] = new_demo
+                prompt_cells[i]["_red_blue_summary"] = result.get(
+                    "changes_summary", ""
+                )
+                refined_count += 1
+            # Also apply system_prompt refinement if provided
+            new_sp = result.get("refined_system_prompt")
+            if new_sp and new_sp.strip():
+                prompt_cells[i]["system_prompt"] = new_sp
+
+        logger.info(
+            "[red_blue] refined %d/%d cells", refined_count, len(prompt_cells)
+        )
+
+    async def _run_persona_simulation(
+        self, final_system: dict, brief: dict
+    ) -> None:
+        """Persona simulation: 3 target-audience personas react to each
+        cell's demo. Results stored on final_system for UI display and
+        as supplementary input to vibe_critic.
+        """
+        prompt_cells = final_system.get("prompt_matrix") or []
+        if not prompt_cells:
+            return
+
+        target_audience = brief.get("target_audience", "")
+        if isinstance(target_audience, list):
+            target_audience = ", ".join(str(t) for t in target_audience)
+
+        slim_cells = [
+            {
+                "cell_id": c.get("cell_id"),
+                "direction_name": c.get("direction_name"),
+                "demo_output": (c.get("demo_output") or "")[:500],
+            }
+            for c in prompt_cells
+        ]
+
+        try:
+            result = await self.persona_simulator.run(
+                {
+                    "target_audience": target_audience or "未指定（请根据 brief 推断）",
+                    "platform": brief.get("target_platforms", ["小红书"])[0]
+                    if brief.get("target_platforms")
+                    else "小红书",
+                    "cells": slim_cells,
+                },
+                self.run_id,
+                self.db,
+            )
+        except Exception as e:
+            logger.warning("[persona_sim] failed: %r", e)
+            return
+
+        final_system["_persona_reactions"] = result
+        summary = result.get("summary") or {}
+        weak = summary.get("weak_cells") or []
+        if weak:
+            logger.warning(
+                "[persona_sim] weak cells (all 3 personas skip): %s", weak
+            )
+        else:
+            logger.info(
+                "[persona_sim] strong=%s, narrow=%s, weak=%s",
+                summary.get("strong_cells", []),
+                summary.get("narrow_cells", []),
+                summary.get("weak_cells", []),
+            )
 
     async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
         """B: fetch user-pasted xiaohongshu post URLs via Gemini url_context.

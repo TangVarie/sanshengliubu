@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.21.0"
+VERSION = "v0.22.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "Multi-agent 第一轮：策略辩论（中书 ↔ 门下真对话）+ 叙事导演（跨 cell 一致性）"
+VERSION_NOTES = "Multi-agent 第二轮：红蓝对抗精炼（消灭 AI 腔）+ 画像模拟审稿（用户视角）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -65,6 +65,8 @@ _STAGE_ROLES = {
     "narrative_director": "strategy",
     # Content generation + taste judgment: voice quality matters
     "ministry_works_builder": "content",
+    "red_blue_refiner": "content",     # needs natural language feel
+    "persona_simulator": "content",    # simulates real humans
     "vibe_critic": "content",
     "vibe_rewriter": "content",
 }
@@ -350,6 +352,8 @@ PIPELINE_STAGES = [
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
     ("narrative_director", "叙事导演", "🎬"),
+    ("red_blue_refiner", "红蓝精炼", "⚔️"),
+    ("persona_simulator", "画像模拟", "👥"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
     ("chancellery_final", "终审", "✅"),
