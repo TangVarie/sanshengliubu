@@ -687,11 +687,25 @@ with tabs[0]:
 
 # Tab 1: Secretariat
 with tabs[1]:
-    # May have multiple secretariat runs
-    sec_logs = [l for l in stage_logs if l["stage_name"] == "secretariat"]
-    if sec_logs:
-        for sl in sec_logs:
-            with st.expander(f"方案 (轮次 {sec_logs.index(sl) + 1})", expanded=(sl == sec_logs[-1])):
+    # May have multiple secretariat runs — legacy stage_name "secretariat"
+    # or strategy_debate_N where N is even (0, 2, 4...)
+    sec_logs = [l for l in stage_logs if l.get("stage_name") == "secretariat"]
+    debate_sec_logs = sorted(
+        [l for l in stage_logs
+         if l.get("stage_name", "").startswith("strategy_debate_")
+         and int(l["stage_name"].rsplit("_", 1)[-1]) % 2 == 0],
+        key=lambda l: int(l["stage_name"].rsplit("_", 1)[-1]),
+    )
+    all_sec_logs = sec_logs + debate_sec_logs
+    if all_sec_logs:
+        for sl in all_sec_logs:
+            sname = sl.get("stage_name", "")
+            if sname.startswith("strategy_debate_"):
+                turn = int(sname.rsplit("_", 1)[-1])
+                label = f"策略辩论 第 {turn // 2 + 1} 轮（中书省发言）"
+            else:
+                label = f"方案 (轮次 {all_sec_logs.index(sl) + 1})"
+            with st.expander(label, expanded=(sl == all_sec_logs[-1])):
                 render_stage_meta(sl)
                 if sl.get("output_data"):
                     render_stage_output(sl["output_data"])
@@ -705,10 +719,23 @@ with tabs[1]:
 
 # Tab 2: Chancellery
 with tabs[2]:
-    chan_logs = [l for l in stage_logs if l["stage_name"].startswith("chancellery_")]
-    if chan_logs:
-        for cl in chan_logs:
-            round_label = cl["stage_name"].replace("chancellery_", "第") + "轮审议"
+    # Legacy chancellery_N logs + strategy_debate_N where N is odd (1, 3, 5...)
+    chan_logs = [l for l in stage_logs if l.get("stage_name", "").startswith("chancellery_")]
+    debate_chan_logs = sorted(
+        [l for l in stage_logs
+         if l.get("stage_name", "").startswith("strategy_debate_")
+         and int(l["stage_name"].rsplit("_", 1)[-1]) % 2 == 1],
+        key=lambda l: int(l["stage_name"].rsplit("_", 1)[-1]),
+    )
+    all_chan_logs = chan_logs + debate_chan_logs
+    if all_chan_logs:
+        for cl in all_chan_logs:
+            sname = cl.get("stage_name", "")
+            if sname.startswith("strategy_debate_"):
+                turn = int(sname.rsplit("_", 1)[-1])
+                round_label = f"策略辩论 第 {turn // 2 + 1} 轮（门下省质疑）"
+            else:
+                round_label = sname.replace("chancellery_", "第") + "轮审议"
             with st.expander(round_label, expanded=(cl == chan_logs[-1])):
                 render_stage_meta(cl)
                 output = cl.get("output_data", {})
