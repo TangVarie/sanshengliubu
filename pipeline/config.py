@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.20.0"
+VERSION = "v0.21.0"
 VERSION_DATE = "2026-04-15"
-VERSION_NOTES = "截图分析（Gemini Vision）+ 样本库 + Google Search scout 默认关"
+VERSION_NOTES = "Multi-agent 第一轮：策略辩论（中书 ↔ 门下真对话）+ 叙事导演（跨 cell 一致性）"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -61,6 +61,8 @@ _STAGE_ROLES = {
     "ministry_war": "planning",
     "ministry_justice": "planning",
     "ministry_works_cell_planner": "planning",
+    # Cross-cell coherence: needs reasoning (sees whole matrix)
+    "narrative_director": "strategy",
     # Content generation + taste judgment: voice quality matters
     "ministry_works_builder": "content",
     "vibe_critic": "content",
@@ -128,7 +130,14 @@ PLATFORM_DEMO_LENGTH_DEFAULT: tuple[int, int] = (50, 2000)
 
 # ── Chancellery review ─────────────────────────────────────────────────────
 
-MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3
+MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3 (legacy, used by non-debate path)
+
+# ── Strategy Debate ──────────────────────────────────────────────────────
+# Max turns in the secretariat ↔ chancellery multi-turn debate.
+# Secretariat speaks on even turns, chancellery on odd. So MAX_DEBATE_TURNS=8
+# means 4 exchanges (each agent speaks 4 times). Chancellery can approve
+# at any odd turn to end early. Last chancellery turn is force-approve.
+MAX_DEBATE_TURNS = 8
 
 # final_review (工部产出的 prompt_matrix) 的轮次上限。第一次跑流水线 = round 1；
 # 用户每点一次「应用修订意见并重跑」round +1。超过 MAX_FINAL_REJECTIONS 后强制
@@ -340,6 +349,7 @@ PIPELINE_STAGES = [
     ("ministry_works", "工部·架构", "🏗️"),
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
+    ("narrative_director", "叙事导演", "🎬"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
     ("chancellery_final", "终审", "✅"),

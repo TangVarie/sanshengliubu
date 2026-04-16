@@ -61,6 +61,7 @@ from pipeline.agents.ministries.works import (
     VibeCritic,
     VibeRewriter,
 )
+from pipeline.agents.narrative_director import NarrativeDirector
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class PipelineOrchestrator:
         self.works_builder = WorksBuilder()
         self.vibe_critic = VibeCritic()
         self.vibe_rewriter = VibeRewriter()
+        self.narrative_director = NarrativeDirector()
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -348,7 +350,12 @@ class PipelineOrchestrator:
                     f"works_plan keys: {list(works_plan.keys())}"
                 )
 
-            # 5c+. Gemini 结构审（advisory）— audits each prompt_cell for
+            # 5c+. 叙事导演（Claude, 跨 cell 一致性+差异化诊断）
+            # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
+            # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
+            await self._run_narrative_director(final_system, works_plan)
+
+            # 5c++. Gemini 结构审（advisory）— audits each prompt_cell for
             # structural completeness (5 pools / persona / compliance /
             # keywords / banlist / platform voice). Fires ONCE, between
             # builder and vibe. Hints get merged into the rewriter's
@@ -473,32 +480,120 @@ class PipelineOrchestrator:
             raise
 
     async def _strategy_loop(self, brief: dict) -> dict:
-        """Secretariat → Chancellery review, max 2 rejections then force pass."""
-        plan = None
-        review = None
+        """Multi-turn strategy debate between secretariat and chancellery.
 
-        for round_num in range(1, MAX_CHANCELLERY_REJECTIONS + 2):
-            if plan is None:
-                plan = await self._run_with_clarification(
-                    self.secretariat, {"brief": brief}
+        Replaces the old submit→review→revise cycle with a real
+        adversarial dialogue. Both agents see the full conversation
+        history so their positions evolve naturally through challenge
+        and response, not just "fix what I pointed out".
+
+        The debate runs up to MAX_DEBATE_TURNS (config). Secretariat
+        speaks on even turns (0, 2, 4...), chancellery on odd (1, 3, 5...).
+        Chancellery can approve at any odd turn to end early.
+
+        Each turn produces a stage_log entry for UI visibility:
+          strategy_debate_0 (secretariat proposes)
+          strategy_debate_1 (chancellery challenges)
+          strategy_debate_2 (secretariat responds)
+          ...
+        """
+        max_turns = int(getattr(
+            __import__("pipeline.config", fromlist=["MAX_DEBATE_TURNS"]),
+            "MAX_DEBATE_TURNS",
+            8,
+        ))
+        debate_history: list[dict] = []
+        plan = None
+
+        for turn in range(max_turns):
+            stage_name = f"strategy_debate_{turn}"
+            is_secretariat = (turn % 2 == 0)
+
+            if is_secretariat:
+                # Secretariat's turn: propose or respond to challenges
+                input_data = {"brief": brief}
+                if debate_history:
+                    input_data["debate_history"] = debate_history
+                    input_data["debate_mode"] = True
+
+                agent = self.secretariat
+                orig_stage = agent.stage_name
+                agent.stage_name = stage_name
+                try:
+                    response = await self._run_with_clarification(agent, input_data)
+                finally:
+                    agent.stage_name = orig_stage
+
+                # Extract the plan from secretariat's response. In debate
+                # mode it's in current_plan; in initial mode it's the
+                # top-level output.
+                plan = response.get("current_plan") or response
+                debate_history.append({
+                    "role": "secretariat",
+                    "turn": turn,
+                    "content": response,
+                })
+                logger.info(
+                    f"[strategy_debate] turn {turn} (secretariat): "
+                    f"directions={[d.get('direction_id') for d in plan.get('tactical_directions', [])]}"
                 )
             else:
-                plan = await self.secretariat.run_with_revision(
-                    brief=brief,
-                    revision_feedback=review,
-                    previous_plan=plan,
-                    run_id=self.run_id,
-                    db=self.db,
+                # Chancellery's turn: challenge or approve
+                input_data = {
+                    "review_type": "plan_review",
+                    "plan": plan,
+                    "brief": brief,
+                    "debate_history": debate_history,
+                    "debate_mode": True,
+                    "round_number": (turn // 2) + 1,
+                }
+
+                # Force pass on last chancellery turn
+                if turn >= max_turns - 1:
+                    response = {
+                        "verdict": "approved",
+                        "challenges": [],
+                        "overall_assessment": "⚠️ 辩论达到最大轮次，强制通过",
+                    }
+                    log = self.db.create_stage_log(
+                        self.run_id, stage_name, input_data
+                    )
+                    self.db.update_stage_log(
+                        log["id"], status="completed", output_data=response
+                    )
+                else:
+                    agent = self.chancellery
+                    orig_stage = agent.stage_name
+                    agent.stage_name = stage_name
+                    try:
+                        response = await agent.run(input_data, self.run_id, self.db)
+                    finally:
+                        agent.stage_name = orig_stage
+
+                debate_history.append({
+                    "role": "chancellery",
+                    "turn": turn,
+                    "content": response,
+                })
+
+                verdict = (response.get("verdict") or "").strip().lower()
+                logger.info(
+                    f"[strategy_debate] turn {turn} (chancellery): "
+                    f"verdict={verdict}, "
+                    f"challenges={len(response.get('challenges', []))}"
                 )
 
-            review = await self.chancellery.run_review(
-                plan, brief, self.run_id, self.db, round_number=round_num
-            )
+                if verdict == "approved":
+                    logger.info(
+                        f"[strategy_debate] approved after {turn + 1} turns"
+                    )
+                    return plan
 
-            if review.get("verdict") == "approved":
-                return plan
-
-        return plan  # Forced pass on last round
+        logger.warning(
+            f"[strategy_debate] max turns ({max_turns}) reached, "
+            f"forcing plan through"
+        )
+        return plan
 
     async def _run_ministries(
         self, tasks: dict, brief: dict, plan: dict, done: dict | None = None
@@ -1283,6 +1378,129 @@ class PipelineOrchestrator:
             "shared_skeleton": works_plan.get("shared_skeleton", {}),
             "_uncertainty_summary": works_plan.get("_uncertainty_summary", {}),
         }
+
+    async def _run_narrative_director(
+        self, final_system: dict, works_plan: dict
+    ) -> None:
+        """Narrative Director: cross-cell coherence + diversity audit.
+
+        Looks at the WHOLE prompt_matrix as a unit. If it finds issues
+        (e.g. 3/6 cells use the same hook type), outputs per-cell fix
+        instructions. Affected cells get selectively rebuilt via the
+        same builder flow (not a full matrix re-run).
+        """
+        prompt_cells = final_system.get("prompt_matrix") or []
+        if len(prompt_cells) < 2:
+            # Single cell — nothing to compare
+            return
+
+        # Build slim input (director doesn't need full system_prompt text,
+        # just demo_output + direction/persona/hook metadata)
+        slim_cells = [
+            {
+                "cell_id": c.get("cell_id"),
+                "direction_id": c.get("direction_id"),
+                "direction_name": c.get("direction_name"),
+                "platform": c.get("platform"),
+                "demo_output": (c.get("demo_output") or "")[:500],
+                "system_prompt_preview": (c.get("system_prompt") or "")[:300],
+            }
+            for c in prompt_cells
+        ]
+
+        try:
+            review = await self.narrative_director.run(
+                {"prompt_cells": slim_cells},
+                self.run_id,
+                self.db,
+            )
+        except Exception as e:
+            logger.warning(
+                "[narrative_director] failed, skipping: %r", e
+            )
+            return
+
+        verdict = (review.get("verdict") or "").lower()
+        cells_to_revise = review.get("cells_to_revise") or []
+
+        if verdict == "all_coherent" or not cells_to_revise:
+            logger.info(
+                "[narrative_director] all_coherent — no cross-cell issues"
+            )
+            final_system["_narrative_director_result"] = review
+            return
+
+        logger.warning(
+            "[narrative_director] needs_adjustment — %d cells flagged: %s",
+            len(cells_to_revise),
+            [c.get("cell_id") for c in cells_to_revise],
+        )
+        final_system["_narrative_director_result"] = review
+
+        # Selective rebuild: for each flagged cell, inject the director's
+        # fix_instruction into the builder's input as a _narrative_directive
+        # and re-run just that cell. Reuse the existing single-cell builder
+        # flow from _run_works_builders (build_single_cell).
+        cell_plans_by_id = {
+            c.get("cell_id"): c
+            for c in works_plan.get("cell_plans", [])
+        }
+        shared_skeleton = works_plan.get("shared_skeleton", {})
+
+        for revision in cells_to_revise:
+            cid = revision.get("cell_id")
+            fix = revision.get("fix_instruction", "")
+            if not cid or not fix:
+                continue
+            cell_plan = cell_plans_by_id.get(cid)
+            if not cell_plan:
+                continue
+
+            logger.info(
+                "[narrative_director] rebuilding %s: %s",
+                cid,
+                fix[:100],
+            )
+            try:
+                rebuild_input = {
+                    "active_cells": [cell_plan],
+                    "shared_skeleton": shared_skeleton,
+                    "_batch_info": {
+                        "label": f"叙事导演修复 {cid}",
+                        "round": "narrative_fix",
+                        "cell_ids": [cid],
+                    },
+                    "_narrative_directive": fix,
+                    "_strict_contract": (
+                        f"叙事导演要求修改这个 cell：{fix}\n"
+                        f"在保留原有合规/关键词/人设的前提下，按指令调整 "
+                        f"demo_output 的钩子结构或叙事方式。"
+                    ),
+                }
+                rebuilt = await self.works_builder.run(
+                    rebuild_input, self.run_id, self.db
+                )
+                new_cells = rebuilt.get("prompt_cells") or []
+                for nc in new_cells:
+                    if nc.get("cell_id") == cid:
+                        # Replace in prompt_matrix
+                        for i, c in enumerate(prompt_cells):
+                            if c.get("cell_id") == cid:
+                                prompt_cells[i] = nc
+                                logger.info(
+                                    "[narrative_director] rebuilt %s OK",
+                                    cid,
+                                )
+                                break
+                        break
+            except Exception as e:
+                logger.warning(
+                    "[narrative_director] rebuild %s failed: %r",
+                    cid,
+                    e,
+                )
+
+        final_system["prompt_matrix"] = prompt_cells
 
     async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
         """B: fetch user-pasted xiaohongshu post URLs via Gemini url_context.
