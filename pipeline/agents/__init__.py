@@ -41,6 +41,13 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 # ── API config cache (populated in main thread, used by background threads) ──
 _api_config: dict[str, str] = {}
+# Guard the narrow write-during-run path in _call_claude: when the backend
+# rejects cache_control with 400, multiple concurrent agent threads can all
+# hit the same fault simultaneously. Without this lock N threads each do a
+# redundant fallback retry before any of them flips the "cache disabled" bit
+# in _api_config. Init-time writes to _api_config are single-threaded so they
+# don't need the lock.
+_api_config_lock = threading.Lock()
 
 
 def _list_claude_relay_presets() -> dict[str, dict]:
@@ -827,14 +834,42 @@ class BaseAgent:
         _preset_supports_adaptive = _api_config.get(
             "supports_adaptive_thinking", True
         )
+        # Adaptive thinking is an Opus-4.6-specific API feature. Match the
+        # canonical model family prefix instead of a bare "4-6" substring
+        # so future names like "claude-opus-5-0" don't accidentally match
+        # and we don't cross-match unrelated model names that happen to
+        # contain those digits.
+        _is_opus_4_6_family = (
+            "claude-opus-4-6" in effective_model
+            or "claude-sonnet-4-6" in effective_model
+        )
         if self._use_thinking and not _preset_uses_suffix:
-            if "4-6" in effective_model and _preset_supports_adaptive:
+            if _is_opus_4_6_family and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": THINKING_BUDGET_TOKENS,
                 }
+        elif self._use_thinking and _preset_uses_suffix:
+            # Suffix-mode sanity check: the relay is supposed to infer
+            # thinking tier from the model NAME, so the effective model for
+            # a thinking stage must carry one of the known suffixes. If the
+            # operator forgot to set a model_override for this stage, we'd
+            # silently run it WITHOUT thinking on a non-thinking base model.
+            # Log once per stage so the mis-config surfaces instead of
+            # mysteriously-worse outputs.
+            if not any(
+                s in effective_model
+                for s in ("-thinking", "-high", "-medium", "-low")
+            ):
+                logger.warning(
+                    "[%s] thinking_via_model_suffix=True but effective model "
+                    "%r has no known thinking suffix — this stage will likely "
+                    "run without thinking. Check model_overrides in secrets.",
+                    self.stage_name,
+                    effective_model,
+                )
 
         # Apply rate limiting. Vertex returns None (server-side quota);
         # relay/direct gets the sliding-window limiter so we respect both
@@ -872,19 +907,24 @@ class BaseAgent:
             )
             if is_cache_fault:
                 _active_preset = get_active_claude_relay_name() or "_global"
-                logger.warning(
-                    "[cache-fallback] backend rejected cache_control with 400, "
-                    "auto-disabling caching for preset '%s' and retrying. "
-                    "Error: %s",
-                    _active_preset,
-                    err_text[:300],
-                )
-                # Disable caching for the CURRENT preset only. Other presets
-                # (which may support caching) are unaffected. The flag is
-                # stored under a per-preset key so switching relays via the
-                # settings page restores the correct behavior automatically.
-                _api_config[f"_cache_disabled_{_active_preset}"] = True
-                _api_config["supports_cache"] = False
+                _cache_key = f"_cache_disabled_{_active_preset}"
+                # Check-and-set under a lock so concurrent agents all see the
+                # same decision. First thread that gets the lock flips the
+                # bit; later threads see it set and skip the log spam but
+                # still fall through to the cache-less retry with this
+                # thread's own kwargs.
+                with _api_config_lock:
+                    _first_to_disable = not _api_config.get(_cache_key)
+                    _api_config[_cache_key] = True
+                    _api_config["supports_cache"] = False
+                if _first_to_disable:
+                    logger.warning(
+                        "[cache-fallback] backend rejected cache_control with 400, "
+                        "auto-disabling caching for preset '%s' and retrying. "
+                        "Error: %s",
+                        _active_preset,
+                        err_text[:300],
+                    )
                 kwargs["system"] = system_prompt  # plain string, no cache
                 response = _do_stream(kwargs)
             else:

@@ -86,10 +86,20 @@ try:
                         st.session_state.pop(f"confirm_del_{pid}", None)
                         st.rerun()
 
-        # Auto-refresh while any project is running
+        # Auto-refresh while any project is running. Streamlit has no
+        # server-push, so the only way to see live status is a periodic
+        # rerun. Guarded by a user toggle so a user can freeze the view
+        # (e.g. while copying something from a table) without the page
+        # yanking out from under them.
         if running > 0:
-            time.sleep(5)
-            st.rerun()
+            _auto = st.toggle(
+                "🔄 自动刷新（每 5 秒）",
+                value=st.session_state.get("dashboard_auto_refresh", True),
+                key="dashboard_auto_refresh",
+            )
+            if _auto:
+                time.sleep(5)
+                st.rerun()
 
 except Exception as e:
     st.error(f"无法连接数据库。请在「设置」页面配置 Supabase 连接。\n\n错误：{e}")

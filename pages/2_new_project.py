@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 
 import streamlit as st
 from utils.version_badge import show_version_badge
@@ -13,31 +14,67 @@ st.title("📝 新建 Prompt 工程项目")
 
 # ── File processing helpers ────────────────────────────────────────────────
 
+# Hard caps enforced server-side (the `type=[...]` arg on st.file_uploader is
+# just a UI hint, the client can still post anything). Images go into the
+# prompt as base64, which inflates by ~33%; 2 MB decoded → ~2.7 MB encoded,
+# which is already a lot of tokens. Text-like files are bounded to 1 MB so a
+# runaway upload can't blow the free-text column / LLM context.
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024
+_MAX_TEXT_BYTES = 1 * 1024 * 1024
+_TEXT_EXTS = (".txt", ".md", ".json")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def _read_with_cap(uploaded_file, max_bytes: int) -> bytes | None:
+    """Read uploaded_file and return bytes, or None if it exceeds max_bytes.
+    Uses .size when available (Streamlit UploadedFile exposes it) to avoid
+    materializing oversized content in memory."""
+    size = getattr(uploaded_file, "size", None)
+    if size is not None and size > max_bytes:
+        return None
+    data = uploaded_file.read()
+    if len(data) > max_bytes:
+        return None
+    return data
+
+
 def extract_file_content(uploaded_file) -> str:
-    """Extract text content from an uploaded file."""
+    """Extract text content from an uploaded file. Enforces size caps."""
     name = uploaded_file.name.lower()
 
-    if name.endswith((".txt", ".md", ".json")):
-        return uploaded_file.read().decode("utf-8", errors="replace")
+    if name.endswith(_TEXT_EXTS):
+        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
+        if data is None:
+            return f"[文件过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
+        return data.decode("utf-8", errors="replace")
 
     if name.endswith(".pdf"):
+        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
+        if data is None:
+            return f"[PDF 过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
         try:
             from PyPDF2 import PdfReader
-            reader = PdfReader(io.BytesIO(uploaded_file.read()))
+            reader = PdfReader(io.BytesIO(data))
             return "\n".join(page.extract_text() or "" for page in reader.pages)
         except Exception as e:
             return f"[PDF 解析失败: {e}]"
 
     if name.endswith(".docx"):
+        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
+        if data is None:
+            return f"[DOCX 过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
         try:
             from docx import Document
-            doc = Document(io.BytesIO(uploaded_file.read()))
+            doc = Document(io.BytesIO(data))
             return "\n".join(p.text for p in doc.paragraphs)
         except Exception as e:
             return f"[DOCX 解析失败: {e}]"
 
-    if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-        b64 = base64.b64encode(uploaded_file.read()).decode("utf-8")
+    if name.endswith(_IMAGE_EXTS):
+        data = _read_with_cap(uploaded_file, _MAX_IMAGE_BYTES)
+        if data is None:
+            return f"[图片过大跳过: {uploaded_file.name} > {_MAX_IMAGE_BYTES // 1024 // 1024}MB]"
+        b64 = base64.b64encode(data).decode("utf-8")
         return f"[图片文件: {uploaded_file.name}, base64长度: {len(b64)}]\n[BASE64_IMAGE:{b64}]"
 
     return f"[不支持的文件类型: {uploaded_file.name}]"
@@ -412,7 +449,7 @@ with tab_iterate:
                 else:
                     full_text = f"[继承自项目: {base_project['name']}]\n"
                     if brief:
-                        full_text += f"[已有Brief]\n{__import__('json').dumps(brief, ensure_ascii=False, indent=2)}\n[/已有Brief]\n\n"
+                        full_text += f"[已有Brief]\n{json.dumps(brief, ensure_ascii=False, indent=2)}\n[/已有Brief]\n\n"
                     action = "扩展新方向" if is_extend else "迭代优化"
                     full_text += f"[{action}说明]\n{iter_notes}\n"
                     full_text += process_uploaded_files(files_iter)

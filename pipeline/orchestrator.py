@@ -2221,8 +2221,13 @@ class PipelineOrchestrator:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
                 )
-            except Exception as e:
-                logger.warning(f"Vibe critic failed ({e}), proceeding without critique")
+            except Exception:
+                # Full traceback so a vibe-critic failure isn't a mystery
+                # ("why did this run skip the vibe loop?"). Still non-fatal:
+                # we proceed with whatever the builder produced.
+                logger.exception(
+                    "Vibe critic failed, proceeding without critique"
+                )
                 break
 
             failed = critic_result.get("failed_cells", [])

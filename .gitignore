@@ -3,10 +3,18 @@ __pycache__/
 *$py.class
 *.so
 .env
+.env.*
+.env.local
+.env.*.local
 .venv/
 venv/
 ENV/
 .streamlit/secrets.toml
+.streamlit/secrets.*.toml
+# IDE-local settings that often pick up env vars
+.vscode/settings.json
+.idea/
+*.iml
 *.egg-info/
 dist/
 build/
