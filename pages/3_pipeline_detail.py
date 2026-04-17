@@ -431,16 +431,38 @@ for ni_log in needs_input_logs:
 
         if submitted and user_answer.strip():
             intervention = {"answer": user_answer.strip()}
+            # Size caps match pages/2_new_project.py::extract_file_content.
+            # st.file_uploader's `type=` arg is a UI hint only; clients can
+            # post anything, so the cap is enforced here.
+            _MAX_IMAGE_BYTES = 2 * 1024 * 1024
+            _MAX_TEXT_BYTES = 1 * 1024 * 1024
             if uploaded_files:
                 file_texts = []
                 for f in uploaded_files:
                     try:
                         name = f.name.lower()
-                        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                        is_image = name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                        cap = _MAX_IMAGE_BYTES if is_image else _MAX_TEXT_BYTES
+                        size = getattr(f, "size", None)
+                        if size is not None and size > cap:
+                            file_texts.append(
+                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
+                            )
+                            continue
+                        data = f.read()
+                        if len(data) > cap:
+                            file_texts.append(
+                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
+                            )
+                            continue
+                        if is_image:
+                            b64 = base64.b64encode(data).decode("utf-8")
                             file_texts.append(f"[补充图片: {f.name}]\n[BASE64_IMAGE:{b64}]")
                         else:
-                            file_texts.append(f"[补充文件: {f.name}]\n{f.read().decode('utf-8', errors='replace')}")
+                            file_texts.append(
+                                f"[补充文件: {f.name}]\n"
+                                f"{data.decode('utf-8', errors='replace')}"
+                            )
                     except Exception:
                         file_texts.append(f"[补充文件: {f.name}]（无法读取）")
                 intervention["supplementary_files"] = "\n\n".join(file_texts)
@@ -1364,6 +1386,15 @@ with c3:
             st.error(f"重跑失败：{_err}")
 
 # Auto-refresh when running or paused for review (waiting for user input).
+# Streamlit has no server-push, so live progress requires periodic reruns.
+# Gated by a user toggle so the page doesn't yank out while someone's reading
+# a stage log mid-run.
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
-    time.sleep(POLL_INTERVAL_SECONDS)
-    st.rerun()
+    _auto = st.toggle(
+        f"🔄 自动刷新（每 {POLL_INTERVAL_SECONDS} 秒）",
+        value=st.session_state.get("detail_auto_refresh", True),
+        key="detail_auto_refresh",
+    )
+    if _auto:
+        time.sleep(POLL_INTERVAL_SECONDS)
+        st.rerun()

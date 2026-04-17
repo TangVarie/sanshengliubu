@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS projects (
     task_type TEXT DEFAULT 'new_system',   -- new_system | iteration | extension
     brief JSONB,                           -- 太子产出的结构化 brief
     free_text TEXT,                        -- 用户原始输入
-    base_project_id UUID REFERENCES projects(id),  -- 迭代关联
+    base_project_id UUID REFERENCES projects(id) ON DELETE SET NULL,  -- 迭代关联；父项目删除后保留子项目但断开引用
     created_by TEXT DEFAULT 'default',
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
