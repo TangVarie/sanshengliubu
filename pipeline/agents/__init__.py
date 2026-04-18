@@ -30,7 +30,6 @@ from pipeline.config import (
     MAX_RETRIES,
     MAX_TOKENS_DEFAULT,
     MAX_TOKENS_PER_RUN,
-    MODEL_FALLBACKS,
     MODELS,
     RETRY_BASE_DELAY_SECONDS,
     STAGE_MAX_TOKENS,
@@ -1171,9 +1170,6 @@ class BaseAgent:
         total_output_tokens = 0
 
         last_error = None
-        # v0.28.1: track whether we've already swapped to a fallback model
-        # during this run() call, so we don't oscillate between models.
-        _fallback_used = False
         for attempt in range(MAX_RETRIES + 1):
             try:
                 system_prompt = self.load_system_prompt()
@@ -1327,38 +1323,19 @@ class BaseAgent:
                     # from transient model weirdness.
                     _retryable = attempt < 1  # allow at most 1 retry for parse errors
 
-                # v0.28.1: detect upstream 5xx (relay / Anthropic internal)
-                # for two behaviors:
-                #   1. Longer backoff (upstream usually needs 10-30s to recover)
-                #   2. Model fallback — if the primary model has a configured
-                #      fallback (see MODEL_FALLBACKS) and this isn't already
-                #      the fallback, swap self.model for the remaining retries.
-                #      Typical case: relay hasn't routed claude-opus-4-7 yet
-                #      and returns 502; auto-swap to claude-opus-4-6 lets the
-                #      pipeline keep running instead of hard-failing.
+                # v0.28.2: 对上游 5xx(relay 或 Anthropic internal)用更长的
+                # 退避窗口 —— 抖动通常需要 10-30s 恢复,3s*2^attempt 太激进,
+                # 会把重试烧在还没恢复的上游。5xx 用 base=10s,其他错误仍用
+                # RETRY_BASE_DELAY_SECONDS(3s)。
+                # 注意:v0.28.1 的模型自动降级已移除——用户明确选择"全部用
+                # Opus 4.7,失败就重跑",避免降级在 multi-batch 场景下悄悄
+                # 污染后续 batch。
                 _is_5xx = isinstance(
                     e,
                     (anthropic.InternalServerError, anthropic.APIConnectionError),
                 )
 
                 if _retryable and attempt < MAX_RETRIES:
-                    if _is_5xx and not _fallback_used:
-                        _fallback_model = MODEL_FALLBACKS.get(self.model)
-                        if _fallback_model:
-                            logger.warning(
-                                "[%s] %s on %r; swapping to fallback %r "
-                                "for remaining retries",
-                                self.stage_name,
-                                type(e).__name__,
-                                self.model,
-                                _fallback_model,
-                            )
-                            self.model = _fallback_model
-                            _fallback_used = True
-                    # Longer backoff for 5xx — upstream relays / Anthropic
-                    # internal typically need ≥10s to recover; 3s*2^attempt
-                    # is too aggressive and burns retries on still-broken
-                    # upstream. Use 10s base for 5xx, 3s for everything else.
                     _base = 10 if _is_5xx else RETRY_BASE_DELAY_SECONDS
                     delay = _base * (2 ** attempt)
                     await asyncio.sleep(delay)
