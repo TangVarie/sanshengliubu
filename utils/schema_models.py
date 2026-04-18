@@ -58,6 +58,12 @@ class TacticalDirection(BaseModel):
     target_scenario: str = ""
     content_angle: str = ""
     expected_output_type: str = ""
+    # v0.27.0 "B 版思考顺序"三个必填字段 — secretariat 标注,下游 cell_planner
+    # + vibe_critic 消费。extra="allow" 保留兼容性,未填时下游按默认值走。
+    paradigm: str = ""  # "A_emotional_hook" | "B_meta_response"
+    reward_type: str = ""  # 6 选 1: 实用信息/社交信息/情绪共鸣/认知挑战/感官新奇/身份共谋
+    role_embodiment: str = ""  # 6 选 1: 旁观者/学习者/窥探者/受害者/共谋者/评审者
+    gap_direction: str = ""  # 2 选 1: 事件本身 | 复现方法
 
 
 class ModulePlan(BaseModel):
