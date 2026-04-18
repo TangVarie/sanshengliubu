@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.27.0"
+VERSION = "v0.28.0"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "内容思维框架集成:中书省+奖励类型/角色/缺口方向 · 格子规划+8路径/产品副产品化 · vibe 4乘数硬门槛+模板性检测"
+VERSION_NOTES = "10 底层原则进 foundation(全 agent 共享) · Opus 升 4.7 · 写作专用 Sonnet 3.7(网感更强)"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -41,8 +41,21 @@ VERSION_NOTES = "内容思维框架集成:中书省+奖励类型/角色/缺口�
 #                   chancellery_final) may produce lower-quality plans.
 #                   Mostly useful for dev loops / cost-tight pilots.
 
-OPUS_MODEL = "claude-opus-4-6"
+OPUS_MODEL = "claude-opus-4-7"
+# 用于 all_sonnet preset 以及 planning / 结构化任务(planning 阶段需要
+# Sonnet 4-6 的稳定 JSON 输出能力)。
 SONNET_MODEL = "claude-sonnet-4-6"
+# v0.28.0: 内容写作专用模型。老版本 Sonnet(3.7)在纯写作任务上对齐
+# 痕迹更少,常被反馈"网感更强 / 更像真人",所以把 content 角色单独
+# 绑到 3.7 而不是跟 planning 共用 Sonnet 4.6。
+# 注意:实际模型名可能因 relay / Vertex 不同而需要调整——比如
+# Anthropic 官方是 "claude-3-7-sonnet-20250219"。如果你的接入点不
+# 认识 "claude-sonnet-3-7",可在 secrets.toml 的
+# [claude_relay_presets.X.model_overrides] 里覆盖:
+#   ministry_works_builder = "claude-3-7-sonnet-latest"
+#   vibe_rewriter = "claude-3-7-sonnet-latest"
+#   ...
+SONNET_CONTENT_MODEL = "claude-sonnet-3-7"
 
 MODEL_PRESET = "content_sonnet"
 
@@ -74,12 +87,21 @@ _STAGE_ROLES = {
 
 def _resolve_models(preset: str) -> dict[str, str]:
     """Assemble the MODELS dict from role tags + preset. Returning a dict
-    keeps consumers (logging, cost accounting, settings UI) unchanged."""
+    keeps consumers (logging, cost accounting, settings UI) unchanged.
+
+    v0.28.0: content 角色现在用 SONNET_CONTENT_MODEL(Sonnet 3.7),和
+    planning 角色用的 SONNET_MODEL(Sonnet 4.6)分开。因为 content 要人
+    味写作,老 Sonnet 更好;planning 要稳定 JSON,新 Sonnet 更好。
+    """
     if preset == "all_sonnet":
-        return {k: SONNET_MODEL for k in _STAGE_ROLES}
+        # 全 Sonnet 模式:planning 依旧用 4.6 保结构,content 用 3.7 保网感
+        return {
+            k: (SONNET_CONTENT_MODEL if role == "content" else SONNET_MODEL)
+            for k, role in _STAGE_ROLES.items()
+        }
     if preset == "content_sonnet":
         return {
-            k: (SONNET_MODEL if role == "content" else OPUS_MODEL)
+            k: (SONNET_CONTENT_MODEL if role == "content" else OPUS_MODEL)
             for k, role in _STAGE_ROLES.items()
         }
     # Default / fallback: all_opus
@@ -310,15 +332,24 @@ ENABLE_PROMPT_CACHING = True
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    "claude-opus-4-7": 15.0,
     "claude-opus-4-6": 15.0,
     "claude-opus-4-1": 5.0,
     "claude-sonnet-4-6": 3.0,
+    "claude-sonnet-3-7": 3.0,  # Sonnet 3.7 价格与 Sonnet 4.x 同量级
+    # Anthropic 官方名兼容(如果 relay 要求用全名)
+    "claude-3-7-sonnet-20250219": 3.0,
+    "claude-3-7-sonnet-latest": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-7": 75.0,
     "claude-opus-4-6": 75.0,
     "claude-opus-4-1": 25.0,
     "claude-sonnet-4-6": 15.0,
+    "claude-sonnet-3-7": 15.0,
+    "claude-3-7-sonnet-20250219": 15.0,
+    "claude-3-7-sonnet-latest": 15.0,
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────
