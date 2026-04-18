@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.28.2"
+VERSION = "v0.28.3"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "撤销模型自动降级(用户偏好全程 Opus 4.7);保留 5xx 长退避(10s base)"
+VERSION_NOTES = "修正 _resolve_models docstring(planning 在 content_sonnet 下走 Opus 4.7,不是 Sonnet 4.6)"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -89,12 +89,29 @@ def _resolve_models(preset: str) -> dict[str, str]:
     """Assemble the MODELS dict from role tags + preset. Returning a dict
     keeps consumers (logging, cost accounting, settings UI) unchanged.
 
-    v0.28.0: content 角色现在用 SONNET_CONTENT_MODEL(Sonnet 3.7),和
-    planning 角色用的 SONNET_MODEL(Sonnet 4.6)分开。因为 content 要人
-    味写作,老 Sonnet 更好;planning 要稳定 JSON,新 Sonnet 更好。
+    角色 → 模型映射(按 preset):
+
+    content_sonnet(默认):
+      - content 角色(builder / vibe_critic / vibe_rewriter / red_blue /
+        persona_simulator) → SONNET_CONTENT_MODEL(默认 Sonnet 3.7,写作
+        人味最重)
+      - 其他所有角色(strategy + planning + cross-cell coherence) →
+        OPUS_MODEL(默认 Opus 4.7,深推理)
+
+    all_sonnet:
+      - content 角色 → SONNET_CONTENT_MODEL(Sonnet 3.7)
+      - 其他角色 → SONNET_MODEL(Sonnet 4.6,稳定 JSON 输出)
+
+    all_opus:
+      - 全部 → OPUS_MODEL
+
+    注:planning 角色(尚书省 / 六部 / 格子规划)在 content_sonnet 下用 Opus
+    (不是 Sonnet),因为 "Structured planning: Opus preferred for stability"
+    ——结构化派发需要稳定的指令理解,降到 Sonnet 会偶尔漏字段。如果要
+    planning 走 Sonnet 省钱,改用 all_sonnet preset。
     """
     if preset == "all_sonnet":
-        # 全 Sonnet 模式:planning 依旧用 4.6 保结构,content 用 3.7 保网感
+        # 全 Sonnet 模式:content 用 3.7 保网感,其他用 4.6 保结构
         return {
             k: (SONNET_CONTENT_MODEL if role == "content" else SONNET_MODEL)
             for k, role in _STAGE_ROLES.items()
