@@ -1,5 +1,8 @@
 import streamlit as st
 
+from pipeline.config import VERSION, VERSION_DATE, VERSION_NOTES
+from utils.version_badge import show_version_badge
+
 st.set_page_config(
     page_title="三省六部 · Prompt Engineering",
     page_icon="🏛️",
@@ -7,7 +10,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("🏛️ 三省六部 · Prompt Engineering System")
+show_version_badge()
+
+st.title(f"🏛️ 三省六部 · Prompt Engineering System  `{VERSION}`")
+st.caption(f"Build {VERSION_DATE} — {VERSION_NOTES}")
 st.markdown(
     """
     **输入**：产品 brief / 场景需求 / 现有 prompt 迭代诉求

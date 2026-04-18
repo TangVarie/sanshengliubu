@@ -5,8 +5,10 @@ import json
 import streamlit as st
 from db.supabase_client import SupabaseClient
 from utils.export import export_as_markdown, export_as_json
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="产出中心", page_icon="📦", layout="wide")
+show_version_badge()
 st.title("📦 产出中心")
 
 project_id = st.session_state.get("current_project_id") or st.query_params.get("project_id")
@@ -55,9 +57,11 @@ if final_review:
     else:
         st.warning(f"⚠️ 终审状态：{verdict}")
 
-# Display prompt matrix (platform → direction) or legacy templates
-matrix = prompt_system.get("prompt_matrix", [])
-templates = prompt_system.get("prompt_templates", [])
+# Display prompt matrix (platform → direction).
+# Old runs (pre-v0.6.1) had a duplicate `prompt_templates` field that was
+# identical to `prompt_matrix` — fall back to it for backwards compatibility.
+matrix = prompt_system.get("prompt_matrix", []) or prompt_system.get("prompt_templates", [])
+templates = prompt_system.get("prompt_templates", []) if not matrix else []
 
 if matrix:
     st.subheader("Prompt 矩阵")
@@ -91,6 +95,32 @@ if matrix:
                     rewrite_summary = cell.get("rewrite_summary")
                     if rewrite_summary:
                         st.info(f"🎯 网感重写：{rewrite_summary}")
+
+                    # A2: per-direction reference posts (Gemini pulled
+                    # real current Xiaohongshu content with same direction
+                    # theme). Side-by-side comparison anchor — did we
+                    # hit the right vibe or not?
+                    _refs = (prompt_system.get("_per_direction_references") or {})
+                    _cell_refs = _refs.get(cell.get("direction_id", ""), {})
+                    _ref_posts = _cell_refs.get("posts") or []
+                    if _ref_posts:
+                        st.markdown(
+                            "**🔭 对标参考**（Gemini 搜到的当前小红书真实同方向帖子）"
+                        )
+                        st.caption(
+                            "对比我们的 demo 跟下面这些真人帖子的第一句/场景感——"
+                            "如果差距很大，考虑点「应用修订意见」重跑工部。"
+                        )
+                        for rp in _ref_posts:
+                            title = rp.get("title") or "(无标题)"
+                            snippet = rp.get("snippet") or ""
+                            url = rp.get("url", "")
+                            flag = " ⚠️ 疑似分析文" if rp.get("_suspect_analysis") else ""
+                            st.markdown(f"- **《{title}》**{flag}")
+                            if snippet:
+                                st.caption(snippet)
+                            if url:
+                                st.caption(f"→ [{url}]({url})")
 
 elif templates:
     # Legacy: direction-based display for old project data
@@ -136,12 +166,6 @@ if demos:
         with st.expander(f"{demo.get('direction_id', '')} — {demo.get('platform', '')}"):
             st.markdown(f"**人设**: {demo.get('persona_used', '')}")
             st.markdown(demo.get("output_content", ""))
-
-# Usage guide
-guide = prompt_system.get("usage_guide", "")
-if guide:
-    with st.expander("📖 使用指南"):
-        st.markdown(guide)
 
 # Uncertainty summary (low-impact residuals — high-impact resolved via clarification upstream)
 uncertainty_summary = prompt_system.get("_uncertainty_summary", {})
@@ -219,15 +243,6 @@ if uncertainty_summary:
                 st.session_state["current_project_id"] = project_id
                 st.query_params["project_id"] = project_id
                 st.switch_page("pages/3_pipeline_detail.py")
-
-# Batch rules — these should already be baked into each cell's system_prompt.
-# Only show as a debug reference, not a primary artifact the user needs to
-# remember to load alongside the prompts.
-batch_rules = prompt_system.get("batch_rules", {})
-if batch_rules:
-    with st.expander("⚙️ 批量管理规则（调试参考·已内置到每个 system_prompt）", expanded=False):
-        st.caption("这些规则已经写进上面每个格子的 system_prompt 里，你复制 system_prompt 就自动带上了。此处仅作为调试参考。")
-        st.json(batch_rules)
 
 # ── Export ──────────────────────────────────────────────────────────────────
 

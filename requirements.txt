@@ -1,6 +1,15 @@
-streamlit>=1.32.0
-anthropic>=0.25.0
-supabase>=2.4.0
-pydantic>=2.6.0
-PyPDF2>=3.0.0
-python-docx>=1.0.0
+# Upper bounds pin the next major version so a `pip install -U` can't
+# silently pull a breaking release into a working deployment. Bump the
+# ceiling deliberately after verifying the new major locally.
+streamlit>=1.32.0,<2.0.0
+anthropic[vertex]>=0.25.0,<1.0.0
+google-auth>=2.20.0,<3.0.0
+# Gemini (Vertex AI Express API key or Studio API key). Optional —
+# pipeline runs fine without it; when configured it acts as a second-
+# opinion critic + structure reviewer. See pipeline/config.py
+# ENABLE_GEMINI_ASSIST and VERTEX_EXPRESS_API_KEY in secrets.toml.
+google-genai>=0.3.0,<2.0.0
+supabase>=2.4.0,<3.0.0
+pydantic>=2.6.0,<3.0.0
+PyPDF2>=3.0.0,<4.0.0
+python-docx>=1.0.0,<2.0.0

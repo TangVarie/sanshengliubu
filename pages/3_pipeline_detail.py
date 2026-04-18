@@ -6,9 +6,81 @@ import time
 
 import streamlit as st
 from db.supabase_client import SupabaseClient
-from pipeline.config import PIPELINE_STAGES, POLL_INTERVAL_SECONDS
+from pipeline.agents import get_run_totals
+from pipeline.config import (
+    MAX_FINAL_REJECTIONS,
+    MAX_TOKENS_PER_RUN,
+    PIPELINE_STAGES,
+    POLL_INTERVAL_SECONDS,
+)
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
+show_version_badge()
+
+
+def render_stage_error(log: dict) -> None:
+    """Render an error message for a failed stage. Always shows something,
+    even if error_message is empty/missing — silent failures are the worst.
+    Accepts non-string error_message (e.g. legacy rows that stored a dict)
+    and pretty-prints it as JSON instead of rendering a raw repr.
+    """
+    msg = (log or {}).get("error_message")
+    if msg:
+        if isinstance(msg, str):
+            text = msg.strip()
+        else:
+            try:
+                text = json.dumps(msg, ensure_ascii=False, indent=2)
+            except Exception:
+                text = repr(msg)
+        if text:
+            st.error(text)
+            return
+    st.error(
+        f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
+        f"可能原因：旧版本运行 / 中转站返回空 body / 异常对象无 __str__。\n"
+        f"请查看 Streamlit 服务端日志（运行控制台）获取完整 traceback。\n\n"
+        f"stage_log id: `{(log or {}).get('id', '?')}`"
+    )
+
+
+def render_stage_meta(log: dict | None) -> None:
+    """Show a compact caption at the top of each stage tab with the key
+    observability fields: model actually used (including [thinking ✓]
+    tag when applicable), duration, total tokens. This is how users
+    answer 'did thinking actually fire on this stage?' without needing
+    to dig into raw DB rows.
+    """
+    if not log:
+        return
+    bits: list[str] = []
+    mu = log.get("model_used")
+    if mu:
+        # Color the thinking indicator so ✓/✗ is easy to skim.
+        if "[thinking ✓]" in str(mu):
+            mu_disp = str(mu).replace(
+                "[thinking ✓]", "**`[thinking ✓]`**"
+            )
+        elif "[thinking ✗]" in str(mu):
+            mu_disp = str(mu).replace(
+                "[thinking ✗]",
+                "**`[thinking ✗ — 中转站忽略了 thinking JSON]`**",
+            )
+        else:
+            mu_disp = str(mu)
+        bits.append(f"模型 {mu_disp}")
+    tokens = log.get("tokens_used")
+    if tokens:
+        bits.append(f"tokens {int(tokens):,}")
+    dur = log.get("duration_seconds")
+    if dur:
+        bits.append(f"耗时 {float(dur):.1f}s")
+    status = log.get("status")
+    if status and status not in ("completed",):
+        bits.append(f"状态 {status}")
+    if bits:
+        st.caption(" · ".join(bits))
 
 
 def render_stage_output(output_data: dict):
@@ -53,10 +125,220 @@ except Exception as e:
 
 # ── Header ─────────────────────────────────────────────────────────────────
 
-STATUS_EMOJI = {"draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌", "paused_for_review": "⏸️"}
+STATUS_EMOJI = {
+    "draft": "📝", "running": "🔄", "completed": "✅", "failed": "❌",
+    "paused_for_review": "⏸️", "needs_revision": "📝🔁",
+}
 status = project.get("status", "draft")
+
+# Reset session-scoped busy flags once the project is no longer running.
+# Without this, a button would stay disabled in a user's tab even after
+# the pipeline completed in another tab / finished via background thread.
+if status != "running":
+    for _key in (
+        f"pipeline_busy_{project_id}",
+        f"pipeline_busy_actions_{project_id}",
+    ):
+        if st.session_state.get(_key):
+            st.session_state[_key] = False
+
 st.title(f"🏛️ {project['name']}")
 st.caption(f"状态：{STATUS_EMOJI.get(status, '❓')} {status}　|　ID: {project_id[:8]}...")
+
+# ── A: Original input viewer ─────────────────────────────────────────────
+# Let the user see exactly what this pipeline was built from — free_text,
+# structured brief, platforms, reference URLs, etc. Solves "我当初填了什么".
+_free_text = project.get("free_text", "")
+_brief = project.get("brief") or {}
+with st.expander("📋 原始输入（查看 / 复用）", expanded=False):
+    if _free_text:
+        st.markdown("**你当初提交的原文：**")
+        st.text_area(
+            "free_text（只读）",
+            value=_free_text,
+            height=150,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+    else:
+        st.caption("（free_text 为空——可能是通过 API 直接创建的项目）")
+
+    if _brief:
+        # Show key fields from structured brief in readable format
+        _brief_highlights = []
+        for _k in (
+            "product_name", "product_category", "target_audience",
+            "target_platforms", "campaign_objective", "core_claim",
+            "competitive_context", "constraints", "task_type",
+        ):
+            _v = _brief.get(_k)
+            if _v:
+                _brief_highlights.append(f"- **{_k}**: {_v}")
+        if _brief_highlights:
+            st.markdown("**结构化 Brief（太子解析结果）：**")
+            st.markdown("\n".join(_brief_highlights))
+
+        # Reference posts / trend intel if present
+        _ref_posts = (_brief.get("_reference_posts") or {}).get("posts") or []
+        if _ref_posts:
+            st.markdown(f"**参考帖子**（{len(_ref_posts)} 条）：")
+            for _rp in _ref_posts[:5]:
+                st.caption(f"- {_rp.get('title', '?')} → {_rp.get('url', '')}")
+
+        _ref_urls = _brief.get("_reference_post_urls") or []
+        if _ref_urls:
+            st.markdown(f"**用户贴的参考 URL**（{len(_ref_urls)} 条）：")
+            for _ru in _ref_urls:
+                st.caption(f"- {_ru}")
+
+        with st.expander("🔍 完整 Brief JSON", expanded=False):
+            st.json(_brief)
+
+    # B: Copy-and-modify button
+    if st.button(
+        "📋 复制并修改（基于此项目新建）",
+        help="把这个项目的原始输入复制到「新建项目」页面，预填所有字段，你只需改你想改的部分。",
+    ):
+        st.session_state["prefill_from_project"] = {
+            "product_name": _brief.get("product_name", project.get("name", "")),
+            "product_category": _brief.get("product_category", ""),
+            "target_platforms": _brief.get("target_platforms", []),
+            "campaign_objective": _brief.get("campaign_objective", []),
+            "competitive_context": _brief.get("competitive_context", ""),
+            "constraints": _brief.get("constraints", ""),
+            "free_text": _free_text,
+            "reference_urls": _brief.get("_reference_post_urls", []),
+        }
+        st.switch_page("pages/2_new_project.py")
+
+# Banner for needs_revision: surface 终审 verdict + revision instructions immediately
+if status == "needs_revision":
+    try:
+        latest_run_id = runs[0]["id"] if runs else None
+        if latest_run_id:
+            _final_logs = [
+                l for l in db.get_stage_logs(latest_run_id)
+                if l.get("stage_name") == "chancellery_final"
+            ]
+            _final_review = (_final_logs[-1].get("output_data") if _final_logs else None) or {}
+            _verdict = _final_review.get("verdict", "unknown")
+            _instructions = _final_review.get("revision_instructions", "")
+            _revisions = _final_review.get("mandatory_revisions", []) or []
+            _dimensions = _final_review.get("review_dimensions", {}) or {}
+            _suggestions = _final_review.get("suggestions", []) or []
+            # Current final-review round from _revision_context (if any)
+            _brief = (project or {}).get("brief") or {}
+            _rc = _brief.get("_revision_context") or {}
+            _current_round = int(_rc.get("round", 1)) if _rc else 1
+            _next_round = _current_round + 1 if _rc else 2
+            with st.container(border=True):
+                # Round badge — shows user how close they are to force-pass
+                if _current_round >= MAX_FINAL_REJECTIONS:
+                    st.warning(
+                        f"🔔 当前终审为 **第 {_current_round} 轮**，已达硬上限 "
+                        f"({MAX_FINAL_REJECTIONS})。再次点击「应用修订意见」会触发"
+                        f"**强制通过**——意味着门下省会自动放行，建议改为人工复核产出后"
+                        f"点「📦 查看部分产出」导出。"
+                    )
+                else:
+                    st.info(
+                        f"🔁 当前终审为 **第 {_current_round} 轮 / 共 {MAX_FINAL_REJECTIONS} 轮**。"
+                        f"下次点击「应用修订意见」将触发第 {_next_round} 轮，"
+                        f"门下省会做增量评审（只看本次未解决的问题，不重复上轮已修的事）。"
+                    )
+                st.error(
+                    f"📝🔁 **终审判定：{_verdict}** — 流水线已运行完毕，但门下省终审认为产出"
+                    f"未达交付标准。下方「终审」tab 有完整审查报告。"
+                )
+                if _revisions:
+                    st.markdown("**必须修改：**")
+                    for r in _revisions:
+                        st.markdown(f"- {r}")
+                if _instructions:
+                    with st.expander("📋 修改指令", expanded=True):
+                        st.markdown(_instructions)
+
+                # If chancellery flagged revision_required but didn't populate
+                # mandatory_revisions / revision_instructions, surface whatever
+                # it DID return so the user isn't stuck with an empty banner.
+                if not _revisions and not _instructions:
+                    st.warning(
+                        "⚠️ 终审标记为 revision_required 但 `mandatory_revisions` 和 "
+                        "`revision_instructions` 两个字段都是空的。下面展开可以看到终审"
+                        "的完整原始输出——可能问题写在 `review_dimensions.issues` 或 "
+                        "`suggestions` 里，也可能是模型没填好。"
+                    )
+                    if _dimensions:
+                        dim_issues = []
+                        for dim_name, dim_data in _dimensions.items():
+                            if isinstance(dim_data, dict):
+                                score = dim_data.get("score", 0)
+                                issues = dim_data.get("issues", "")
+                                if issues and score < 5:
+                                    dim_issues.append(
+                                        f"**{dim_name}** ({score}/5): {issues}"
+                                    )
+                        if dim_issues:
+                            st.markdown("**审查维度中发现的问题：**")
+                            for di in dim_issues:
+                                st.markdown(f"- {di}")
+                    if _suggestions:
+                        st.markdown("**终审建议（非强制）：**")
+                        for s in _suggestions:
+                            st.markdown(f"- {s}")
+                    with st.expander(
+                        "🔍 终审 stage_log 完整原始输出（调试用）", expanded=False
+                    ):
+                        st.json(_final_review)
+
+                # ── Apply revision button ─────────────────────────────────
+                st.markdown("---")
+                st.markdown(
+                    "**应用修订**：把上面的 mandatory_revisions 反喂给工部，"
+                    "只重跑 工部架构 → 格子规划 → 构建 → 网感复检 → 终审，"
+                    "保留前面已完成的太子/中书省/尚书省/五部，不浪费 token。"
+                )
+                _busy_key = f"pipeline_busy_{project_id}"
+                _is_busy = st.session_state.get(_busy_key, False)
+                if st.button(
+                    "✅ 应用修订意见并重跑工部",
+                    type="primary",
+                    key="apply_revision_btn",
+                    disabled=_is_busy,
+                    help="读取终审的 mandatory_revisions 和 revision_instructions，"
+                         "存到 project.brief._revision_context，删除 ministry_works/"
+                         "cell_planner/builder/vibe_critic/vibe_rewriter/chancellery_final 的 "
+                         "stage_logs，然后触发 resume — 工部会拿到修订指令做针对性修复。",
+                ):
+                    st.session_state[_busy_key] = True
+                    from pipeline.orchestrator import (
+                        PipelineAlreadyRunningError,
+                        revise_and_resume_pipeline_in_background,
+                    )
+                    from pipeline.agents import init_api_config
+                    init_api_config()
+                    try:
+                        revise_and_resume_pipeline_in_background(
+                            project_id, latest_run_id, db
+                        )
+                        st.success(
+                            "✅ 已触发修订流程。修订指令已存入 project.brief，"
+                            "工部相关 stage_logs 已清除，流水线将从工部重跑并把"
+                            "修订意见作为 _revision_directives 注入到工部各 agent。"
+                        )
+                        st.rerun()
+                    except PipelineAlreadyRunningError as _err:
+                        st.session_state[_busy_key] = False
+                        st.warning(
+                            f"⚠️ {_err}\n\n"
+                            "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                            "按钮重置状态，再试。"
+                        )
+                    except Exception as _err:
+                        st.session_state[_busy_key] = False
+                        st.error(f"应用修订失败：{_err}")
+    except Exception as _e:
+        st.warning(f"无法加载终审报告：{_e}")
 
 if not runs:
     st.info("此项目尚未启动流水线。")
@@ -67,15 +349,31 @@ run = runs[0]
 run_id = run["id"]
 stage_logs = db.get_stage_logs(run_id)
 
-# Build a lookup: stage_name -> log
+# If Supabase couldn't return the full payload (free-tier connection hiccups,
+# big output_data blobs), .partial flips True and we fall back to a slim
+# query without output_data. Surface it so the user isn't puzzled by empty
+# stage details after a flaky refresh.
+if getattr(stage_logs, "partial", False):
+    st.warning(
+        "⚠️ 数据未完整加载：当前表格未包含各阶段的 `output_data`（受 Supabase "
+        "连接/负载影响，系统自动降级成轻量查询）。刷新页面通常会恢复。"
+    )
+
+# Build a lookup: stage_name -> log. Skip rows missing stage_name (defensive
+# against partial writes / schema drift) instead of KeyError-ing the page.
 log_map: dict[str, dict] = {}
 for log in stage_logs:
-    log_map[log["stage_name"]] = log
+    name = log.get("stage_name")
+    if name:
+        log_map[name] = log
 
 # ── Clarification Alert ───────────────────────────────────────────────────
 
 STAGE_DISPLAY_NAMES = {
     "crown_prince": "太子",
+    "gemini_reference_analyzer": "参考帖子·Gemini",
+    "gemini_trend_scout_pre": "趋势取样·Gemini",
+    "gemini_trend_scout_post": "网感对标·Gemini",
     "secretariat": "中书省",
     "chancellery": "门下省",
     "dispatcher": "尚书省",
@@ -87,6 +385,9 @@ STAGE_DISPLAY_NAMES = {
     "ministry_works": "工部·架构",
     "ministry_works_cell_planner": "工部·格子规划",
     "ministry_works_builder": "工部·构建",
+    "red_blue_refiner": "红蓝精炼",
+    "persona_simulator": "画像模拟",
+    "ministry_works_structure_review": "结构审·Gemini",
     "vibe_critic": "网感复检",
     "vibe_rewriter": "网感重写",
     "chancellery_final": "终审",
@@ -98,7 +399,8 @@ needs_input_logs = [
 ]
 for ni_log in needs_input_logs:
     output = ni_log.get("output_data", {})
-    stage_display = STAGE_DISPLAY_NAMES.get(ni_log["stage_name"], ni_log["stage_name"])
+    _ni_name = ni_log.get("stage_name", "unknown")
+    stage_display = STAGE_DISPLAY_NAMES.get(_ni_name, _ni_name)
     questions = output.get("questions", [])
     context_info = output.get("context", "")
 
@@ -129,16 +431,38 @@ for ni_log in needs_input_logs:
 
         if submitted and user_answer.strip():
             intervention = {"answer": user_answer.strip()}
+            # Size caps match pages/2_new_project.py::extract_file_content.
+            # st.file_uploader's `type=` arg is a UI hint only; clients can
+            # post anything, so the cap is enforced here.
+            _MAX_IMAGE_BYTES = 2 * 1024 * 1024
+            _MAX_TEXT_BYTES = 1 * 1024 * 1024
             if uploaded_files:
                 file_texts = []
                 for f in uploaded_files:
                     try:
                         name = f.name.lower()
-                        if name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                        is_image = name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                        cap = _MAX_IMAGE_BYTES if is_image else _MAX_TEXT_BYTES
+                        size = getattr(f, "size", None)
+                        if size is not None and size > cap:
+                            file_texts.append(
+                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
+                            )
+                            continue
+                        data = f.read()
+                        if len(data) > cap:
+                            file_texts.append(
+                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
+                            )
+                            continue
+                        if is_image:
+                            b64 = base64.b64encode(data).decode("utf-8")
                             file_texts.append(f"[补充图片: {f.name}]\n[BASE64_IMAGE:{b64}]")
                         else:
-                            file_texts.append(f"[补充文件: {f.name}]\n{f.read().decode('utf-8', errors='replace')}")
+                            file_texts.append(
+                                f"[补充文件: {f.name}]\n"
+                                f"{data.decode('utf-8', errors='replace')}"
+                            )
                     except Exception:
                         file_texts.append(f"[补充文件: {f.name}]（无法读取）")
                 intervention["supplementary_files"] = "\n\n".join(file_texts)
@@ -156,6 +480,86 @@ for ni_log in needs_input_logs:
 
     st.divider()
 
+# ── Stuck detection + force-cancel ────────────────────────────────────────
+# When status=running but no stage_log has updated_at in the last
+# STUCK_THRESHOLD_SECONDS, the daemon thread is almost certainly wedged
+# in an external call (relay hang, network timeout, Gemini deadlock).
+# We can't kill Python threads from outside, so instead we let the user
+# force-reset the project state — new runs can then be triggered and
+# the zombie thread is just ignored (its future writes land on a run
+# nobody looks at).
+STUCK_THRESHOLD_SECONDS = 300  # 5 minutes since last stage_log update
+
+if status == "running":
+    # Find the most recent update across stage_logs
+    _most_recent = 0.0
+    for _l in stage_logs:
+        _ts = _l.get("updated_at") or _l.get("created_at")
+        if not _ts:
+            continue
+        try:
+            from datetime import datetime as _dt
+            # Supabase timestamps are ISO8601 with timezone
+            _ts_str = str(_ts).replace("Z", "+00:00")
+            _dt_obj = _dt.fromisoformat(_ts_str)
+            _most_recent = max(_most_recent, _dt_obj.timestamp())
+        except Exception:
+            continue
+
+    if _most_recent > 0:
+        _elapsed = time.time() - _most_recent
+        _looks_stuck = _elapsed > STUCK_THRESHOLD_SECONDS
+    else:
+        _looks_stuck = False
+        _elapsed = 0.0
+
+    # Always show a cancel button when status=running (primary escape
+    # hatch). Make the stuck banner loud so the user sees why they'd
+    # click it.
+    with st.container(border=True):
+        if _looks_stuck:
+            st.error(
+                f"⚠️ **流水线疑似卡死** — 已经 {int(_elapsed // 60)} 分 "
+                f"{int(_elapsed % 60)} 秒没有任何阶段更新。"
+                f"大概率是某个外部调用（中转站 / Gemini / 网络）被 hang 住。"
+                f"Python 无法从外部杀死后台线程，但可以**强制重置状态**让你重新开始——"
+                f"点下面按钮即可。"
+            )
+        else:
+            st.info(
+                f"🔄 流水线正在执行（最近更新 {int(_elapsed)} 秒前）。"
+                f"需要中止当前任务可以点下面的强制终止。"
+            )
+
+        _force_busy_key = f"force_cancel_busy_{project_id}"
+        _force_busy = st.session_state.get(_force_busy_key, False)
+        if st.button(
+            "⛔ 强制终止卡死任务",
+            disabled=_force_busy,
+            key=f"force_cancel_btn_{project_id}",
+            type="primary" if _looks_stuck else "secondary",
+            help=(
+                "把 project.status 和所有 running 的 pipeline_run 硬标为 failed。"
+                "zombie 线程可能仍在后台消耗资源，直到下次 Streamlit Cloud Reboot "
+                "才彻底清掉——但你可以立刻点「重跑流水线」开新 run，不受旧线程干扰"
+                "（每次重跑都是新 run_id）。"
+            ),
+        ):
+            st.session_state[_force_busy_key] = True
+            try:
+                from pipeline.orchestrator import force_cancel_pipeline
+                summary = force_cancel_pipeline(project_id, db)
+                st.success(
+                    f"✅ 已强制终止 {summary['cancelled_runs']} 个 running 的 run。"
+                    f"点「重跑流水线」可以开新 run 了。"
+                )
+                time.sleep(1.5)
+                st.session_state[_force_busy_key] = False
+                st.rerun()
+            except Exception as err:
+                st.session_state[_force_busy_key] = False
+                st.error(f"强制终止失败：{type(err).__name__}: {err}")
+
 # ── Pipeline Progress Bar ──────────────────────────────────────────────────
 
 st.subheader("流水线进度")
@@ -170,6 +574,20 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
                 log = log_map[k]
                 break
 
+    # Strategy debate: secretariat and chancellery log under
+    # strategy_debate_0 (secretariat), strategy_debate_1 (chancellery), etc.
+    # Match the latest debate turn for each agent.
+    if not log and stage_key == "secretariat":
+        for k in sorted(log_map, reverse=True):
+            if k.startswith("strategy_debate_") and int(k.rsplit("_", 1)[-1]) % 2 == 0:
+                log = log_map[k]
+                break
+    if not log and stage_key == "chancellery":
+        for k in sorted(log_map, reverse=True):
+            if k.startswith("strategy_debate_") and int(k.rsplit("_", 1)[-1]) % 2 == 1:
+                log = log_map[k]
+                break
+
     with cols[i]:
         s = log.get("status", "pending") if log else "pending"
         if s == "completed":
@@ -181,7 +599,19 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
         elif s == "failed":
             st.error(f"{stage_icon}\n{stage_label}")
         elif s == "skipped":
-            st.info(f"{stage_icon}\n{stage_label}")
+            # Skipped may be either (a) a resume that intentionally jumped
+            # over an already-completed stage, or (b) a Gemini advisory
+            # stage that couldn't run (not configured / API error / parse
+            # error). Surface the underlying _skip_reason when present so
+            # the user can distinguish. Abbreviate it to fit the box.
+            _skip_reason = ""
+            _out = (log or {}).get("output_data") or {}
+            if isinstance(_out, dict):
+                _skip_reason = str(_out.get("_skip_reason", ""))[:30]
+            if _skip_reason:
+                st.info(f"{stage_icon}\n{stage_label}\n_{_skip_reason}_")
+            else:
+                st.info(f"{stage_icon}\n{stage_label}")
         else:
             st.container(border=True).markdown(
                 f"<div style='text-align:center;color:#999'>{stage_icon}<br>{stage_label}</div>",
@@ -194,43 +624,142 @@ st.divider()
 st.subheader("各环节详情")
 
 # Group stages into tabs
-tab_names = ["太子", "中书省", "门下省", "尚书省", "六部", "终审"]
+tab_names = ["太子", "中书省", "门下省", "尚书省", "六部", "网感", "终审"]
 tabs = st.tabs(tab_names)
 
 # Tab 0: Crown Prince
 with tabs[0]:
     log = log_map.get("crown_prince")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
-        if log.get("error_message"):
-            st.error(log["error_message"])
+        if log.get("status") == "failed":
+            render_stage_error(log)
     else:
         st.caption("等待执行...")
 
+    # Gemini trend scout (pre-secretariat) — surface the raw posts
+    # that got injected into brief._trend_intel so the user sees
+    # exactly what secretariat received as calibration samples.
+    ts_log = log_map.get("gemini_trend_scout_pre")
+    if ts_log:
+        st.divider()
+        st.markdown("**🔭 Gemini 趋势取样（pre-secretariat）**")
+        render_stage_meta(ts_log)
+        ts_status = ts_log.get("status", "pending")
+        ts_out = ts_log.get("output_data") or {}
+        if ts_status == "skipped":
+            reason = str(ts_out.get("_skip_reason", "unknown"))
+            if "not_configured" in reason:
+                st.warning(
+                    "⚠️ 跳过（Gemini 未配置）——配置好 `VERTEX_EXPRESS_API_KEY` "
+                    "且 `ENABLE_GEMINI_TREND_SCOUT_PRE=True` 后下次生效。"
+                )
+            elif "parse_error" in reason:
+                _raw = ts_out.get("_raw_text_preview", "")
+                st.error(
+                    f"❌ Gemini 输出非 JSON，无法解析（`{reason}`）。"
+                    "Google Search grounding 经常让 Gemini 改口用自然语言叙述。"
+                    "下面是它实际返回的前 500 字："
+                )
+                if _raw:
+                    st.code(_raw, language="text")
+                else:
+                    st.caption("（没抓到原文预览，试试 Reboot 或换 GEMINI_MODEL。）")
+            else:
+                st.info(f"⏭️ 跳过：`{reason}`")
+        elif ts_status == "completed":
+            posts = ts_out.get("posts") or []
+            queries = ts_out.get("queries_used") or []
+            rejected = ts_out.get("_rejected_off_domain_count", 0)
+            if posts:
+                st.success(
+                    f"✅ 拉到 {len(posts)} 条小红书原文帖子"
+                    + (f"（过滤掉 {rejected} 条非 xiaohongshu 域名）" if rejected else "")
+                )
+                for i, p in enumerate(posts, 1):
+                    title = p.get("title") or "(无标题)"
+                    snippet = p.get("snippet") or ""
+                    url = p.get("url", "")
+                    flag = " ⚠️ 疑似分析文" if p.get("_suspect_analysis") else ""
+                    with st.expander(f"#{i} 《{title}》{flag}"):
+                        if snippet:
+                            st.markdown(f"**片段**：{snippet}")
+                        if url:
+                            st.markdown(f"**URL**：[{url}]({url})")
+                        if p.get("cover_image_url"):
+                            st.image(
+                                p["cover_image_url"],
+                                caption="封面（来自 Google 缩略图）",
+                                width=200,
+                            )
+                if queries:
+                    with st.expander("🔍 Gemini 用到的搜索查询", expanded=False):
+                        for q in queries:
+                            st.markdown(f"- `{q}`")
+            else:
+                nf = ts_out.get("_not_found_reason") or "搜索返回空"
+                st.warning(f"⚠️ 没找到真实原文帖子：{nf}")
+        elif ts_status == "failed":
+            render_stage_error(ts_log)
+        else:
+            st.caption(f"状态：{ts_status}")
+
 # Tab 1: Secretariat
 with tabs[1]:
-    # May have multiple secretariat runs
-    sec_logs = [l for l in stage_logs if l["stage_name"] == "secretariat"]
-    if sec_logs:
-        for sl in sec_logs:
-            with st.expander(f"方案 (轮次 {sec_logs.index(sl) + 1})", expanded=(sl == sec_logs[-1])):
+    # May have multiple secretariat runs — legacy stage_name "secretariat"
+    # or strategy_debate_N where N is even (0, 2, 4...)
+    sec_logs = [l for l in stage_logs if l.get("stage_name") == "secretariat"]
+    debate_sec_logs = sorted(
+        [l for l in stage_logs
+         if l.get("stage_name", "").startswith("strategy_debate_")
+         and int(l["stage_name"].rsplit("_", 1)[-1]) % 2 == 0],
+        key=lambda l: int(l["stage_name"].rsplit("_", 1)[-1]),
+    )
+    all_sec_logs = sec_logs + debate_sec_logs
+    if all_sec_logs:
+        for sl in all_sec_logs:
+            sname = sl.get("stage_name", "")
+            if sname.startswith("strategy_debate_"):
+                turn = int(sname.rsplit("_", 1)[-1])
+                label = f"策略辩论 第 {turn // 2 + 1} 轮（中书省发言）"
+            else:
+                label = f"方案 (轮次 {all_sec_logs.index(sl) + 1})"
+            with st.expander(label, expanded=(sl == all_sec_logs[-1])):
+                render_stage_meta(sl)
                 if sl.get("output_data"):
                     render_stage_output(sl["output_data"])
-                elif sl.get("error_message"):
-                    st.error(sl["error_message"])
+                elif sl.get("status") == "failed":
+                    render_stage_error(sl)
+                else:
+                    st.caption(f"状态：{sl.get('status', 'pending')}")
     else:
         st.caption("等待执行...")
 
 
 # Tab 2: Chancellery
 with tabs[2]:
-    chan_logs = [l for l in stage_logs if l["stage_name"].startswith("chancellery_")]
-    if chan_logs:
-        for cl in chan_logs:
-            round_label = cl["stage_name"].replace("chancellery_", "第") + "轮审议"
-            with st.expander(round_label, expanded=(cl == chan_logs[-1])):
+    # Legacy chancellery_N logs + strategy_debate_N where N is odd (1, 3, 5...)
+    chan_logs = [l for l in stage_logs if l.get("stage_name", "").startswith("chancellery_")]
+    debate_chan_logs = sorted(
+        [l for l in stage_logs
+         if l.get("stage_name", "").startswith("strategy_debate_")
+         and int(l["stage_name"].rsplit("_", 1)[-1]) % 2 == 1],
+        key=lambda l: int(l["stage_name"].rsplit("_", 1)[-1]),
+    )
+    all_chan_logs = chan_logs + debate_chan_logs
+    if all_chan_logs:
+        for cl in all_chan_logs:
+            sname = cl.get("stage_name", "")
+            if sname.startswith("strategy_debate_"):
+                turn = int(sname.rsplit("_", 1)[-1])
+                round_label = f"策略辩论 第 {turn // 2 + 1} 轮（门下省质疑）"
+            else:
+                round_label = sname.replace("chancellery_", "第") + "轮审议"
+            with st.expander(round_label, expanded=(cl == all_chan_logs[-1])):
+                render_stage_meta(cl)
                 output = cl.get("output_data", {})
                 if output:
                     verdict = output.get("verdict", "unknown")
@@ -265,18 +794,21 @@ with tabs[2]:
                                     human_intervention={"note": note},
                                 )
                                 st.success("已发送")
-                elif cl.get("error_message"):
-                    st.error(cl["error_message"])
+                elif cl.get("status") == "failed":
+                    render_stage_error(cl)
     else:
         st.caption("等待执行...")
 
 # Tab 3: Dispatcher
 with tabs[3]:
     log = log_map.get("dispatcher")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         render_stage_output(log["output_data"])
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
+        if log.get("status") == "failed":
+            render_stage_error(log)
     else:
         st.caption("等待执行...")
 
@@ -289,6 +821,7 @@ with tabs[4]:
     ]
     def _render_stage_log(stage_key: str, label: str = ""):
         log = log_map.get(stage_key)
+        render_stage_meta(log)
         if log and log.get("output_data"):
             render_stage_output(log["output_data"])
         elif log:
@@ -296,7 +829,7 @@ with tabs[4]:
             if s == "running":
                 st.info("⏳ 执行中...")
             elif s == "failed":
-                st.error(f"执行失败：{log.get('error_message', '')}")
+                render_stage_error(log)
             elif s == "skipped":
                 st.warning("⏭️ 已跳过")
             else:
@@ -309,30 +842,230 @@ with tabs[4]:
             _render_stage_log(mk)
             # Works tab also shows cell planner + builder logs
             if mk == "ministry_works":
+                def _batch_label(log: dict, fallback_prefix: str, idx: int) -> str:
+                    """Read _batch_info from log.input_data for human-friendly label.
+                    Falls back to legacy sequential numbering."""
+                    input_data = log.get("input_data") or {}
+                    info = input_data.get("_batch_info") or {}
+                    label = info.get("label")
+                    cell_ids = info.get("cell_ids") or []
+                    status = log.get("status", "pending")
+                    status_tag = ""
+                    if status == "failed":
+                        status_tag = " ❌"
+                    elif status == "completed":
+                        status_tag = " ✅"
+                    elif status == "running":
+                        status_tag = " ⏳"
+                    if label:
+                        cells_str = f" [{', '.join(cell_ids)}]" if cell_ids else ""
+                        return f"{label}{cells_str}{status_tag}"
+                    return f"{fallback_prefix} {idx + 1}{status_tag}"
+
                 cell_planner_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_cell_planner"]
                 if cell_planner_logs:
                     st.divider()
-                    st.markdown("**工部·格子规划（分批执行）**")
-                    for cl in cell_planner_logs:
-                        with st.expander(f"格子规划批次 {cell_planner_logs.index(cl) + 1}", expanded=False):
+                    st.markdown(f"**工部·格子规划**（共 {len(cell_planner_logs)} 次调用，含 batch/cell 重试）")
+                    for idx, cl in enumerate(cell_planner_logs):
+                        with st.expander(_batch_label(cl, "格子规划批次", idx), expanded=False):
                             if cl.get("output_data"):
                                 render_stage_output(cl["output_data"])
-                            elif cl.get("error_message"):
-                                st.error(cl["error_message"])
+                            elif cl.get("status") == "failed":
+                                render_stage_error(cl)
                 builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
                 if builder_logs:
                     st.divider()
-                    st.markdown("**工部·构建（分批执行）**")
-                    for bl in builder_logs:
-                        with st.expander(f"构建批次 {builder_logs.index(bl) + 1}", expanded=False):
+                    st.markdown(f"**工部·构建**（共 {len(builder_logs)} 次调用，含 batch/cell 重试）")
+                    for idx, bl in enumerate(builder_logs):
+                        with st.expander(_batch_label(bl, "构建批次", idx), expanded=False):
                             if bl.get("output_data"):
                                 render_stage_output(bl["output_data"])
-                            elif bl.get("error_message"):
-                                st.error(bl["error_message"])
+                            elif bl.get("status") == "failed":
+                                render_stage_error(bl)
 
-# Tab 5: Final Review
+                # Gemini structure review (advisory, between builder and vibe).
+                # Surface the skip reason prominently when skipped — that's
+                # how the operator finds out "Gemini isn't actually running".
+                sr_log = log_map.get("ministry_works_structure_review")
+                if sr_log:
+                    st.divider()
+                    st.markdown("**🔎 Gemini 结构审**")
+                    render_stage_meta(sr_log)
+                    sr_status = sr_log.get("status", "pending")
+                    sr_out = sr_log.get("output_data") or {}
+                    if sr_status == "skipped":
+                        reason = sr_out.get("_skip_reason", "unknown")
+                        if "not_configured" in str(reason):
+                            st.warning(
+                                f"⚠️ 跳过（Gemini 未配置）：`{reason}`\n\n"
+                                "检查 `.streamlit/secrets.toml` 的 "
+                                "`VERTEX_EXPRESS_API_KEY` 是否填了，"
+                                "以及 `pipeline/config.py` 的 "
+                                "`ENABLE_GEMINI_ASSIST=True`。"
+                            )
+                        elif "call_failed" in str(reason):
+                            st.error(
+                                f"❌ 调用失败：`{reason}`\n\n"
+                                "大概率是模型名 `GEMINI_MODEL` 不对（Vertex 返回 404），"
+                                "或 API key 无效、配额用光。"
+                                "去 `pipeline/config.py` 把 `GEMINI_MODEL` 改成"
+                                "你 Vertex 账户里实际可用的模型 ID "
+                                "（常见：`gemini-2.5-pro` / `gemini-2.5-flash`）。"
+                            )
+                        elif "parse_error" in str(reason):
+                            _raw = sr_out.get("_raw_text_preview", "")
+                            st.error(
+                                f"❌ 输出非 JSON：`{reason}`\n\n"
+                                "Gemini 返回的内容没法解析成 JSON——"
+                                "可能被安全过滤，或 Google Search 工具接管了响应格式。"
+                                "下面是它实际返回的前 500 字，看看它到底说了什么："
+                            )
+                            if _raw:
+                                st.code(_raw, language="text")
+                            else:
+                                st.caption(
+                                    "（没抓到原文预览——可能响应完全空，"
+                                    "换个 `GEMINI_MODEL` 或关掉 `ENABLE_GEMINI_TREND_SCOUT_*` 试试。）"
+                                )
+                        else:
+                            st.info(f"⏭️ 跳过：`{reason}`")
+                    elif sr_status == "completed":
+                        verdict = sr_out.get("verdict", "unknown")
+                        incomplete = sr_out.get("cells_incomplete") or []
+                        if verdict == "all_pass":
+                            st.success(
+                                f"✅ 所有 cell 结构完整 · "
+                                f"Gemini 评审通过（{len(sr_out.get('cell_reviews', []))} 条）"
+                            )
+                        elif incomplete:
+                            st.warning(
+                                f"⚠️ {len(incomplete)} 个 cell 结构不全："
+                            )
+                            for item in incomplete:
+                                cid = item.get("cell_id", "?")
+                                missing = item.get("missing_items") or []
+                                hint = item.get("revision_hint", "")
+                                with st.expander(f"📌 {cid}（缺 {len(missing)} 项）"):
+                                    if missing:
+                                        st.markdown("**缺失项：**")
+                                        for m in missing:
+                                            st.markdown(f"- {m}")
+                                    if hint:
+                                        st.markdown(f"**建议修法：** {hint}")
+                        else:
+                            st.info(f"判定：{verdict}")
+                        with st.expander("🔍 完整评审输出", expanded=False):
+                            st.json(sr_out)
+                    elif sr_status == "failed":
+                        render_stage_error(sr_log)
+                    else:
+                        st.caption(f"状态：{sr_status}")
+
+# Tab 5: Vibe (网感复检 + Gemini 仲裁)
 with tabs[5]:
+    # Vibe critic
+    _vc_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_critic"]
+    _vr_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_rewriter"]
+
+    if _vc_logs:
+        for idx, vcl in enumerate(_vc_logs):
+            with st.expander(
+                f"网感复检 轮次 {idx + 1}",
+                expanded=(vcl == _vc_logs[-1]),
+            ):
+                render_stage_meta(vcl)
+                _vc_out = vcl.get("output_data") or {}
+                if _vc_out:
+                    _vc_verdict = _vc_out.get("verdict", "unknown")
+                    _vc_failed = _vc_out.get("failed_cells") or []
+                    if _vc_verdict == "all_pass":
+                        st.success(f"✅ 全部通过（{len(_vc_out.get('cell_reviews', []))} 个 cell）")
+                    else:
+                        st.warning(
+                            f"⚠️ {_vc_verdict}：{len(_vc_failed)} 个 cell 需要重写"
+                        )
+                    # Show per-cell gut_call summary
+                    _reviews = _vc_out.get("cell_reviews") or []
+                    if _reviews:
+                        for _cr in _reviews:
+                            _cid = _cr.get("cell_id", "?")
+                            _gut = _cr.get("gut_call", "?")
+                            _gut_word = _cr.get("gut_word", "")
+                            _sev = _cr.get("severity", "")
+                            _emoji = {"pass": "✅", "borderline": "🟡", "fail": "🔴"}.get(
+                                _sev, "❓"
+                            )
+                            st.caption(
+                                f"{_emoji} **{_cid}** — gut: {_gut} · {_gut_word} · severity: {_sev}"
+                            )
+
+                    # Gemini arbitration results (if any)
+                    _ga = _vc_out.get("_gemini_arbitration") or {}
+                    if _ga and _ga.get("verdict") != "skipped":
+                        st.divider()
+                        st.markdown("**🟢 Gemini 二审（仲裁）**")
+                        _ga_failed = _ga.get("failed_cells") or []
+                        _ga_verdict = _ga.get("verdict", "unknown")
+                        _ga_usage = _ga.get("_gemini_usage") or {}
+                        if _ga_verdict == "all_pass" or not _ga_failed:
+                            st.success(
+                                "✅ Gemini 也判全部通过——Claude 和 Gemini 意见一致。"
+                            )
+                        else:
+                            st.warning(
+                                f"⚠️ Gemini 额外 flag 了 {len(_ga_failed)} 个 cell "
+                                f"（Claude 判 pass 但 Gemini 判 fail）："
+                            )
+                            for _gf in _ga_failed:
+                                _g_cid = _gf.get("cell_id", "?")
+                                _g_dir = _gf.get("rewrite_directives", "")
+                                st.caption(f"🔴 **{_g_cid}**：{_g_dir[:200]}")
+                        if _ga_usage:
+                            st.caption(
+                                f"Gemini 费用：${_ga_usage.get('cost_usd', 0):.4f} · "
+                                f"tokens {_ga_usage.get('input_tokens', 0)}+{_ga_usage.get('output_tokens', 0)}"
+                            )
+                    elif _ga and _ga.get("verdict") == "skipped":
+                        st.caption(
+                            f"ℹ️ Gemini 二审跳过：{_ga.get('_skip_reason', 'unknown')}"
+                        )
+
+                    with st.expander("🔍 完整 critic 输出", expanded=False):
+                        st.json(_vc_out)
+                elif vcl.get("status") == "failed":
+                    render_stage_error(vcl)
+                else:
+                    st.caption(f"状态：{vcl.get('status', 'pending')}")
+    else:
+        st.caption("等待执行...")
+
+    # Vibe rewriter logs (if any)
+    if _vr_logs:
+        st.divider()
+        for idx, vrl in enumerate(_vr_logs):
+            with st.expander(
+                f"网感重写 轮次 {idx + 1}",
+                expanded=False,
+            ):
+                render_stage_meta(vrl)
+                _vr_out = vrl.get("output_data") or {}
+                if _vr_out:
+                    _rewritten = _vr_out.get("prompt_cells") or []
+                    st.info(f"重写了 {len(_rewritten)} 个 cell")
+                    for _rc in _rewritten:
+                        _rc_cid = _rc.get("cell_id", "?")
+                        _rc_mode = _rc.get("rewrite_mode", "?")
+                        _rc_summary = _rc.get("rewrite_summary", "")
+                        st.caption(
+                            f"📝 **{_rc_cid}** ({_rc_mode})：{_rc_summary[:150]}"
+                        )
+                elif vrl.get("status") == "failed":
+                    render_stage_error(vrl)
+
+# Tab 6: Final Review
+with tabs[6]:
     log = log_map.get("chancellery_final")
+    render_stage_meta(log)
     if log and log.get("output_data"):
         output = log["output_data"]
         verdict = output.get("verdict", "unknown")
@@ -349,29 +1082,240 @@ with tabs[5]:
 # ── Stats footer ───────────────────────────────────────────────────────────
 
 st.divider()
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b, col_c, col_d = st.columns(4)
 
 total_tokens = sum(l.get("tokens_used", 0) for l in stage_logs)
 total_duration = sum(l.get("duration_seconds", 0) or 0 for l in stage_logs)
 completed_stages = sum(1 for l in stage_logs if l.get("status") == "completed")
 
+# Cost: prefer the DB-authoritative value on pipeline_runs.total_cost_usd
+# (updated after each agent completion via agents/__init__.py), fall back
+# to in-process _run_totals for the same-process running case, then to 0.
+_run_cost_db = 0.0
+try:
+    _run_cost_db = float(run.get("total_cost_usd", 0) or 0)
+except (TypeError, ValueError):
+    _run_cost_db = 0.0
+
+# Live per-run totals from the in-process budget tracker (only populated
+# while the thread is running in this Streamlit process). Used mainly to
+# surface cache effectiveness; falls back to stage_logs sum otherwise.
+_run_totals = get_run_totals(run_id)
+_cache_read = _run_totals.get("cache_read", 0)
+_cache_creation = _run_totals.get("cache_creation", 0)
+_calls = _run_totals.get("calls", 0)
+_cache_calls = _run_totals.get("calls_with_cache_activity", 0)
+_run_cost_live = float(_run_totals.get("cost_usd", 0.0))
+_run_cost = max(_run_cost_db, _run_cost_live)
+
 with col_a:
     st.metric("已完成环节", f"{completed_stages}/{len(PIPELINE_STAGES)}")
 with col_b:
-    st.metric("总 Token", f"{total_tokens:,}")
+    # Show budget remaining as the subtitle so the operator can eyeball how
+    # close we are to the hard cap. Uses stage_logs sum as authoritative
+    # (works across resume); in-process totals are additive during a fresh run.
+    budget_pct = (total_tokens / MAX_TOKENS_PER_RUN * 100) if MAX_TOKENS_PER_RUN else 0
+    st.metric(
+        "总 Token",
+        f"{total_tokens:,}",
+        f"{budget_pct:.0f}% of budget",
+        delta_color="off",
+    )
 with col_c:
+    # Cost is best-effort (unknown models → $0). The caption below states
+    # the precision so a $0.00 reading isn't mistaken for free execution.
+    st.metric("预计成本", f"${_run_cost:.2f}")
+with col_d:
     st.metric("总耗时", f"{total_duration:.1f}s")
+
+# Cache effectiveness indicator — only shown when the background thread
+# reported at least a few calls in this process. Otherwise the totals are
+# 0 because a different process/restart handled those calls.
+if _calls >= 3:
+    if _cache_read + _cache_creation == 0:
+        st.caption(
+            f"🟡 Prompt 缓存：本次 {_calls} 次调用中 0 次命中缓存。"
+            f"很可能中转站丢弃了 `cache_control` 字段——在 `pipeline/config.py` "
+            f"把 `ENABLE_PROMPT_CACHING` 改成 `False` 可以避免发送多余字段。"
+        )
+    else:
+        hit_rate = _cache_calls / _calls * 100
+        st.caption(
+            f"🟢 Prompt 缓存生效：{_cache_calls}/{_calls} 次调用命中 "
+            f"({hit_rate:.0f}%)，已累计 cache_read={_cache_read:,} / "
+            f"cache_creation={_cache_creation:,} tokens。"
+        )
+
+# ── C: Mid-run supplement panel ────────────────────────────────────────────
+# Let the user add new ideas / references / corrections and re-run from
+# a chosen stage without going back to page 2. Works for completed,
+# failed, and needs_revision states — basically any time the pipeline
+# isn't actively running.
+if status not in ("running",):
+    with st.expander("📝 补充信息 / 追加参考 / 部分重跑", expanded=False):
+        st.caption(
+            "在当前项目的基础上追加新信息，选择从哪个阶段开始重跑。"
+            "已完成的上游阶段会保留（不花重复 token），只有你选的阶段及其下游会被重新执行。"
+        )
+
+        _supp_text = st.text_area(
+            "补充文字（追加到原始输入，不覆盖）",
+            height=120,
+            placeholder="新想法、新卖点、对之前产出的修改意见、老板最新反馈……",
+            key="supp_text",
+        )
+
+        _supp_urls = st.text_area(
+            "补充参考帖子 URL（每行一条，追加到已有的参考列表）",
+            height=80,
+            placeholder="https://www.xiaohongshu.com/explore/xxx",
+            key="supp_urls",
+        )
+
+        _supp_files = st.file_uploader(
+            "补充文件",
+            accept_multiple_files=True,
+            type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg", "gif", "webp", "json"],
+            key="supp_files",
+        )
+
+        # Stage selector — which point to re-run from. Everything at
+        # and below the selected stage gets deleted + re-executed.
+        _rerun_stages = {
+            "crown_prince": "太子（从头解析 brief，最彻底）",
+            "secretariat": "中书省（重新制定策略方向）",
+            "ministry_works": "工部·架构（重新设计骨架，保留五部）",
+            "ministry_works_builder": "工部·构建（只重新生成 prompt）",
+            "vibe_critic": "网感复检（只重新检查味道）",
+        }
+        _selected_stage = st.selectbox(
+            "从哪个阶段开始重跑？",
+            options=list(_rerun_stages.keys()),
+            format_func=lambda k: _rerun_stages[k],
+            index=0,
+            key="supp_rerun_stage",
+        )
+
+        # Downstream stage names for deletion. Order matters — we delete
+        # everything at and below the selected stage.
+        _stage_order = [
+            "crown_prince",
+            "gemini_reference_analyzer",
+            "gemini_trend_scout_pre",
+            "secretariat",
+            "chancellery_1", "chancellery_2", "chancellery_3",
+            "dispatcher",
+            "ministry_personnel", "ministry_revenue", "ministry_rites",
+            "ministry_war", "ministry_justice",
+            "ministry_works",
+            "ministry_works_cell_planner",
+            "ministry_works_builder",
+            "ministry_works_structure_review",
+            "vibe_critic", "vibe_rewriter",
+            "chancellery_final",
+        ]
+
+        if st.button(
+            "🚀 追加并重跑",
+            type="primary",
+            key="supp_submit",
+            help="追加信息到项目 + 删除下游 stage_logs + 从选定阶段继续执行",
+        ):
+            if not _supp_text.strip() and not _supp_urls.strip() and not _supp_files:
+                st.warning("请至少填一项补充内容。")
+            else:
+                try:
+                    # 1. Append supplement to project
+                    _proj = db.get_project(project_id) or {}
+                    _old_text = _proj.get("free_text", "") or ""
+                    _new_text = _old_text
+                    if _supp_text.strip():
+                        _new_text += (
+                            f"\n\n--- 补充信息 ({time.strftime('%Y-%m-%d %H:%M')}) ---\n"
+                            + _supp_text.strip()
+                        )
+
+                    # Process uploaded files — import the helper from page 2
+                    # at call time (avoid circular import at module level).
+                    if _supp_files:
+                        try:
+                            from importlib import import_module as _im
+                            _p2 = _im("pages.2_new_project")
+                            _new_text += _p2.process_uploaded_files(_supp_files)
+                        except Exception:
+                            # Fallback: just list filenames
+                            for _f in _supp_files:
+                                _new_text += f"\n[补充文件: {_f.name}]"
+
+                    _brief_update = dict(_proj.get("brief") or {})
+                    # Append reference URLs
+                    _existing_refs = _brief_update.get("_reference_post_urls") or []
+                    for _line in (_supp_urls or "").splitlines():
+                        _u = _line.strip()
+                        if _u and "xiaohongshu.com" in _u and _u.startswith("http"):
+                            _existing_refs.append(_u)
+                    if _existing_refs:
+                        _brief_update["_reference_post_urls"] = _existing_refs[:20]
+                    # Clear stale revision context so the re-run is clean
+                    _brief_update.pop("_revision_context", None)
+
+                    db.update_project(
+                        project_id,
+                        free_text=_new_text,
+                        brief=_brief_update,
+                    )
+
+                    # 2. Delete stage_logs from selected stage downward
+                    _idx = (
+                        _stage_order.index(_selected_stage)
+                        if _selected_stage in _stage_order
+                        else 0
+                    )
+                    _to_delete = _stage_order[_idx:]
+                    # Also delete any numbered variants (chancellery_1..3)
+                    # that aren't in _stage_order
+                    _to_delete_extra = []
+                    for _sn in _to_delete:
+                        if _sn.startswith("chancellery") and not _sn.startswith("chancellery_final"):
+                            _to_delete_extra += [f"chancellery_{i}" for i in range(1, 10)]
+                    _to_delete = list(set(_to_delete + _to_delete_extra))
+                    # Also delete Gemini scout stages that depend on the
+                    # deleted Claude stages
+                    for _gs in [
+                        "gemini_trend_scout_pre",
+                        "gemini_reference_analyzer",
+                    ]:
+                        if _gs not in _to_delete and _idx <= _stage_order.index(_gs) if _gs in _stage_order else False:
+                            _to_delete.append(_gs)
+
+                    _deleted = db.delete_stage_logs_by_names(run_id, _to_delete)
+                    st.success(
+                        f"✅ 补充信息已追加，{_deleted} 个 stage_log 已清除。"
+                        f"点下方「▶️ 继续执行」从 {_rerun_stages[_selected_stage]} 重跑。"
+                    )
+                    # Reset project status so resume is allowed
+                    db.update_project(project_id, status="failed")
+                    db.update_pipeline_run(run_id, status="failed", completed_at=None)
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as _err:
+                    st.error(f"补充失败：{type(_err).__name__}: {_err}")
 
 # ── Actions + auto-refresh ─────────────────────────────────────────────────
 
 st.divider()
 c1, c2, c3 = st.columns(3)
 with c1:
-    if status == "completed":
-        if st.button("📦 查看产出"):
+    if status in ("completed", "needs_revision"):
+        label = "📦 查看产出" if status == "completed" else "📦 查看部分产出"
+        if st.button(label):
             st.session_state["current_project_id"] = project_id
             st.query_params["project_id"] = project_id
             st.switch_page("pages/4_output_center.py")
+# Session-scoped busy flag prevents a second click before Streamlit reruns.
+_actions_busy_key = f"pipeline_busy_actions_{project_id}"
+_actions_busy = st.session_state.get(_actions_busy_key, False)
+
 with c2:
     # Allow resume whenever not actively completed — covers failed, paused, and
     # silently-hung "running" states (e.g. background thread crashed without
@@ -379,27 +1323,78 @@ with c2:
     if status != "completed":
         if st.button(
             "▶️ 继续执行",
-            help="从失败/中断处继续，跳过已完成的阶段。如果流水线卡住没有进度，也可以点这个强制恢复。",
+            disabled=_actions_busy,
+            help=(
+                "从失败/中断处继续。已完成的 stage 直接跳过；工部的格子规划和构建"
+                "还会做 cell 级 resume——扫描之前成功的批次，只重跑真正还没成功的"
+                "cell，不会让已经花过 token 的产出白白重算。"
+            ),
         ):
-            from pipeline.orchestrator import resume_pipeline_in_background
+            st.session_state[_actions_busy_key] = True
+            from pipeline.orchestrator import (
+                PipelineAlreadyRunningError,
+                resume_pipeline_in_background,
+            )
             from pipeline.agents import init_api_config
             init_api_config()
-            # Reset status so the orchestrator can take over again
-            db.update_project(project_id, status="running")
-            resume_pipeline_in_background(project_id, run_id, db)
-            st.rerun()
+            try:
+                # Don't pre-set project.status here; orchestrator.run() does
+                # it, and our guard checks project.status so pre-setting
+                # would make the guard reject our own call.
+                resume_pipeline_in_background(project_id, run_id, db)
+                st.rerun()
+            except PipelineAlreadyRunningError as _err:
+                st.session_state[_actions_busy_key] = False
+                st.warning(
+                    f"⚠️ {_err}\n\n"
+                    "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                    "按钮重置状态，再试。"
+                )
+            except Exception as _err:
+                st.session_state[_actions_busy_key] = False
+                st.error(f"继续执行失败：{_err}")
 with c3:
     # Restart from scratch — always available except while a fresh run is healthy
-    if st.button("🔄 重跑流水线", help="完全从头开始（会创建新的 run）"):
-        from pipeline.orchestrator import start_pipeline_in_background
+    if st.button(
+        "🔄 重跑流水线",
+        disabled=_actions_busy,
+        help="完全从头开始（会创建新的 run）",
+    ):
+        st.session_state[_actions_busy_key] = True
+        from pipeline.orchestrator import (
+            PipelineAlreadyRunningError,
+            start_pipeline_in_background,
+        )
         from pipeline.agents import init_api_config
-        new_run = db.create_pipeline_run(project_id)
-        db.update_project(project_id, status="running")
         init_api_config()
-        start_pipeline_in_background(project_id, new_run["id"], db)
-        st.rerun()
+        try:
+            # create_pipeline_run + start — orchestrator sets project.status
+            # internally, so we skip the pre-emptive update that would
+            # trip our own guard.
+            new_run = db.create_pipeline_run(project_id)
+            start_pipeline_in_background(project_id, new_run["id"], db)
+            st.rerun()
+        except PipelineAlreadyRunningError as _err:
+            st.session_state[_actions_busy_key] = False
+            st.warning(
+                f"⚠️ {_err}\n\n"
+                "如果任务实际已卡死，先点页面顶部的「⛔ 强制终止卡死任务」"
+                "按钮重置状态，再试。"
+            )
+        except Exception as _err:
+            st.session_state[_actions_busy_key] = False
+            st.error(f"重跑失败：{_err}")
 
-# Auto-refresh when running or paused for review (waiting for user input)
+# Auto-refresh when running or paused for review (waiting for user input).
+# Streamlit has no server-push, so live progress requires periodic reruns.
+# Gated by a user toggle so the page doesn't yank out while someone's reading
+# a stage log mid-run.
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
-    time.sleep(POLL_INTERVAL_SECONDS)
-    st.rerun()
+    _auto = st.toggle(
+        f"🔄 自动刷新（每 {POLL_INTERVAL_SECONDS} 秒）",
+        value=st.session_state.get("detail_auto_refresh", True),
+        key="detail_auto_refresh",
+    )
+    if _auto:
+        time.sleep(POLL_INTERVAL_SECONDS)
+        st.rerun()

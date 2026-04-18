@@ -38,13 +38,17 @@
 
 ## 规则
 
-1. 只处理输入中的 `active_cells`，不多不少
-2. `platform_content_logic` 必须具体到该平台用户的心理状态和行为模式
-3. `persona_strategy_notes` 至少覆盖2种人设类型的差异化说明
-4. `applicable_personas` 按优先级排序：campaign_objectives 综合匹配度 > 方向匹配度 > 受众覆盖面
-5. `ministry_digest` 每个字段必须自包含——构建者只看这一个 digest 就有足够信息
-6. 每个格子的逻辑必须独立完整——读者只看这一个 cell_plan 就能理解该怎么做
-7. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
+1. **【硬契约】严格 1:1 输入输出**：输入的 `active_cells` 数组里有 N 个 cell，你的 `cell_plans` 数组里**必须有且只有 N 个 cell_plan**，每个 cell_plan 的 `cell_id` 必须严格对应输入中的某一个 `cell_id`。**禁止跳过任何 cell**，禁止合并 cell，禁止偷懒只返回第一个或几个。如果输入是 `[{"cell_id":"D1_xhs"},{"cell_id":"D2_xhs"},{"cell_id":"D3_xhs"}]`，那 cell_plans 的长度必须是 3，cell_id 必须分别是 D1_xhs / D2_xhs / D3_xhs，少一个都算失败。
+2. **完成度自检**：写完后回头数一遍——cell_plans.length 是不是和 active_cells.length 相等？输入里每个 cell_id 是不是都出现在你的输出里？如果不是，回去补齐。
+3. `platform_content_logic` 必须具体到该平台用户的心理状态和行为模式
+4. `persona_strategy_notes` 至少覆盖2种人设类型的差异化说明
+5. `applicable_personas` 按优先级排序：campaign_objectives 综合匹配度 > 方向匹配度 > 受众覆盖面
+6. `ministry_digest` 每个字段必须自包含——构建者只看这一个 digest 就有足够信息
+7. 每个格子的逻辑必须独立完整——读者只看这一个 cell_plan 就能理解该怎么做
+8. 如果某个部的输出缺失（标记为 skipped），在 digest 中注明并用合理默认值
+9. 如果输入中包含 `_strict_contract` 字段，那是 orchestrator 给你的硬性提醒，**必须严格遵守**（特别是输入/输出数量必须 1:1）
+9.1 如果输入中包含 `_revision_directives` 字段，说明上一版被终审驳回。把 mandatory_revisions 里与 cell 规划相关的问题（比如"某方向缺人设引用"、"某方向 ministry_digest 关键词错"）反映到你输出的 cell_plan 里，让下游 builder 拿到正确的输入。架构师上一步可能已经更新了 shared_skeleton（如新增 persona_library / title_rules），你要在 ministry_digest 里**引用**这些新模块。
+10. **JSON 卫生（关键）**：所有字符串值中的换行必须用 `\n` 转义符，禁止直接写入真换行符。**字符串内部禁止使用 ASCII 双引号 `"`**——必须改用中文全角引号 `"` `"` 或 `「」`（这些在 JSON 里不需要转义）。所有需要引号的地方（引用、强调、专业术语、商品名）统统用 `「」`。写完脑内过一遍：能不能直接 `json.loads()` 一次通过？
 
 ## 输出格式
 
@@ -58,6 +62,7 @@
       "direction_id": "D1",
       "direction_name": "方向名称",
       "platform": "小红书",
+      "paradigm": "A_emotional_hook | B_meta_response",
       "platform_content_logic": "该方向在该平台的内容逻辑（具体到用户消费场景、内容形式、互动模式）",
       "persona_strategy_notes": "学生党：侧重XX，切入角度是YY；职场人：侧重AA，切入角度是BB",
       "customization_notes": "该格子与同方向其他平台、同平台其他方向的差异点",
@@ -72,3 +77,14 @@
   ]
 }
 ```
+
+**`paradigm` 字段处理**（唯一合法的两种情况）：
+
+1. **正常路径（期望 99% 走这条）**：输入的 active_cell 带有 `paradigm` 字段（上游 secretariat 已标注）。你**原样透传**到输出的 cell_plan。**绝对不要自己判断、改写、覆盖**——范式由上游决定，你只是搬运。
+
+2. **兜底路径（异常场景）**：输入的 active_cell 缺失 `paradigm` 字段（说明上游 secretariat 漏填，这是架构师级别的 bug）。此时你：
+   - 填入默认值 `"A_emotional_hook"`
+   - **必须**在 `customization_notes` 里显式加一行：`"⚠️ paradigm 默认为 A（上游 active_cell 未标注，请 builder 确认是否正确）"`
+   - 这不是你在"判断范式"，这是在**标记上游缺失**让 builder 知情
+
+这两种路径之外的所有"我觉得这个方向更像 B"之类的自作主张都是禁止的。

@@ -1,9 +1,12 @@
 """项目总览 — Dashboard page showing all projects and their status."""
 
 import streamlit as st
+import time
 from db.supabase_client import SupabaseClient
+from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="项目总览", page_icon="📋", layout="wide")
+show_version_badge()
 st.title("📋 项目总览")
 
 STATUS_EMOJI = {
@@ -11,6 +14,8 @@ STATUS_EMOJI = {
     "running": "🔄",
     "completed": "✅",
     "failed": "❌",
+    "needs_revision": "📝🔁",
+    "paused_for_review": "⏸️",
 }
 
 TASK_TYPE_LABEL = {
@@ -27,16 +32,18 @@ try:
         st.info("暂无项目，点击左侧「新建项目」开始。")
     else:
         # Quick stats
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         total = len(projects)
         running = sum(1 for p in projects if p["status"] == "running")
         completed = sum(1 for p in projects if p["status"] == "completed")
+        needs_rev = sum(1 for p in projects if p["status"] == "needs_revision")
         failed = sum(1 for p in projects if p["status"] == "failed")
 
         col1.metric("总项目数", total)
         col2.metric("运行中", running)
         col3.metric("已完成", completed)
-        col4.metric("失败", failed)
+        col4.metric("待修订", needs_rev)
+        col5.metric("失败", failed)
 
         st.divider()
 
@@ -79,11 +86,20 @@ try:
                         st.session_state.pop(f"confirm_del_{pid}", None)
                         st.rerun()
 
-        # Auto-refresh if any project is running
+        # Auto-refresh while any project is running. Streamlit has no
+        # server-push, so the only way to see live status is a periodic
+        # rerun. Guarded by a user toggle so a user can freeze the view
+        # (e.g. while copying something from a table) without the page
+        # yanking out from under them.
         if running > 0:
-            import time
-            time.sleep(5)
-            st.rerun()
+            _auto = st.toggle(
+                "🔄 自动刷新（每 5 秒）",
+                value=st.session_state.get("dashboard_auto_refresh", True),
+                key="dashboard_auto_refresh",
+            )
+            if _auto:
+                time.sleep(5)
+                st.rerun()
 
 except Exception as e:
     st.error(f"无法连接数据库。请在「设置」页面配置 Supabase 连接。\n\n错误：{e}")
