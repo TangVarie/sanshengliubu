@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.25.0"
+VERSION = "v0.26.0"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "参考样本库(证据包) + 自动 AI 分析 + vibe loop 注入评论区 DNA(需跑 migration 005)"
+VERSION_NOTES = "图片走 Gemini Vision 预转写(下游真能看见)+ 太子 60% 留存硬约束 + 留存率 UI 标红 + input_data 诊断面板"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
