@@ -318,6 +318,113 @@ class SupabaseClient:
         )
         return resp.data or []
 
+    # ── Reference Pack (v2) ───────────────────────────────────────────
+    # "证据包" schema: cover + title + body + top_comments + ai_analysis.
+    # See db/migrations/005_reference_samples_v2.sql.
+
+    _REFERENCE_PACK_UPDATABLE = frozenset({
+        "title", "post_title", "post_body", "cover_image_b64",
+        "top_comments", "platform", "category", "ai_analysis",
+        "quality_score", "tags",
+    })
+
+    def save_reference_pack(self, pack: dict) -> dict:
+        """Insert a v2 证据包. Required: post_title OR post_body, platform.
+        Other fields optional. Returns the inserted row."""
+        if not (pack.get("post_title") or pack.get("post_body")):
+            raise ValueError("证据包至少要有 post_title 或 post_body。")
+        payload = {
+            "title": pack.get("title") or (pack.get("post_title") or "")[:80] or "未命名样本",
+            "source_type": "pack",
+            # legacy compat: mirror post_body into content_text so the old
+            # list_reference_samples readers still see some content
+            "content_text": pack.get("post_body") or "",
+            "post_title": pack.get("post_title"),
+            "post_body": pack.get("post_body"),
+            "cover_image_b64": pack.get("cover_image_b64"),
+            "top_comments": pack.get("top_comments") or [],
+            "platform": pack.get("platform"),
+            "category": pack.get("category"),
+            "ai_analysis": pack.get("ai_analysis"),
+            "quality_score": int(pack.get("quality_score") or 0),
+            "tags": pack.get("tags") or [],
+        }
+        resp = self.client.table("reference_samples").insert(payload).execute()
+        return _first_row(resp, op="insert", table="reference_samples")
+
+    def update_reference_pack(self, sample_id: str, **fields) -> dict:
+        """Partial-update a pack. Allowlisted to the v2 columns."""
+        unknown = set(fields) - self._REFERENCE_PACK_UPDATABLE
+        if unknown:
+            raise ValueError(
+                f"update_reference_pack: refusing unknown field(s) {sorted(unknown)}"
+            )
+        resp = (
+            self.client.table("reference_samples")
+            .update(fields)
+            .eq("id", sample_id)
+            .execute()
+        )
+        return _first_row(resp, op="update", table="reference_samples")
+
+    def list_reference_packs(
+        self,
+        *,
+        platform: str | None = None,
+        category: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List v2 packs, most-recent first (with quality-score tiebreak).
+        Empty filters return all packs."""
+        q = (
+            self.client.table("reference_samples")
+            .select(
+                "id, title, post_title, post_body, cover_image_b64, "
+                "top_comments, platform, category, ai_analysis, "
+                "quality_score, tags, created_at"
+            )
+            .eq("source_type", "pack")
+        )
+        if platform:
+            q = q.eq("platform", platform)
+        if category:
+            q = q.eq("category", category)
+        resp = (
+            q.order("quality_score", desc=True)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
+    def get_relevant_reference_packs(
+        self,
+        platform: str,
+        category: str | None = None,
+        limit: int = 6,
+    ) -> list[dict]:
+        """Retrieval helper for vibe_loop. Priority:
+          1. exact platform + exact category match (best)
+          2. exact platform match (category mismatch or missing)
+          3. nothing else — do NOT cross platforms (小红书 vs 抖音 vibe
+             diverges too much to be useful as reference)
+        Within each tier, order by quality_score DESC, created_at DESC.
+        """
+        if not platform:
+            return []
+        tier_a = self.list_reference_packs(
+            platform=platform, category=category, limit=limit,
+        ) if category else []
+        if len(tier_a) >= limit:
+            return tier_a[:limit]
+        # Fill remaining slots from platform-only pool, dedup by id
+        seen = {r["id"] for r in tier_a}
+        tier_b = [
+            r for r in self.list_reference_packs(platform=platform, limit=limit)
+            if r["id"] not in seen
+        ]
+        return (tier_a + tier_b)[:limit]
+
     # ── Outputs ────────────────────────────────────────────────────
 
     def get_latest_output_for_project(self, project_id: str) -> dict | None:

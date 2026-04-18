@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.24.0"
+VERSION = "v0.25.0"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "审查加固:DB 空结果守护 + 上传大小限制 + FK SET NULL(需跑 migration 004)+ 缓存降级锁 + 自动刷新开关"
+VERSION_NOTES = "参考样本库(证据包) + 自动 AI 分析 + vibe loop 注入评论区 DNA(需跑 migration 005)"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled

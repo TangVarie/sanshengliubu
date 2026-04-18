@@ -49,6 +49,7 @@ from pipeline.agents.gemini_structure_reviewer import (
     run_gemini_structure_review,
 )
 from pipeline.agents.gemini_reference_analyzer import run_reference_analyzer
+from pipeline.retrieve_samples import retrieve_reference_packs
 from pipeline.agents.gemini_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -393,7 +394,7 @@ class PipelineOrchestrator:
             await self._run_gemini_structure_review_stage(final_system)
 
             # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
-            final_system = await self._run_vibe_loop(final_system)
+            final_system = await self._run_vibe_loop(final_system, structured_brief)
 
             # 5e. Cross-cell duplicate re-check after vibe. Builder's own
             # check (at end of _run_works_builders) catches builder-produced
@@ -2153,7 +2154,11 @@ class PipelineOrchestrator:
                 len(prompt_cells),
             )
 
-    async def _run_vibe_loop(self, final_system: dict) -> dict:
+    async def _run_vibe_loop(
+        self,
+        final_system: dict,
+        structured_brief: dict | None = None,
+    ) -> dict:
         """Critic → Rewriter loop with elastic iteration count.
 
         网感不行 = system_prompt 设计有缺陷 → 重写 system_prompt（不是改 demo）。
@@ -2174,6 +2179,38 @@ class PipelineOrchestrator:
             return final_system
 
         shared_skeleton = final_system.get("shared_skeleton", {})
+
+        # ── 人工证据包检索(v0.25.0)───────────────────────────────────────
+        # 为每个平台预取匹配的参考样本(用户在 pages/6_reference_library.py 录入),
+        # 注入到 critic/rewriter 的 input。评论区 DNA / hook / comment
+        # resonance_points 等来源于 reference_pack_analyzer 的结构化输出,
+        # rewriter 可以 per-cell 按 platform 挑自己关心的。
+        # 零样本情况下(用户还没录入)静默跳过,不阻塞也不警告。
+        _brief_category = (
+            (structured_brief or {}).get("product_category")
+            or (structured_brief or {}).get("category")
+        )
+        _unique_platforms = sorted({
+            (c.get("platform") or "").strip()
+            for c in prompt_cells
+            if c.get("platform")
+        })
+        reference_packs_by_platform: dict[str, list] = {}
+        for _plat in _unique_platforms:
+            _packs = retrieve_reference_packs(
+                self.db,
+                platform=_plat,
+                category=_brief_category,
+                limit=6,
+            )
+            if _packs:
+                reference_packs_by_platform[_plat] = _packs
+        if reference_packs_by_platform:
+            logger.info(
+                "[vibe_loop] injecting reference_packs: %s",
+                {k: len(v) for k, v in reference_packs_by_platform.items()},
+            )
+
         # Track which cell_ids were rewritten so round 2+ only re-evaluates those
         rewritten_ids: set[str] = set()
         # Total matrix size doesn't change across iterations (rewriter preserves
@@ -2217,6 +2254,8 @@ class PipelineOrchestrator:
                     for c in cells_to_critique
                 ]
             }
+            if reference_packs_by_platform:
+                critic_input["reference_packs_by_platform"] = reference_packs_by_platform
             try:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
@@ -2350,17 +2389,20 @@ class PipelineOrchestrator:
                 if c.get("cell_id") in failed_ids
             ]
 
+            rewriter_input = {
+                "failed_cells": failed_full_cells,
+                "shared_skeleton": shared_skeleton,
+            }
+            if reference_packs_by_platform:
+                rewriter_input["reference_packs_by_platform"] = reference_packs_by_platform
             try:
                 rewritten = await self.vibe_rewriter.run(
-                    {
-                        "failed_cells": failed_full_cells,
-                        "shared_skeleton": shared_skeleton,
-                    },
+                    rewriter_input,
                     self.run_id,
                     self.db,
                 )
-            except Exception as e:
-                logger.warning(f"Vibe rewriter failed ({e}), keeping original cells")
+            except Exception:
+                logger.exception("Vibe rewriter failed, keeping original cells")
                 break
 
             new_cells_by_id = {
