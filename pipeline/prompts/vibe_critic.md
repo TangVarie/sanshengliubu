@@ -131,6 +131,85 @@
 
 **关键**：即使第 2 步发现了一堆问题，只要第 0 步的本能 + 第 1 步的味道对照判 pass，**这条就是 pass**。不要因为第 2 步的诊断"看起来很丰富"就把 pass 改成 fail。第 2 步是诊断，不是判决。
 
+### 第 0.3 步：四乘数硬门槛(v0.27.0 新增,在 gut_call 之前作为硬前置)
+
+用户的点击/停留/分享本质是一次微型期望值计算,核心公式是**乘法**关系:
+
+```
+点击概率 ∝ 奖励类型信号 × 兴趣对齐 × 信息缺口张力 × 身份-目的一致性
+```
+
+**任何一项接近零,其他三项再高都无效**。这也就是为什么"信息很丰富但没人看"。
+
+你必须按这 4 项各自给 `pass | weak | fail` 三档判定。这个判定**比 gut_call 和 taste_match 都优先**——任一项为 `fail` = 整条 cell 强制 `severity: fail`,不管别的维度多好看。
+
+**4 项判定标准**:
+
+#### ① `reward_signal`(奖励类型信号)
+用户在前 3 秒能识别出这条内容提供的**价值类型**吗?(不是具体内容,是类型)
+- `pass`: 前 3 秒一眼能感受到这里有 [社交八卦 / 情绪共鸣 / 实用信息 / ...] 之一
+- `weak`: 需要读完才能判断有无价值
+- `fail`: 读完都说不出得到了什么——"今天想和大家分享我的生活"级别的零信号开头
+
+对照 cell_plan 里的 `reward_type` 字段(secretariat 标注):实际开场传递的奖励类型是否和 reward_type 一致?不一致 = fail。
+
+#### ② `interest_align`(兴趣对齐)
+这条内容的奖励类型**对 target_audience 的兴趣结构来说是有反应的**吗?
+- `pass`: target_audience 看到这条会本能停下
+- `weak`: target_audience 可能会停,取决于心情
+- `fail`: 完全不在这群人的兴趣结构里,比如对一群"不关心两性话题的人"打情感钩子
+
+不确定 target_audience 的兴趣结构时,按 cell_plan 里 `applicable_personas` 反推判断。
+
+#### ③ `gap_tension`(信息缺口张力 —— **方向**比强度更重要)
+
+用户"好像懂了但又没完全懂"的状态最有点击欲,但缺口**方向**决定是否有效:
+- `pass`: 缺口指向**事件本身**(是谁 / 发生了什么 / 怎么回事)——真人叙事的自然缺口
+- `weak`: 缺口方向模糊,既可以往事件走也可以往复现走
+- `fail`: 缺口指向**复现方法**(做了什么就有这效果 / 哪里买)——商业叙事的典型缺口,用户几秒内识破
+
+对照 cell_plan 里的 `gap_direction` 字段。如果 secretariat 标了 `事件本身` 但本 demo 实际缺口偏向"哪里买/怎么做",= fail。
+
+#### ④ `identity_consistency`(身份-目的一致性 —— **一票否决**)
+
+用户反感的**不是广告本身**,而是**"你在骗我以为这不是广告"**。
+
+本 cell 的叙事身份(我以什么身份在说话)和真实目的(这条内容要达成什么)在用户感知里一致吗?
+
+合法形态(任一):
+- 真素人对齐: 我是用户,我真的在用
+- 真博主-真推广对齐: 我是博主,这是我接的广告,但我觉得值得推
+- 真品牌-真营销对齐: 我是品牌,不装,就是来介绍产品
+- 真情绪-真表达对齐: 我在表达一种感受,产品只是表达的一个元素
+
+非法形态(任一 = fail):
+- 博主假装素人
+- 营销假装路人
+- 套路假装真情
+- 品牌假装第三方观察者
+
+对照 cell_plan 里的 `product_role`: 如果 `product_role = "副产品"` 但 demo 写得像"我就是来推广这个产品"的博主口吻,那是身份错位 = fail。
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"multiplier_gate": {
+  "reward_signal": "pass | weak | fail",
+  "interest_align": "pass | weak | fail",
+  "gap_tension": "pass | weak | fail",
+  "identity_consistency": "pass | weak | fail",
+  "gate_verdict": "pass_all | any_weak | any_fail",
+  "fail_reason": "如有 fail,一句话说哪项为什么"
+}
+```
+
+**整体决策规则**:
+- 任何一项 = `fail` → 强制 `severity: fail`,进入 rewriter 重写
+- 任何一项 = `weak`(没有 fail)→ 至多判 `borderline`
+- 全部 = `pass` → 才允许进入后续 gut_call / taste_match 正常流程
+
+---
+
 ### 第 0.5 步：AI 空话硬否决（在 gut_call 之前作为前置 filter）
 
 在做 gut_call 之前，先扫一遍 demo_output 的全文。如果**命中以下任意一条黑名单短语**，`gut_call` 直接强制写 `"不会点"`，`severity = "fail"`——不允许用"方向对但差点意思"来开脱：
@@ -143,6 +222,35 @@
 这些词是 AI 腔的硬指纹，工部下游的 `_validate_prompt_cell` 已经把它们标为硬性失败。你在此处 fail 等于"提前一层把它挡下"，避免污染到用户。
 
 如果黑名单命中但其他方面看起来还行，仍然判 fail——**不给面子分**。在 `taste_match` 里补一句"AI 空话 '[具体词]' 命中硬否决"即可。
+
+### 第 2.5 步：模板性检测(v0.27.0 新增,机械可执行)
+
+**原则**:一条内容如果可以被任何品牌/任何品类套用,那它就不属于任何品牌——这是 AI 腔最隐形的症状,不靠感觉能查出来,靠**关键词替换测试**。
+
+**操作步骤**:
+1. 从 demo_output 里找出明显的品类/品牌/产品名关键词(比如"精华液"、"蓝牙耳机"、"奶粉"、"XX 品牌")
+2. 把这些关键词逐一替换成**另一个完全无关的品类**(护肤 → 食品;食品 → 3C;3C → 母婴)
+3. 替换后再读一遍 demo,问: **这条内容整体结构和情感逻辑是否仍然成立?**
+
+**判定**:
+- **成立** = 这是模板话,AI 腔严重,整条 cell 强制 `severity: fail` —— 比如"做了这件事之后老公不一样了"换成"做了这件事之后皮肤不一样了"依然成立,说明这不是真人说法,是套路模板
+- **部分成立**(主体能用但细节不通) = `severity: borderline`
+- **完全不成立**(换完就读不通,因为内容深度绑定这个品类的独特场景/术语/人物关系)= 这条真的扎进了品类,不是模板
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"template_test": {
+  "swapped_category_example": "'精华液' → '智能音响' 后 demo 变成: [填一个改写示例]",
+  "still_holds": "yes | partially | no",
+  "verdict": "pass(no 对应) | borderline(partially) | fail(yes)",
+  "signature_to_this_category": "哪些具体细节/场景/术语让这条深度绑定了这个品类(如 no)"
+}
+```
+
+**重要**: 模板性检测**不覆盖**四乘数判决——两层独立。一条内容可能 4 乘数全 pass 但模板性 fail(典型:钩子好但内容空),也可能模板性 pass 但 4 乘数 fail(典型:品类扎实但身份不一致)。任一层 fail = 整体 fail。
+
+---
 
 ### 第 3 步：跨 cell 一致性检查（batch 内必做）
 
@@ -213,6 +321,20 @@
       "cell_id": "D1_xiaohongshu",
       "platform": "小红书",
       "paradigm": "A_emotional_hook | B_meta_response",
+      "multiplier_gate": {
+        "reward_signal": "pass | weak | fail",
+        "interest_align": "pass | weak | fail",
+        "gap_tension": "pass | weak | fail",
+        "identity_consistency": "pass | weak | fail",
+        "gate_verdict": "pass_all | any_weak | any_fail",
+        "fail_reason": "如有 fail,一句话说哪项为什么"
+      },
+      "template_test": {
+        "swapped_category_example": "'精华液' → '智能音响' 后 demo 变成: [改写示例]",
+        "still_holds": "yes | partially | no",
+        "verdict": "pass | borderline | fail",
+        "signature_to_this_category": "哪些具体细节让这条深度绑定品类(如 no)"
+      },
       "gut_call": "会点 | 差点意思 | 不会点",
       "gut_word": "有那味 | 夯 | 差点意思但方向对 | 平 | AI腔 | 像广告 | 像产品说明书 | 像演讲稿 | 像作业",
       "first_sentence": "demo 的第一句原文",

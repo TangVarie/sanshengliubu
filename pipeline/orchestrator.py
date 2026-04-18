@@ -355,6 +355,19 @@ class PipelineOrchestrator:
                     f"target_platforms: {plan.get('target_platforms', [])}"
                 )
 
+            # v0.27.0: 把 cell_plan / tactical_direction 索引挂到 self,
+            # vibe_loop 需要把这些 ground-truth 字段(paradigm / reward_type /
+            # role_embodiment / gap_direction / path_combination / product_role)
+            # 注入到 critic_input,让 critic 做 4 乘数硬门槛对照判决。
+            self._cell_plan_index = {
+                cp.get("cell_id"): cp for cp in cell_plans if cp.get("cell_id")
+            }
+            self._direction_index = {
+                d.get("direction_id"): d
+                for d in plan.get("tactical_directions", [])
+                if d.get("direction_id")
+            }
+
             # Assemble full works_plan for builder
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
@@ -2241,19 +2254,45 @@ class PipelineOrchestrator:
                     f"(skipping {len(prompt_cells) - len(cells_to_critique)} unchanged)"
                 )
 
+            # v0.27.0: 注入 secretariat + cell_planner 标注的 ground-truth
+            # 字段(reward_type / role_embodiment / gap_direction / paradigm /
+            # path_combination / product_role),让 critic 做 4 乘数硬门槛
+            # 对照判决(见 vibe_critic.md 第 0.3 步)。
+            # cell_plans 和 direction 索引在 orchestrator.run() 5b 步挂到
+            # self 上;resume 路径若索引为空,critic 会自动退到启发式判断。
+            _cell_idx = getattr(self, "_cell_plan_index", {}) or {}
+            _dir_idx = getattr(self, "_direction_index", {}) or {}
+
+            def _enriched_cell(c: dict) -> dict:
+                cp = _cell_idx.get(c.get("cell_id"), {}) or {}
+                direction = _dir_idx.get(c.get("direction_id"), {}) or {}
+                return {
+                    "cell_id": c.get("cell_id"),
+                    "direction_id": c.get("direction_id"),
+                    "direction_name": c.get("direction_name"),
+                    "platform": c.get("platform"),
+                    "system_prompt": c.get("system_prompt", ""),
+                    "demo_output": c.get("demo_output", ""),
+                    # ground-truth intent from upstream stages
+                    "paradigm": cp.get("paradigm") or direction.get("paradigm"),
+                    "reward_type": direction.get("reward_type"),
+                    "role_embodiment": direction.get("role_embodiment"),
+                    "gap_direction": direction.get("gap_direction"),
+                    "path_combination": cp.get("path_combination"),
+                    "product_role": cp.get("product_role"),
+                }
+
             critic_input = {
-                "prompt_cells": [
-                    {
-                        "cell_id": c.get("cell_id"),
-                        "direction_id": c.get("direction_id"),
-                        "direction_name": c.get("direction_name"),
-                        "platform": c.get("platform"),
-                        "system_prompt": c.get("system_prompt", ""),
-                        "demo_output": c.get("demo_output", ""),
-                    }
-                    for c in cells_to_critique
-                ]
+                "prompt_cells": [_enriched_cell(c) for c in cells_to_critique]
             }
+            # Pass brief-level context so critic can check interest_align
+            # against target_audience + campaign_objective.
+            if structured_brief:
+                critic_input["brief_context"] = {
+                    "target_audience": structured_brief.get("target_audience", ""),
+                    "campaign_objective": structured_brief.get("campaign_objective", []),
+                    "product_category": structured_brief.get("product_category", ""),
+                }
             if reference_packs_by_platform:
                 critic_input["reference_packs_by_platform"] = reference_packs_by_platform
             try:

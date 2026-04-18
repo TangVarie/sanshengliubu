@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.26.0"
+VERSION = "v0.27.0"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "图片走 Gemini Vision 预转写(下游真能看见)+ 太子 60% 留存硬约束 + 留存率 UI 标红 + input_data 诊断面板"
+VERSION_NOTES = "内容思维框架集成:中书省+奖励类型/角色/缺口方向 · 格子规划+8路径/产品副产品化 · vibe 4乘数硬门槛+模板性检测"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
