@@ -75,17 +75,30 @@ CREATE INDEX IF NOT EXISTS idx_outputs_run ON outputs(run_id);
 CREATE TABLE IF NOT EXISTS reference_samples (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title TEXT NOT NULL DEFAULT '未命名样本',
-    source_type TEXT DEFAULT 'screenshot',  -- screenshot | text | url
-    content_text TEXT,                       -- OCR'd text or user-pasted
-    analysis JSONB,                          -- Gemini's structured analysis
-    image_url TEXT,                          -- Supabase storage URL (optional)
-    tags TEXT[] DEFAULT '{}',                -- user tags for filtering
+    source_type TEXT DEFAULT 'screenshot',  -- screenshot | text | url | pack
+    content_text TEXT,                       -- legacy: OCR'd text or user-pasted
+    analysis JSONB,                          -- legacy: Gemini screenshot analysis
+    image_url TEXT,                          -- legacy: Supabase storage URL
+    tags TEXT[] DEFAULT '{}',                -- legacy: user tags
+    -- v2 "证据包" fields (migration 005) — 封面+标题+正文+评论区 四位一体
+    post_title TEXT,                         -- 原帖标题
+    post_body TEXT,                          -- 原帖正文
+    cover_image_b64 TEXT,                    -- 封面 base64(支持视觉分析)
+    top_comments JSONB DEFAULT '[]'::jsonb,  -- [{text, likes?}, ...]
+    platform TEXT,                           -- 小红书 / 抖音 / B站 / ...
+    category TEXT,                           -- 护肤 / 食品 / 3C / ...
+    ai_analysis JSONB,                       -- 太子式分析(vibe_tags/hook/tone/comment_dna)
+    quality_score INTEGER DEFAULT 0,         -- A/B 反馈加权(可选)
     created_by TEXT DEFAULT 'default',
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_reference_samples_created
     ON reference_samples(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reference_samples_platform_category
+    ON reference_samples(platform, category);
+CREATE INDEX IF NOT EXISTS idx_reference_samples_quality
+    ON reference_samples(quality_score DESC, created_at DESC);
 
 -- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
 ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
