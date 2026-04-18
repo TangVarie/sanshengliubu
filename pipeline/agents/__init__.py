@@ -834,17 +834,18 @@ class BaseAgent:
         _preset_supports_adaptive = _api_config.get(
             "supports_adaptive_thinking", True
         )
-        # Adaptive thinking is an Opus-4.6-specific API feature. Match the
-        # canonical model family prefix instead of a bare "4-6" substring
-        # so future names like "claude-opus-5-0" don't accidentally match
-        # and we don't cross-match unrelated model names that happen to
-        # contain those digits.
-        _is_opus_4_6_family = (
+        # Adaptive thinking is an Opus-4.6+ API feature(自 Opus 4.6 起支持,
+        # Opus 4.7 继承)。Match canonical model family prefixes exactly, so
+        # future names like "claude-opus-5-0" don't accidentally match and
+        # we don't cross-match unrelated model names containing those digits.
+        # Sonnet 3.7 不支持 adaptive thinking,会走到 else 分支发 budget_tokens。
+        _is_adaptive_thinking_family = (
             "claude-opus-4-6" in effective_model
+            or "claude-opus-4-7" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
         if self._use_thinking and not _preset_uses_suffix:
-            if _is_opus_4_6_family and _preset_supports_adaptive:
+            if _is_adaptive_thinking_family and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {
