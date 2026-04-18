@@ -2,9 +2,9 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.28.1"
+VERSION = "v0.28.2"
 VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "修复 502:Opus 4.7 relay 未覆盖时自动 fallback 到 4.6;5xx 重试间隔延长到 10/20/40 秒"
+VERSION_NOTES = "撤销模型自动降级(用户偏好全程 Opus 4.7);保留 5xx 长退避(10s base)"
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -56,19 +56,6 @@ SONNET_MODEL = "claude-sonnet-4-6"
 #   vibe_rewriter = "claude-3-7-sonnet-latest"
 #   ...
 SONNET_CONTENT_MODEL = "claude-sonnet-3-7"
-
-# v0.28.1: 模型 fallback 链 — 当某个 stage 的主模型在所有重试后仍 5xx,
-# 自动切到 fallback 模型再跑一次。典型触发场景:你的 relay 还没加入某个
-# 新模型(比如 claude-opus-4-7),upstream 透回 502;与其让流水线炸,不如
-# 降级到稳定的旧模型继续跑。
-#
-# 只配 Opus 线,因为 Opus 4.7/4.6 都支持 adaptive thinking,无需调整 thinking
-# 参数。Sonnet 3.7 <-> 4.6 的 thinking API 约定不同,跨版本自动降级容易
-# 产生混乱,所以 Sonnet 不配 fallback(写作类 stage 也不用 thinking,单纯
-# 5xx 重试即可)。
-MODEL_FALLBACKS: dict[str, str] = {
-    "claude-opus-4-7": "claude-opus-4-6",
-}
 
 MODEL_PRESET = "content_sonnet"
 
