@@ -74,8 +74,26 @@ def extract_file_content(uploaded_file) -> str:
         data = _read_with_cap(uploaded_file, _MAX_IMAGE_BYTES)
         if data is None:
             return f"[图片过大跳过: {uploaded_file.name} > {_MAX_IMAGE_BYTES // 1024 // 1024}MB]"
-        b64 = base64.b64encode(data).decode("utf-8")
-        return f"[图片文件: {uploaded_file.name}, base64长度: {len(b64)}]\n[BASE64_IMAGE:{b64}]"
+        # ── 图片预转写(v0.26.0)──
+        # 旧版做法:把图片转成 [BASE64_IMAGE:...] 占位符塞进 free_text。
+        # 但 Anthropic API 不会把字符串里的 base64 当图像理解,所以
+        # 下游 Crown Prince + 六部根本"看不见"图,只知道有张图存在。
+        # 新版:本地起一个 Gemini Vision 调用,把图转成 OCR + 视觉描述
+        # + 关键数据 的结构化文字块。Gemini 没配置 / 失败 → 降级到带
+        # 警告语的占位符(transcribe_image_for_brief 内部包了所有异常)。
+        from pipeline.agents.gemini_image_transcriber import (
+            transcribe_image_for_brief,
+        )
+        # mime 简单从扩展名推断,够 Gemini API 用
+        _ext_to_mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp",
+        }
+        _mime = next(
+            (m for ext, m in _ext_to_mime.items() if name.endswith(ext)),
+            "image/png",
+        )
+        return transcribe_image_for_brief(data, _mime, uploaded_file.name)
 
     return f"[不支持的文件类型: {uploaded_file.name}]"
 
@@ -95,13 +113,29 @@ def _launch_pipeline(db, project, success_message: str = "✅ 流水线已启动
 
 
 def process_uploaded_files(files) -> str:
-    """Process multiple uploaded files into a tagged text block."""
+    """Process multiple uploaded files into a tagged text block.
+
+    图片走 Gemini Vision 预转写(见 extract_file_content 图片分支),
+    每张耗时 ~5-15s,所以这里包一个 st.spinner 让用户知道在跑。
+    """
     if not files:
         return ""
+    has_images = any(
+        getattr(f, "name", "").lower().endswith(_IMAGE_EXTS)
+        for f in files
+    )
     parts = []
-    for f in files:
-        content = extract_file_content(f)
-        parts.append(f"\n[参考文件: {f.name}]\n{content}\n[/参考文件]")
+    if has_images:
+        with st.spinner(
+            f"📷 正在用 Gemini Vision 转写 {len(files)} 个上传文件中的图片(每张 ~5-15s)..."
+        ):
+            for f in files:
+                content = extract_file_content(f)
+                parts.append(f"\n[参考文件: {f.name}]\n{content}\n[/参考文件]")
+    else:
+        for f in files:
+            content = extract_file_content(f)
+            parts.append(f"\n[参考文件: {f.name}]\n{content}\n[/参考文件]")
     return "\n".join(parts)
 
 

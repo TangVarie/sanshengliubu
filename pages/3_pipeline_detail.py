@@ -437,34 +437,55 @@ for ni_log in needs_input_logs:
             _MAX_IMAGE_BYTES = 2 * 1024 * 1024
             _MAX_TEXT_BYTES = 1 * 1024 * 1024
             if uploaded_files:
-                file_texts = []
-                for f in uploaded_files:
+                # 图片走 Gemini Vision 预转写,与 pages/2_new_project.py 一致。
+                # 旧版 base64 占位符让下游 LLM 看不见图,人工补充等于白补。
+                from pipeline.agents.gemini_image_transcriber import (
+                    transcribe_image_for_brief,
+                )
+                _ext_to_mime = {
+                    ".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }
+                _has_imgs = any(
+                    f.name.lower().endswith(tuple(_ext_to_mime))
+                    for f in uploaded_files
+                )
+
+                def _process_one(f):
                     try:
                         name = f.name.lower()
-                        is_image = name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                        is_image = name.endswith(tuple(_ext_to_mime))
                         cap = _MAX_IMAGE_BYTES if is_image else _MAX_TEXT_BYTES
                         size = getattr(f, "size", None)
                         if size is not None and size > cap:
-                            file_texts.append(
-                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
-                            )
-                            continue
+                            return f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
                         data = f.read()
                         if len(data) > cap:
-                            file_texts.append(
-                                f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
-                            )
-                            continue
+                            return f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
                         if is_image:
-                            b64 = base64.b64encode(data).decode("utf-8")
-                            file_texts.append(f"[补充图片: {f.name}]\n[BASE64_IMAGE:{b64}]")
-                        else:
-                            file_texts.append(
-                                f"[补充文件: {f.name}]\n"
-                                f"{data.decode('utf-8', errors='replace')}"
+                            mime = next(
+                                (m for ext, m in _ext_to_mime.items() if name.endswith(ext)),
+                                "image/png",
                             )
+                            return f"[补充图片: {f.name}]\n{transcribe_image_for_brief(data, mime, f.name)}"
+                        return (
+                            f"[补充文件: {f.name}]\n"
+                            f"{data.decode('utf-8', errors='replace')}"
+                        )
                     except Exception:
-                        file_texts.append(f"[补充文件: {f.name}]（无法读取）")
+                        return f"[补充文件: {f.name}]（无法读取）"
+
+                file_texts: list[str] = []
+                if _has_imgs:
+                    with st.spinner(
+                        f"📷 正在用 Gemini Vision 转写补充图片(每张 ~5-15s)..."
+                    ):
+                        for f in uploaded_files:
+                            file_texts.append(_process_one(f))
+                else:
+                    for f in uploaded_files:
+                        file_texts.append(_process_one(f))
                 intervention["supplementary_files"] = "\n\n".join(file_texts)
             try:
                 db.update_stage_log(ni_log["id"], human_intervention=intervention)
@@ -632,7 +653,87 @@ with tabs[0]:
     log = log_map.get("crown_prince")
     render_stage_meta(log)
     if log and log.get("output_data"):
+        # ── 留存率诊断(v0.26.0)──
+        # 用户喂的 raw 内容(free_text 里的 [参考文件: ...] 块)在
+        # 太子 raw_materials + reference_summary 里实际保留了多少。
+        # 留存率太低意味着模型在偷懒概括——见 crown_prince.md 第 4 条
+        # 硬约束。这一行单独显示,让丢内容问题不再隐藏。
+        try:
+            import re as _re_diag
+            _input_data = log.get("input_data") or {}
+            _input_free_text = (
+                _input_data.get("free_text")
+                or (_input_data.get("brief") or {}).get("free_text")
+                or ""
+            )
+            _ref_blocks = _re_diag.findall(
+                r"\[参考文件:\s*[^\]]*\]\n(.*?)\n\[/参考文件\]",
+                _input_free_text,
+                flags=_re_diag.DOTALL,
+            )
+            _ref_chars = sum(len(b) for b in _ref_blocks)
+            _out = log["output_data"] or {}
+            _kept_chars = (
+                len(str(_out.get("raw_materials") or ""))
+                + len(str(_out.get("reference_summary") or ""))
+            )
+            if _ref_chars > 0:
+                _ratio = _kept_chars / _ref_chars
+                _pct = f"{_ratio * 100:.0f}%"
+                if _ratio >= 0.6:
+                    st.success(
+                        f"📊 参考文件留存率:**{_pct}** "
+                        f"(原始 {_ref_chars:,} 字 → 太子保留 {_kept_chars:,} 字,"
+                        f"≥60% 阈值,健康)"
+                    )
+                elif _ratio >= 0.3:
+                    st.warning(
+                        f"📊 参考文件留存率:**{_pct}** "
+                        f"(原始 {_ref_chars:,} 字 → 太子保留 {_kept_chars:,} 字,"
+                        f"低于 60% 阈值——下游六部可能拿不到完整素材)"
+                    )
+                else:
+                    st.error(
+                        f"📊 参考文件留存率:**{_pct}** "
+                        f"(原始 {_ref_chars:,} 字 → 太子只保留 {_kept_chars:,} 字,"
+                        f"严重偏低——大量素材已被概括丢失)"
+                    )
+            elif _input_free_text:
+                st.caption(
+                    f"📊 太子接收 free_text {len(_input_free_text):,} 字 → "
+                    f"raw_materials + reference_summary 输出 {_kept_chars:,} 字"
+                )
+        except Exception as _diag_err:
+            st.caption(f"(留存率诊断失败:{_diag_err})")
+
         render_stage_output(log["output_data"])
+
+        # ── 完整 input_data 折叠面板(诊断丢内容用)──
+        # 让用户能直接对比"我喂了什么"vs"模型看到了什么"vs"模型输出了什么"。
+        with st.expander("📥 太子接收的完整输入 input_data(诊断用)", expanded=False):
+            _id = log.get("input_data") or {}
+            if not _id:
+                st.caption("(input_data 为空)")
+            else:
+                _free_text_in = (
+                    _id.get("free_text")
+                    or (_id.get("brief") or {}).get("free_text")
+                    or ""
+                )
+                if _free_text_in:
+                    st.markdown(f"**free_text 长度:** {len(_free_text_in):,} 字")
+                    st.text_area(
+                        "free_text(只读)",
+                        value=_free_text_in,
+                        height=300,
+                        disabled=True,
+                        label_visibility="collapsed",
+                        key="cp_input_freetext_diag",
+                    )
+                _other = {k: v for k, v in _id.items() if k != "free_text"}
+                if _other:
+                    st.markdown("**其他 input 字段:**")
+                    st.json(_other)
     elif log:
         st.info(f"状态：{log.get('status', 'pending')}")
         if log.get("status") == "failed":
