@@ -333,7 +333,12 @@ def call_gemini_json(
 
         # Build contents: text + optional images for multimodal calls.
         if images:
-            _content_parts: list[Any] = [types.Part.from_text(user_message)]
+            # v0.29.10: 新版 google-genai SDK 的 Part.from_text 要 keyword
+            # 参数 text=...,不能位置传。之前写 Part.from_text(user_message)
+            # 报 `TypeError: Part.from_text() takes 1 posit...`,所有带图片
+            # 的 Gemini 调用(image transcriber / reference_analyzer / 各
+            # reference_analyzer)全挂。
+            _content_parts: list[Any] = [types.Part.from_text(text=user_message)]
             for img_bytes, img_mime in images:
                 _content_parts.append(
                     types.Part.from_bytes(data=img_bytes, mime_type=img_mime)

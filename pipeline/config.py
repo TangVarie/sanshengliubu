@@ -2,10 +2,14 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.9"
+VERSION = "v0.29.10"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "流水线详情页可观测性大升级: (1) 新增『中间精炼』tab 展示 "
+    "hotfix: google-genai SDK Part.from_text() 位置参数改关键字参数。"
+    "之前写 Part.from_text(user_message) 新版 SDK 直接 TypeError,所有"
+    "带图片的 Gemini 调用(image transcriber / reference_analyzer)全挂,"
+    "上传的图片都显示『未经过视觉转写』。改为 Part.from_text(text=...)。"
+    "功能同 v0.29.9(流水线详情页可观测性大升级): (1) 新增『中间精炼』tab 展示 "
     "叙事导演 / 红蓝精炼 / 画像模拟 三个阶段,之前 UI 没位置、"
     "图标染色点进去看不到内容; (2) 网感 tab 补上 叙事结构重写 "
     "(structural_rewriter) 的 per-cell 摘要; (3) 太子 tab 顶部新增 "
