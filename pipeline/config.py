@@ -2,13 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.0"
+VERSION = "v0.29.1"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "critic-rewriter 责任分流: critic 新增 root_cause_kind(5 类);"
-    "orchestrator 按类分流 vibe_rewriter / structural_rewriter / strategic_warnings;"
-    "secretariat 新增 stop_trigger 字段作为 interest_align 判决锚点;"
-    "brief 新增 advertising_stance 让 identity_consistency 按姿态分流判决。"
+    "策略层自动升级(C.2.1): strategic_warnings 触发 secretariat 修订受"
+    "影响 direction 的 stop_trigger/reward_type/role_embodiment 后再跑"
+    "一次 vibe_loop(上限 1 轮);"
+    "消费者二层校验(C.2.2): persona_simulator 新增 consumer_simulation"
+    "模式,vibe_loop 后按 stop_trigger 构造目标用户对每个 cell 做"
+    "stop/scroll 二元判决,scroll 的 cell 追加进 strategic_warnings。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
@@ -394,6 +396,23 @@ VIBE_LOOP_ESCALATE_THRESHOLD = 0.30  # failure rate to unlock extra round
 #   - strategic_warnings(策略层错配,rewriter 改不了)
 # 关闭时:全部塞给 vibe_rewriter(v0.28 及之前的行为),作为稳妥兜底。
 ENABLE_STRUCTURAL_REWRITER = True
+
+# v0.29.1: 策略层自动升级(C.2.1)— vibe_loop 结束后若仍有 strategic_warnings,
+# 自动回 secretariat 修订受影响的 direction(更新 stop_trigger / reward_type /
+# role_embodiment 等锚点),然后再跑一次 vibe_loop 让 critic + rewriter
+# 用新锚点重新判决。关闭时保持 v0.29.0 行为(只写 warnings 由用户人工介入)。
+ENABLE_STRATEGIC_ESCALATION = True
+# 硬上限:策略层循环的最大轮数。默认 1 — 只允许一次自动升级,避免 direction
+# 来回摆动陷入死循环。超过后 strategic_warnings 仍然会写到 final_system
+# 让用户人工处理。
+STRATEGIC_LOOP_MAX_ITERATIONS = 1
+
+# v0.29.1: 消费者模拟(C.2.2)— 在 vibe_loop 结束后、终审前,让
+# persona_simulator 以 stop_trigger 描述的具体目标用户身份对每个 cell
+# 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。结果存到
+# final_system._consumer_simulation,UI 显示;cell 若被目标用户 scroll,会
+# 追加进 strategic_warnings 走人工审查通道。
+ENABLE_CONSUMER_SIMULATION = True
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
 RED_BLUE_CONCURRENCY = 3

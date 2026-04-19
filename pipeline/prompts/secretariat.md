@@ -118,6 +118,86 @@ brief 里带了 `advertising_stance` 字段(`stealth` / `disclosed_kol` / `brand
 2. 针对性修改，不要推翻整个方案重来
 3. 在 `strategic_insight` 或 `tactical_directions` 中体现修改
 
+## 策略层自动升级模式(v0.29.1 新增 — strategic_revision)
+
+如果输入中包含 `strategic_revision` 字段,说明下游 vibe_critic 在内容生成阶段检测到某些 `tactical_direction` 存在**策略层错配**(interest_align 或 reward_signal 级别的 fail,rewriter 改不了)。orchestrator 把相关 cell 的 critic 诊断回传给你,**你需要针对性修订这些 direction 的策略锚点**。
+
+### 输入结构
+
+```json
+{
+  "strategic_revision": {
+    "current_plan": { ...完整的上一版 strategic_plan... },
+    "affected_direction_ids": ["D2", "D5"],
+    "strategic_warnings": [
+      {
+        "cell_id": "D2_xiaohongshu",
+        "direction_id": "D2",
+        "platform": "小红书",
+        "root_cause_explanation": "critic 的一句话诊断",
+        "multiplier_gate": {
+          "reward_signal": "pass | weak | fail",
+          "interest_align": "pass | weak | fail",
+          "gap_tension": "pass | weak | fail",
+          "identity_consistency": "pass | weak | fail"
+        },
+        "iteration": 2
+      }
+    ]
+  },
+  "brief": { ... }
+}
+```
+
+### 你要做的
+
+1. **只改 affected_direction_ids 列出的方向**。其他方向 `tactical_directions` 的字段**原样保留**,不要动,不要"顺便优化"。
+2. 对每个受影响的 direction,重点审视以下 4 个字段:
+   - `stop_trigger` — 如果 interest_align = fail,大概率是这个字段写得太泛(人口学标签而不是心理状态),必须改写成**具体的、可验证的因果陈述**。
+   - `reward_type` — 如果 reward_signal = fail,可能是 reward_type 标错了(声明的是"社交信息"但内容实际是"实用信息")。对照 critic 的诊断文字重新选。
+   - `role_embodiment` — 如果身份错位相关的 fail,可能是这个字段和 content_angle 不一致,需要重选。
+   - `gap_direction` — 一般不用动,除非 critic 明确指出缺口方向错。
+3. **不要改 `direction_id` 和 `direction_name`** — 下游用 direction_id 做关联,改了会断链。
+4. 在每个修订过的 direction 里,额外加一个临时字段 `_revision_note`,一句话说明"这次改了什么 / 为什么",给下游留痕。
+5. **matrix_skeleton 保持原样**。自动升级不增删 cell,只更新 direction 的策略字段。
+
+### 输出格式
+
+和正常模式相同(完整的 strategic_plan JSON),但你只改了 affected_direction_ids 里那些 direction 的字段。输出示例:
+
+```json
+{
+  "system_name": "(原样)",
+  "strategic_insight": "(原样,除非受影响的 direction 数量过半,才允许调整 insight)",
+  "tactical_directions": [
+    {"direction_id": "D1", "...": "(原样不动)"},
+    {
+      "direction_id": "D2",
+      "direction_name": "(原样不动)",
+      "paradigm": "(原样或修订)",
+      "reward_type": "(修订,如 critic 说标错)",
+      "role_embodiment": "(修订,如身份错位)",
+      "gap_direction": "(一般原样)",
+      "stop_trigger": "(必须修订,从散文改成具体心理状态)",
+      "rationale": "(更新以反映新锚点)",
+      "target_scenario": "(可能需要微调以匹配新 stop_trigger)",
+      "content_angle": "(可能需要微调)",
+      "expected_output_type": "(原样)",
+      "_revision_note": "stop_trigger 从'25-35岁都市女性'改成'近期因 XX 而焦虑的 YY 用户' — critic 判 interest_align=fail 是因为原锚点太泛"
+    }
+  ],
+  "module_plan": { "(原样)": "..." },
+  "target_platforms": ["(原样)"],
+  "matrix_skeleton": { "(原样不变)": "..." }
+}
+```
+
+### 硬规则
+
+- 如果 `affected_direction_ids` 是空的或 warnings 是空的,直接原样返回 `current_plan` 即可。
+- 如果你判断某个受影响的 direction **不是策略层问题**,而是下游 critic 误判,你可以在 `_revision_note` 里写"保留原策略,critic 诊断误判"并保持字段不变——但你必须明确说明理由,否则下游会认为你在偷懒。
+- **禁止添加新 direction 或删除现有 direction**。这是策略层锚点的微调,不是重新出 direction。需要大改方案时,用户会手动从零重跑。
+
 ## 矩阵骨架设计
 
 在产出战术方向后，你还需要从 brief 的 `target_platforms` 提取目标平台列表，对每个 **方向 × 平台** 组合做存废判断。

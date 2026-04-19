@@ -21,6 +21,9 @@ from pipeline.config import (
     ENABLE_GEMINI_TREND_SCOUT_POST,
     ENABLE_GEMINI_TREND_SCOUT_PRE,
     ENABLE_STRUCTURAL_REWRITER,
+    ENABLE_STRATEGIC_ESCALATION,
+    ENABLE_CONSUMER_SIMULATION,
+    STRATEGIC_LOOP_MAX_ITERATIONS,
     GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
@@ -413,6 +416,27 @@ class PipelineOrchestrator:
 
             # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
             final_system = await self._run_vibe_loop(final_system, structured_brief)
+
+            # 5d+. 策略层自动升级(v0.29.1, C.2.1)— 如果 vibe_loop 留下了
+            # strategic_warnings(interest_align / reward_signal 级错配,
+            # rewriter 改不了),回 secretariat 修订受影响 direction 的策略
+            # 锚点(stop_trigger / reward_type / role_embodiment),然后再
+            # 跑一次 vibe_loop 让 critic + rewriter 用新锚点重新判决。
+            # 上限 STRATEGIC_LOOP_MAX_ITERATIONS(默认 1)防止死循环。
+            # Feature-flagged:ENABLE_STRATEGIC_ESCALATION=False 时跳过。
+            if ENABLE_STRATEGIC_ESCALATION:
+                final_system, plan = await self._run_strategic_escalation(
+                    final_system, structured_brief, plan,
+                )
+
+            # 5d++. 消费者模拟(v0.29.1, C.2.2)— 在终审前用 persona_simulator
+            # 以 direction.stop_trigger 描述的具体目标用户扮演者对每个 cell
+            # 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。
+            # 被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
+            if ENABLE_CONSUMER_SIMULATION:
+                await self._run_consumer_simulation(
+                    final_system, structured_brief, plan,
+                )
 
             # 5e. Cross-cell duplicate re-check after vibe. Builder's own
             # check (at end of _run_works_builders) catches builder-produced
@@ -2611,6 +2635,247 @@ class PipelineOrchestrator:
             f"(hard cap {hard_cap}), proceeding with remaining issues"
         )
         return final_system
+
+    async def _run_strategic_escalation(
+        self,
+        final_system: dict,
+        structured_brief: dict,
+        plan: dict,
+    ) -> tuple[dict, dict]:
+        """策略层自动升级(v0.29.1, C.2.1)。
+
+        vibe_loop 跑完后,若留下 strategic_warnings(rewriter 改不了的
+        策略层错配),就回 secretariat 修订受影响 direction 的策略锚点
+        (stop_trigger / reward_type / role_embodiment / ...),然后再
+        跑一次 vibe_loop 让 critic + rewriter 用新锚点重新判决。
+
+        返回 (final_system, plan) 二元组 — plan 可能被更新。
+
+        硬上限 STRATEGIC_LOOP_MAX_ITERATIONS(默认 1):只允许一次自动
+        升级,避免 direction 来回摆动。超过后 strategic_warnings 会继续
+        挂在 final_system 上,由 UI 提示用户人工处理。
+
+        失败模式:secretariat 抛异常 → 保留原 warnings + 原 plan,不阻塞
+        后续终审。critic/rewriter 重跑时的异常也同样非致命。
+        """
+        max_iter = STRATEGIC_LOOP_MAX_ITERATIONS
+        iteration = 0
+
+        while iteration < max_iter:
+            warnings = final_system.get("strategic_warnings") or []
+            if not warnings:
+                return final_system, plan
+
+            affected_direction_ids = sorted({
+                w.get("direction_id") for w in warnings
+                if w.get("direction_id")
+            })
+            if not affected_direction_ids:
+                # Warnings exist but have no direction_id (old critic output
+                # or Gemini-flagged). Nothing actionable at strategy layer —
+                # leave warnings for user.
+                return final_system, plan
+
+            logger.warning(
+                "[strategic_escalation] round %d: %d cells flagged strategic "
+                "across directions %s — requesting secretariat revision",
+                iteration + 1,
+                len(warnings),
+                affected_direction_ids,
+            )
+
+            revision_input = {
+                "brief": structured_brief,
+                "strategic_revision": {
+                    "current_plan": plan,
+                    "affected_direction_ids": affected_direction_ids,
+                    "strategic_warnings": warnings,
+                },
+            }
+
+            try:
+                revised_plan = await self.secretariat.run(
+                    revision_input, self.run_id, self.db,
+                )
+            except Exception:
+                logger.exception(
+                    "[strategic_escalation] secretariat revision failed; "
+                    "keeping original plan + warnings"
+                )
+                return final_system, plan
+
+            # Merge revised directions into plan + self._direction_index.
+            # Only the affected direction_ids are trusted to have been updated
+            # — if secretariat returned other direction_ids with changes,
+            # we explicitly ignore those changes to avoid scope creep.
+            revised_by_id = {
+                d.get("direction_id"): d
+                for d in revised_plan.get("tactical_directions", []) or []
+                if d.get("direction_id")
+            }
+            merged_directions = []
+            change_log: list[str] = []
+            for d in plan.get("tactical_directions", []) or []:
+                did = d.get("direction_id")
+                if did in affected_direction_ids and did in revised_by_id:
+                    new_d = revised_by_id[did]
+                    merged_directions.append(new_d)
+                    note = new_d.get("_revision_note", "")
+                    change_log.append(f"{did}: {note}" if note else did)
+                else:
+                    merged_directions.append(d)
+
+            plan = {**plan, "tactical_directions": merged_directions}
+            self._direction_index = {
+                d.get("direction_id"): d
+                for d in merged_directions
+                if d.get("direction_id")
+            }
+
+            # Snapshot pre-escalation warnings so they're not lost; clear
+            # the active list so the next vibe_loop can repopulate it fresh.
+            prior_warnings = final_system.pop("strategic_warnings", [])
+            final_system.setdefault("_strategic_escalation_history", []).append({
+                "iteration": iteration + 1,
+                "affected_direction_ids": affected_direction_ids,
+                "prior_warnings": prior_warnings,
+                "change_log": change_log,
+            })
+
+            logger.info(
+                "[strategic_escalation] round %d applied — re-running vibe_loop "
+                "with updated direction anchors (%s)",
+                iteration + 1,
+                change_log or affected_direction_ids,
+            )
+
+            # Re-run vibe_loop. It reads prompt_matrix from final_system +
+            # self._direction_index for ground-truth anchors, so simply
+            # invoking it again picks up the new stop_trigger / reward_type.
+            # Cells outside affected directions will mostly pass on round 1
+            # (their anchors didn't change); affected cells will get a fresh
+            # classification and the right rewriter.
+            try:
+                final_system = await self._run_vibe_loop(
+                    final_system, structured_brief,
+                )
+            except Exception:
+                logger.exception(
+                    "[strategic_escalation] re-run vibe_loop failed; "
+                    "leaving current state in place"
+                )
+                return final_system, plan
+
+            iteration += 1
+
+        # Hit iteration cap. Any warnings still present stay on
+        # final_system for the UI to show to the user.
+        remaining = final_system.get("strategic_warnings") or []
+        if remaining:
+            logger.warning(
+                "[strategic_escalation] cap reached (%d iterations), "
+                "%d strategic warnings remain for user review",
+                max_iter,
+                len(remaining),
+            )
+        return final_system, plan
+
+    async def _run_consumer_simulation(
+        self,
+        final_system: dict,
+        structured_brief: dict,
+        plan: dict,
+    ) -> None:
+        """消费者模拟二级校验(v0.29.1, C.2.2)。
+
+        在 vibe_loop 收敛后、终审前,用 persona_simulator 的
+        `consumer_simulation` mode 针对每个 cell 以 direction.stop_trigger
+        描述的目标用户身份做 stop / scroll 二元判决。这是 interest_align
+        的第二层校验——critic 的 interest_align 是"专家判断",这一步是
+        "用户端判断"。
+
+        被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
+        (不自动回策略升级——此时 vibe + strategic 已经跑完,再递归会过复杂。)
+
+        Advisory-only:persona_simulator 失败时仅 log 警告,不阻塞终审。
+        结果存到 final_system._consumer_simulation,UI 层渲染。
+        """
+        prompt_cells = final_system.get("prompt_matrix") or []
+        if not prompt_cells:
+            return
+
+        direction_index = getattr(self, "_direction_index", {}) or {}
+
+        # Build per-cell consumer context. Cells whose direction has no
+        # stop_trigger fall back to target_audience from brief.
+        fallback_audience = structured_brief.get("target_audience", "") or ""
+        slim_cells = []
+        for c in prompt_cells:
+            did = c.get("direction_id")
+            d = direction_index.get(did) or {}
+            stop_trigger = (d.get("stop_trigger") or "").strip()
+            slim_cells.append({
+                "cell_id": c.get("cell_id"),
+                "direction_id": did,
+                "direction_name": c.get("direction_name"),
+                "stop_trigger": stop_trigger or fallback_audience,
+                "demo_output": (c.get("demo_output") or "")[:600],
+            })
+
+        try:
+            result = await self.persona_simulator.run(
+                {
+                    "mode": "consumer_simulation",
+                    "target_audience": fallback_audience,
+                    "platform": (
+                        structured_brief.get("target_platforms", [DEFAULT_PLATFORM])[0]
+                        if structured_brief.get("target_platforms")
+                        else DEFAULT_PLATFORM
+                    ),
+                    "cells": slim_cells,
+                },
+                self.run_id,
+                self.db,
+            )
+        except Exception:
+            logger.exception(
+                "[consumer_sim] persona_simulator failed; skipping 2nd-level check"
+            )
+            return
+
+        final_system["_consumer_simulation"] = result
+
+        # Cells where the modeled consumer would scroll = interest_align
+        # second-layer fail. Append to strategic_warnings so UI surfaces them.
+        scrolled = [
+            j for j in (result.get("judgments") or [])
+            if (j.get("action") or "").lower() == "scroll"
+        ]
+        if scrolled:
+            logger.warning(
+                "[consumer_sim] %d cells would be scrolled past by modeled "
+                "target consumer: %s",
+                len(scrolled),
+                [j.get("cell_id") for j in scrolled],
+            )
+            for j in scrolled:
+                final_system.setdefault("strategic_warnings", []).append({
+                    "cell_id": j.get("cell_id"),
+                    "direction_id": j.get("direction_id"),
+                    "platform": j.get("platform", ""),
+                    "root_cause_explanation": (
+                        "consumer_simulation: 目标用户(stop_trigger 描述者)"
+                        f"判决 scroll — {j.get('reason', '')}"
+                    ),
+                    "multiplier_gate": {"interest_align": "fail"},
+                    "iteration": "consumer_sim",
+                    "source": "consumer_simulation",
+                })
+        else:
+            logger.info(
+                "[consumer_sim] all %d cells passed 2nd-level consumer check",
+                len(prompt_cells),
+            )
 
 
 class PipelineAlreadyRunningError(RuntimeError):

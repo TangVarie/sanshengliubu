@@ -158,6 +158,38 @@ if vibe_result:
     else:
         st.warning(f"🎯 网感复检：{verdict} — {summary}")
 
+# v0.29.1: 消费者模拟二级校验 — AI 扮演 stop_trigger 描述的具体目标用户,
+# 对每个 cell 做 stop/scroll 二元判决。被 scroll 的 cell 会同步追加进
+# strategic_warnings(下面那块),这里单独展示 binary 结果让用户看到
+# "谁真的会被钩住"的直观对比。
+consumer_sim = prompt_system.get("_consumer_simulation")
+if consumer_sim and consumer_sim.get("judgments"):
+    summary = consumer_sim.get("summary", {}) or {}
+    stop_n = summary.get("stop_count", 0)
+    scroll_n = summary.get("scroll_count", 0)
+    total = stop_n + scroll_n
+    if total > 0:
+        label = f"👥 消费者二层校验: {stop_n}/{total} 会停下来(另 {scroll_n} 被划走)"
+        if scroll_n == 0:
+            st.success(label)
+        elif scroll_n / max(total, 1) >= 0.5:
+            st.error(label)
+        else:
+            st.warning(label)
+        systemic = summary.get("systemic_issues", "") or ""
+        if systemic:
+            st.caption(f"🔎 系统性观察: {systemic}")
+        with st.expander("展开每条 cell 的消费者反应", expanded=False):
+            for j in consumer_sim.get("judgments", []) or []:
+                action = j.get("action", "?")
+                icon = "✅" if action == "stop" else "❌"
+                st.markdown(
+                    f"{icon} **{j.get('cell_id', '?')}** · {action}  \n"
+                    f"*构造的用户*: {j.get('constructed_user', '(空)')[:160]}  \n"
+                    f"*内心独白*: {j.get('reason', '(空)')}  \n"
+                    f"*stop_trigger 锐度*: `{j.get('stop_trigger_quality', '?')}`"
+                )
+
 # v0.29.0: 策略层隐患警告 — critic 判定 interest_align / reward_signal 错配,
 # rewriter 改不了,需要用户人工介入(回 secretariat 改 direction,或回
 # cell_planner 改 product_role)。红色 callout,直接挂在 vibe 结果下面。
