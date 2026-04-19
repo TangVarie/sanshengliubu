@@ -1281,7 +1281,7 @@ with tabs[5]:
         _mid_log = log_map.get(_mid_stage_name)
         with st.expander(
             f"{_mid_label} — {_mid_desc}",
-            expanded=(_mid_log and _mid_log.get("status") == "completed"),
+            expanded=bool(_mid_log and _mid_log.get("status") == "completed"),
         ):
             if not _mid_log:
                 st.caption("(此阶段未执行,或已被清理等待重跑)")
