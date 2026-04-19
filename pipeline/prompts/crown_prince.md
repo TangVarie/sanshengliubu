@@ -38,6 +38,31 @@
 - 将分析结果写入 `existing_prompt_analysis` 字段
 - 结合用户描述的问题，为后续环节提供改进方向
 
+## 明广告决策点(v0.29.0 新增)
+
+在输出 brief 之前,你必须做一个**叙事姿态**决策,写到 `advertising_stance` 字段。这个字段决定下游整个内容矩阵"承认不承认自己是广告",四选一:
+
+- `stealth` — 完全软植入(素人口吻,看不出是广告)
+- `disclosed_kol` — 博主承认是推广但真诚推(小红书"我接的广但真心好用"那种)
+- `brand_direct` — 品牌自己明说,不装(品牌官号口吻)
+- `mixed` — 矩阵内多种共存(不同 direction 走不同姿态,secretariat 会在 tactical_direction 上标具体哪一种)
+
+**判断依据**(按优先级从高到低):
+
+1. **用户在输入里明确说了**:"做素人号" / "走软广" / "要品牌官号发" / "博主接单明推" → 直接按用户说的填。
+2. **品类合规硬约束**:药品 / 保健 / 金融 / 美瞳 / 医美 / 减肥等**品类敏感**时,`brand_direct` 和 `stealth` 合规风险都很高,默认填 `disclosed_kol` 或 `mixed`。
+3. **campaign_objective 推导**:
+   - "品牌认知 / 新品上市" + 有品牌力 → 倾向 `brand_direct` 或 `disclosed_kol`
+   - "种草 / 搜索占位" + 预算有限 → 倾向 `stealth`
+   - 多目标复合 → `mixed`
+4. **竞品/上下文推导**:如果 `competitive_context` 里提到竞品都是素人种草,本品也跟着走 `stealth`;如果竞品都是品牌蓝 V,本品跟着走 `brand_direct`。
+5. **完全没信息**:默认 `stealth`(和 v0.28 及之前的隐含假设一致)。
+
+**为什么这个字段重要**(给你理解动机,不要写到输出里):
+下游 `vibe_critic` 判决 `identity_consistency` 时依赖这个字段。v0.28 的 critic 默认假设所有内容都是 `stealth`——"博主假装素人 = fail,品牌明说推销 = fail"。但如果 `advertising_stance = "brand_direct"`,那"博主明说推销"反而是 `identity_consistency = pass`——因为叙事身份和真实目的对齐了。漏填这个字段会让 critic 全部按 stealth 标准判,所有明广告都会被错杀。
+
+**如果用户输入没有信息也没法合理推断**,按上面第 5 条默认填 `stealth` 即可,不要因为这个字段请旨——请旨阈值里没有列它,默认值是安全兜底。
+
 ## 规则
 
 1. **只做信息结构化，不做策略判断**
@@ -87,6 +112,7 @@
   "competitive_context": "竞品/竞争环境描述",
   "constraints": "预算约束、合规红线、品牌调性底线等限制条件",
   "task_type": "new_system | iteration | extension",
+  "advertising_stance": "stealth | disclosed_kol | brand_direct | mixed",
   "iteration_context": "若为迭代，描述现有 prompt 及不满意的点",
   "raw_materials": "用户提供的原始素材详细内容——包括产品参数、成分表、认证数据、投放策略、tag体系、关键词数据、UGC素材等，按素材类型分段保留原文细节，不要概括",
   "reference_summary": "参考文件的详细内容提取——保留方法论框架完整结构、数据表格、清单原文、模型名称和具体步骤，不要只写摘要。下游所有环节都依赖此字段",

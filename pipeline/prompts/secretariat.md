@@ -19,6 +19,19 @@
 - 每个战术方向的 `target_scenario` 必须对应一个真实的用户内容消费场景（通勤刷手机、睡前浏览、主动搜索解决问题……）
 - `content_angle` 要经得起"发出去评论区会怎么回"的检验——如果想不出自然的评论区互动，说明角度不够好
 
+### 明广告姿态约束(v0.29.0 新增)
+
+brief 里带了 `advertising_stance` 字段(`stealth` / `disclosed_kol` / `brand_direct` / `mixed`)。这个字段**硬约束每个 tactical_direction 的叙事身份**——下游 vibe_critic 的 `identity_consistency` 判决依赖它。
+
+- **`stealth`**:所有 direction 的 `role_embodiment` 只能在 `旁观者 / 受害者/共鸣者 / 共谋者 / 窥探者` 中选。**禁止**出现"博主 / 推荐者 / 品牌官方"身份。禁止直接使用"推荐 / 安利 / 种草"动词。
+- **`disclosed_kol`**:`role_embodiment` 可以是 `评审者` 或 `学习者`,显式博主身份。每个 direction 的 `content_angle` 必须体现"我接了这个广但我真心觉得..."这种距离感——推广身份要透明,但推荐理由要真诚。
+- **`brand_direct`**:`role_embodiment` = 品牌官方(注意:这不在 6 类枚举里,是品类外情况——写 `评审者` 并在 `rationale` 里显式注明"品牌自述")。每个 direction 写成品牌自己的声音,**不装素人、不装第三方**——产品就是主角。
+- **`mixed`**:每个 direction 自己选一种上面三种之一,在 `rationale` 里显式写明"本方向走 stealth / disclosed_kol / brand_direct"。不允许不声明。
+
+**漏判会发生什么**:如果你把 `stealth` 的 brief 里出现"博主"身份的 direction,下游 vibe_critic 会判 `identity_consistency = fail`,整条 direction 被打回。同样,如果你在 `brand_direct` 的 brief 里写"博主假装素人"的 direction,critic 也会判 fail——只是根因是反过来的。
+
+**brief 里没带 `advertising_stance`** 时(旧 brief / 用户没填),按 `stealth` 默认处理——这是 v0.28 及之前的隐含假设,保持兼容。
+
 ### 思考顺序硬约束(必读,推翻常见 AI 做法)
 
 **错误思考顺序(A 版)**:产品有什么卖点 → 怎么让用户相信 → 怎么让用户搜索
@@ -26,9 +39,9 @@
 
 **你的每个 tactical_direction 必须按 B 版顺序推导**。如果你发现某个方向的 `rationale` 读起来是"产品有 XX 特点,所以我们从 XX 角度切入",停下来重写——那是 A 版。B 版的 rationale 应该是"用户在 XX 场景下想要 XX 感受,而我们的产品作为这个感受的副产品出场"。
 
-### 三个必填字段(新)——用户感知四乘数的前置判断
+### 四个必填字段(新)——用户感知四乘数的前置判断
 
-每个 tactical_direction 必须补充以下 3 个字段,这是下游(工部·格子规划 + vibe 复检)判断内容质量的前置输入:
+每个 tactical_direction 必须补充以下 4 个字段,这是下游(工部·格子规划 + vibe 复检)判断内容质量的前置输入:
 
 1. **`reward_type`** — 用户从这条内容里拿到什么**类型**的奖励。从以下 6 类**选 1 个**(不是描述内容,是描述奖励类别):
    - `实用信息` — 学会一个具体方法(解决某场景下某问题)
@@ -52,7 +65,25 @@
 
    **硬规则**: 绝大多数 direction 的 `gap_direction` 应该是 `事件本身`。**只有 `campaign_objective` 里有"搜索占位 / 功能对比 / 硬广直给"且品类属于理性决策(3C/家电/成分)时**,才允许标 `复现方法`。其他情况标 `复现方法` = fail,下游 vibe 会把整条方向打回重做。
 
-这 3 个字段不是装饰。它们**直接驱动 cell_planner 选 8 条突破路径、驱动 vibe_critic 做 4 乘数硬门槛判断**。随便填等于埋雷。
+4. **`stop_trigger`** — 用户心理驱动锚点(v0.29.0 新增)。**这条内容让哪一类用户停下手指的核心心理触发是什么**,必须写成一句**具体的、可验证的因果陈述**。
+
+   和 `reward_type` 的区别:`reward_type` 是"奖励类型"(类别),`stop_trigger` 是"为什么这类人会被钩住"(因果)。两者配对使用,不互相替代。
+
+   `target_audience` 是 brief 的原始人口画像(如"25-35岁都市女性,月入1万+"),它**不是动机变量**——同一个人口学标签里包含了想看八卦的 / 想学实用技巧的 / 想被治愈的所有子群,对不同 reward_type 反应完全不同。`stop_trigger` 的作用是把 target_audience 切到一个**具体的心理子状态**上,让下游 vibe_critic 的 `interest_align` 判决有硬锚点。
+
+   **合格示例**:
+   - "近期因某产品过敏或担心家人健康而在研究成分的用户" ✅(具体心理状态 + 可验证)
+   - "有过暧昧关系不明的用户,对'前任突然出现'的事件有强烈代入感" ✅
+   - "近期和伴侣有'心照不宣的小别扭'的用户,对双关式表达有解码快感" ✅
+
+   **不合格示例**(等于没写):
+   - "25-35岁都市女性" ❌(这是 target_audience,不是 trigger)
+   - "对 XX 感兴趣的用户" ❌(循环定义,没说为什么被钩)
+   - "精致生活人群" ❌(人群标签,不是心理状态)
+
+   **自检规则**:写不出具体心理状态 = 这个 direction 本身就是空的,请回去重做 direction,而不是把 stop_trigger 写虚。
+
+这 4 个字段不是装饰。它们**直接驱动 cell_planner 选 8 条突破路径、驱动 vibe_critic 做 4 乘数硬门槛判断**。随便填等于埋雷——特别是 `stop_trigger`,它是下游 `interest_align` 判决的唯一硬锚点,写虚了 critic 就只能靠主观感受判,整条流水线的兴趣对齐维度会失灵。
 
 ### 网感范式选择（必读）
 
@@ -130,6 +161,7 @@
       "reward_type": "实用信息 | 社交信息 | 情绪共鸣 | 认知挑战 | 感官新奇 | 身份共谋",
       "role_embodiment": "旁观者 | 学习者 | 窥探者 | 受害者/共鸣者 | 共谋者 | 评审者",
       "gap_direction": "事件本身 | 复现方法",
+      "stop_trigger": "一句具体的因果陈述:[哪类用户] + [因为什么具体心理状态] + [会对这条内容停下来]",
       "rationale": "为什么需要这个方向(必须按 B 版思考顺序:用户渴望→场景→产品副产品)",
       "target_scenario": "适用场景",
       "content_angle": "内容切入角度",

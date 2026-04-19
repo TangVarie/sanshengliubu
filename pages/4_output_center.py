@@ -158,6 +158,38 @@ if vibe_result:
     else:
         st.warning(f"🎯 网感复检：{verdict} — {summary}")
 
+# v0.29.0: 策略层隐患警告 — critic 判定 interest_align / reward_signal 错配,
+# rewriter 改不了,需要用户人工介入(回 secretariat 改 direction,或回
+# cell_planner 改 product_role)。红色 callout,直接挂在 vibe 结果下面。
+strategic_warnings = prompt_system.get("strategic_warnings") or []
+if strategic_warnings:
+    with st.expander(
+        f"🚨 策略层隐患({len(strategic_warnings)} 条)——这些 cell 流水线跑完了但策略层有漏洞",
+        expanded=True,
+    ):
+        st.error(
+            "这些 cell 的 fail 根因被 critic 判为策略层问题(interest_align / "
+            "reward_signal 错配),rewriter 改不了。建议人工审查:回 secretariat "
+            "调整 direction 的 `stop_trigger` / `reward_type`,或回 cell_planner "
+            "调整 `product_role` / `path_combination`。"
+        )
+        for w in strategic_warnings:
+            cell_id = w.get("cell_id", "?")
+            explanation = w.get("root_cause_explanation", "")
+            gate = w.get("multiplier_gate", {}) or {}
+            gate_desc = " · ".join(
+                f"{k}={v}"
+                for k, v in gate.items()
+                if k in ("reward_signal", "interest_align",
+                         "gap_tension", "identity_consistency")
+                and v
+            )
+            st.markdown(
+                f"**{cell_id}** (iter {w.get('iteration', '?')})  \n"
+                f"{explanation or '(无 critic 解释)'}  \n"
+                f"`{gate_desc}`"
+            )
+
 # Demo outputs section
 demos = prompt_system.get("demo_outputs", [])
 if demos:

@@ -31,3 +31,14 @@ class VibeRewriter(BaseAgent):
     """网感重写者 — rewrites system_prompt for cells that failed vibe critic."""
     stage_name = "vibe_rewriter"
     prompt_file = "vibe_rewriter.md"
+
+
+class StructuralRewriter(BaseAgent):
+    """叙事结构重写者 (v0.29.0) — 处理 identity/gap 类结构性 fail。
+
+    职责边界严格窄于 VibeRewriter:只做叙事身份重构 和 信息缺口方向重构。
+    不加钩子 / 不塞真人样本 / 不做具体性补齐——那些是 VibeRewriter 的活。
+    由 orchestrator 按 critic 标注的 root_cause_kind 分流到本 agent。
+    """
+    stage_name = "structural_rewriter"
+    prompt_file = "structural_rewriter.md"

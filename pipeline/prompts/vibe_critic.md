@@ -154,12 +154,18 @@
 对照 cell_plan 里的 `reward_type` 字段(secretariat 标注):实际开场传递的奖励类型是否和 reward_type 一致?不一致 = fail。
 
 #### ② `interest_align`(兴趣对齐)
-这条内容的奖励类型**对 target_audience 的兴趣结构来说是有反应的**吗?
-- `pass`: target_audience 看到这条会本能停下
-- `weak`: target_audience 可能会停,取决于心情
-- `fail`: 完全不在这群人的兴趣结构里,比如对一群"不关心两性话题的人"打情感钩子
 
-不确定 target_audience 的兴趣结构时,按 cell_plan 里 `applicable_personas` 反推判断。
+**判决锚点(v0.29.0 起)**: 优先对照 direction 的 `stop_trigger` 字段(一句具体的因果陈述),**不要再拿宽泛的 target_audience 散文去判**。
+
+`stop_trigger` 回答的是"这条内容让哪一类用户停下手指的核心心理触发是什么"——它是一个**可验证的心理状态**(例:"近期因某产品过敏或担心家人健康而在研究成分的用户")。你的任务是回答:
+
+> **本 cell 的 demo 开头设计,能不能激活 `stop_trigger` 里描述的那个具体心理状态?**
+
+- `pass`: demo 的前 3 秒明确激活了 `stop_trigger` 描述的心理状态(场景 / 物证 / 角色对应得上)
+- `weak`: 方向对,但激活得不够锐——目标心理状态的用户看得到但不会本能停
+- `fail`: demo 开头激活的是另一种心理状态,和 `stop_trigger` 错位;或 `stop_trigger` 本身写成了人口学标签(例:"25-35岁都市女性"),锚点失效——这种 fail 的根因在 secretariat,**在 root_cause_kind 里标 `strategic`**,不是在 rewriter 层能修的
+
+**兜底**: 如果 `stop_trigger` 字段为空(旧 run / secretariat 没填),再退回到对照 `target_audience` + `applicable_personas` 反推。但遇到空字段本身就要在 `fail_reason` 里标注"stop_trigger 缺失"——这是策略层的漏洞。
 
 #### ③ `gap_tension`(信息缺口张力 —— **方向**比强度更重要)
 
@@ -176,19 +182,17 @@
 
 本 cell 的叙事身份(我以什么身份在说话)和真实目的(这条内容要达成什么)在用户感知里一致吗?
 
-合法形态(任一):
-- 真素人对齐: 我是用户,我真的在用
-- 真博主-真推广对齐: 我是博主,这是我接的广告,但我觉得值得推
-- 真品牌-真营销对齐: 我是品牌,不装,就是来介绍产品
-- 真情绪-真表达对齐: 我在表达一种感受,产品只是表达的一个元素
+**判决锚点(v0.29.0 起)**: 优先对照 brief 的 `advertising_stance` 字段——它决定这条内容**应该**是哪种身份:
 
-非法形态(任一 = fail):
-- 博主假装素人
-- 营销假装路人
-- 套路假装真情
-- 品牌假装第三方观察者
+- `stealth`(软植入):合法形态 = 真素人(我是用户,我真的在用) / 真情绪(我表达感受,产品只是元素)。fail = 博主假装素人 / 营销假装路人 / 品牌假装第三方。
+- `disclosed_kol`(博主明推):合法形态 = 我是博主,这是我接的广告,但我觉得值得推。fail = 假装没收钱 / 假装素人/ 明明是品牌自述却冒充博主。
+- `brand_direct`(品牌自述):合法形态 = 我是品牌,不装,就是来介绍产品。**"博主明说推销"在这里反而是 pass**,因为身份和目的对齐了。fail = 假装第三方 / 假装素人 / 假装博主。
+- `mixed`(矩阵内多种共存):对照本 direction 自己在 rationale 里声明的姿态。声明啥就按啥判。
+- **brief 没填 `advertising_stance`** → 退回到默认 `stealth` 的判定(和 v0.28 行为一致)。
 
-对照 cell_plan 里的 `product_role`: 如果 `product_role = "副产品"` 但 demo 写得像"我就是来推广这个产品"的博主口吻,那是身份错位 = fail。
+对照 cell_plan 里的 `product_role`:如果 `product_role = "副产品"` 但 demo 写得像"我就是来推广这个产品"的博主口吻 **且 advertising_stance = "stealth"**,那是身份错位 = fail。但如果 `advertising_stance = "brand_direct"`,product_role 和 demo 的品牌自述口吻反而是对齐的,应该判 pass。
+
+**重要**:不要拿 `stealth` 的标准去判 `brand_direct` 的内容——那会把所有明广告错杀为 fail。`advertising_stance` 字段在 brief_context 里,读一眼再判。
 
 **输出到 cell_review JSON 的字段**(必填):
 
@@ -249,6 +253,37 @@
 ```
 
 **重要**: 模板性检测**不覆盖**四乘数判决——两层独立。一条内容可能 4 乘数全 pass 但模板性 fail(典型:钩子好但内容空),也可能模板性 pass 但 4 乘数 fail(典型:品类扎实但身份不一致)。任一层 fail = 整体 fail。
+
+---
+
+### 第 2.7 步:根因分类(v0.29.0 新增,供下游分流)
+
+四乘数 + 模板测试都跑完后,你最清楚这个 cell **为什么** fail。下游需要按**根因类型**把 fail 的 cell 送到不同的修复入口——不同类型的 fail 用不同工具去改:
+
+- `surface` — 表层问题。四乘数全 pass + 模板性 pass,但 gut_call 差点意思 / taste_match 没接上 / 命中 AI 空话黑名单。修复方式: 钩子重写、具体性补齐、反 AI 腔——`vibe_rewriter` 的活。
+- `structural_identity` — 叙事身份错位。`identity_consistency` = fail,或 product_role 声明和 demo 实际口吻错位(典型:`product_role="副产品"` 但 demo 写成推销员腔)。修复方式:重构叙事立场,把"我"的位置重新定位——`structural_rewriter` 的活,**不是 `vibe_rewriter`**。
+- `structural_gap` — 信息缺口方向错。`gap_tension` = fail,缺口指向"复现方法"而非"事件本身"。修复方式:重构事件层,把缺口锚定在"发生了什么"——也是 `structural_rewriter` 的活。
+- `strategic` — 策略层错配,rewriter 改不了。`interest_align` = fail(target_audience 和 reward_type 错配),或 `reward_signal` = fail 且对照 direction 的 reward_type 明显标错。修复方式:回 secretariat 改 direction / 改 stop_trigger,**或回 cell_planner 改 product_role / path_combination**。
+- `template` — 模板性 fail(换品类仍成立)且四乘数全 pass。修复方式:走 `vibe_rewriter` 加一个"品类专属性注入"指令(强制 demo 带品类独有的场景/术语/人物关系)。
+
+**优先级**(多项 fail 时按此取高优先级):
+
+```
+strategic > structural_identity > structural_gap > template > surface
+```
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+"root_cause_explanation": "一句话说明为什么归到这类。禁止空话,必须引用具体的 multiplier_gate 项 / template_test verdict / 具体的 AI 空话 / 具体的身份错位场景"
+```
+
+**关键**:
+- `root_cause_kind` 是**下游 orchestrator 分流的唯一依据**——写错类型会导致 cell 被送到错误的修复入口。
+- 如果你判 `root_cause_kind = "strategic"`,这条 cell **不会进 rewriter**,会被标成 `strategic_warnings` 让用户人工介入——所以只有真的是策略层错配才标这类,不要因为"反正都 fail 了"就随手标。
+- 如果你判 `root_cause_kind = "structural_identity"` 或 `"structural_gap"`,这条 cell 会走 `structural_rewriter`(叙事结构重写者),它只做身份重构 / 缺口重构,**不做钩子加强**——所以不要把纯钩子弱的 cell 误标成 structural。
+- 四乘数 + 模板都 pass 但 gut_call 差点意思 = `surface`,不是 `structural_*`。
 
 ---
 
@@ -344,6 +379,8 @@
       "concrete_details_check": "通篇有哪些具体细节 / 缺哪些",
       "ai_signals_found": ["在第X段出现'首先'", "结尾有'希望对你有帮助'"],
       "platform_voice_check": "平台口吻是不是对的，哪里不对",
+      "root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+      "root_cause_explanation": "一句话说明为什么归到这类(具体引用 multiplier_gate / template_test / AI 空话 / 身份错位)",
       "rewrite_directives": "（borderline 用微调模板，fail 用重写模板。pass 的留空字符串）"
     }
   ],
@@ -352,6 +389,8 @@
       "cell_id": "D1_xiaohongshu",
       "platform": "小红书",
       "severity": "borderline | fail",
+      "root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+      "root_cause_explanation": "(同 cell_reviews 里的 root_cause_explanation,用于下游分流时的可读性)",
       "taste_gap": "（只有 borderline 才填：具体差在哪半句话）",
       "rewrite_directives": "（同 cell_reviews 里的 rewrite_directives）"
     }

@@ -20,6 +20,7 @@ from pipeline.config import (
     DEFAULT_PLATFORM,
     ENABLE_GEMINI_TREND_SCOUT_POST,
     ENABLE_GEMINI_TREND_SCOUT_PRE,
+    ENABLE_STRUCTURAL_REWRITER,
     GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
@@ -69,6 +70,7 @@ from pipeline.agents.ministries.works import (
     WorksBuilder,
     VibeCritic,
     VibeRewriter,
+    StructuralRewriter,
 )
 from pipeline.agents.narrative_director import NarrativeDirector
 from pipeline.agents.red_blue_refiner import RedBlueRefiner
@@ -104,6 +106,9 @@ class PipelineOrchestrator:
         self.works_builder = WorksBuilder()
         self.vibe_critic = VibeCritic()
         self.vibe_rewriter = VibeRewriter()
+        # v0.29.0: 叙事结构重写者 — 按 critic 的 root_cause_kind 分流。
+        # 未启用 flag 时对象还是创建(零成本),但 _run_vibe_loop 不会调它。
+        self.structural_rewriter = StructuralRewriter()
         self.narrative_director = NarrativeDirector()
         self.red_blue_refiner = RedBlueRefiner()
         self.persona_simulator = PersonaSimulator()
@@ -2278,6 +2283,10 @@ class PipelineOrchestrator:
                     "reward_type": direction.get("reward_type"),
                     "role_embodiment": direction.get("role_embodiment"),
                     "gap_direction": direction.get("gap_direction"),
+                    # v0.29.0: stop_trigger — critic 的 interest_align 判决硬
+                    # 锚点,替代宽泛的 target_audience 散文。secretariat 未填
+                    # 时为 None,critic 会自动退回到启发式判断。
+                    "stop_trigger": direction.get("stop_trigger"),
                     "path_combination": cp.get("path_combination"),
                     "product_role": cp.get("product_role"),
                 }
@@ -2292,6 +2301,11 @@ class PipelineOrchestrator:
                     "target_audience": structured_brief.get("target_audience", ""),
                     "campaign_objective": structured_brief.get("campaign_objective", []),
                     "product_category": structured_brief.get("product_category", ""),
+                    # v0.29.0: 让 critic 的 identity_consistency 判决按
+                    # advertising_stance 分流,而不是硬假设 stealth。
+                    "advertising_stance": structured_brief.get(
+                        "advertising_stance", ""
+                    ),
                 }
             if reference_packs_by_platform:
                 critic_input["reference_packs_by_platform"] = reference_packs_by_platform
@@ -2423,33 +2437,142 @@ class PipelineOrchestrator:
                     ),
                     "severity": critic_map[c["cell_id"]].get("severity", "fail"),
                     "taste_gap": critic_map[c["cell_id"]].get("taste_gap", ""),
+                    # v0.29.0: 让下游 rewriter 能读到 critic 的诊断字段,structural_rewriter
+                    # 需要这些做身份/缺口手术。Gemini arbitration 过来的 cell 不一定有,
+                    # 自动 fallback 到 None。
+                    "root_cause_kind": critic_map[c["cell_id"]].get("root_cause_kind"),
+                    "root_cause_explanation": critic_map[c["cell_id"]].get(
+                        "root_cause_explanation", ""
+                    ),
+                    "multiplier_gate": critic_map[c["cell_id"]].get("multiplier_gate", {}),
                 }
                 for c in prompt_cells
                 if c.get("cell_id") in failed_ids
             ]
 
-            rewriter_input = {
-                "failed_cells": failed_full_cells,
-                "shared_skeleton": shared_skeleton,
-            }
-            if reference_packs_by_platform:
-                rewriter_input["reference_packs_by_platform"] = reference_packs_by_platform
-            try:
-                rewritten = await self.vibe_rewriter.run(
-                    rewriter_input,
-                    self.run_id,
-                    self.db,
+            # v0.29.0: 按 root_cause_kind 分流 — critic-rewriter 责任边界划分
+            # 的具体落地点。关闭 flag 时回到老行为(全部给 vibe_rewriter)。
+            if ENABLE_STRUCTURAL_REWRITER:
+                buckets = _classify_failed_cells(failed_full_cells)
+                logger.info(
+                    "[vibe_loop] fail routing: surface=%d template=%d "
+                    "structural_identity=%d structural_gap=%d strategic=%d",
+                    len(buckets["surface"]),
+                    len(buckets["template"]),
+                    len(buckets["structural_identity"]),
+                    len(buckets["structural_gap"]),
+                    len(buckets["strategic"]),
                 )
-            except Exception:
-                logger.exception("Vibe rewriter failed, keeping original cells")
-                break
 
-            new_cells_by_id = {
-                c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
-            }
+                # ① strategic 类 — rewriter 改不了,记录到 final_system 让
+                # 用户审查时决定是人工重跑策略层还是接受风险。硬 escalate 回
+                # secretariat 留给 v0.29.x 做。
+                if buckets["strategic"]:
+                    strat_entries = [
+                        {
+                            "cell_id": fc.get("cell_id"),
+                            "direction_id": fc.get("direction_id"),
+                            "platform": fc.get("platform"),
+                            "root_cause_explanation": fc.get("root_cause_explanation", ""),
+                            "multiplier_gate": fc.get("multiplier_gate", {}),
+                            "iteration": iteration + 1,
+                        }
+                        for fc in buckets["strategic"]
+                    ]
+                    final_system.setdefault("strategic_warnings", []).extend(
+                        strat_entries
+                    )
+                    logger.warning(
+                        "[vibe_loop] %d cells flagged strategic (not sending to "
+                        "rewriter — needs secretariat/cell_planner revision): %s",
+                        len(strat_entries),
+                        [e["cell_id"] for e in strat_entries],
+                    )
+
+                # ② structural 类 — 走 structural_rewriter(叙事身份/缺口手术)
+                structural_cells = (
+                    buckets["structural_identity"] + buckets["structural_gap"]
+                )
+                structural_new_by_id: dict = {}
+                if structural_cells:
+                    structural_input = {
+                        "failed_cells": structural_cells,
+                        "shared_skeleton": shared_skeleton,
+                    }
+                    if reference_packs_by_platform:
+                        structural_input["reference_packs_by_platform"] = (
+                            reference_packs_by_platform
+                        )
+                    try:
+                        structural_result = await self.structural_rewriter.run(
+                            structural_input, self.run_id, self.db,
+                        )
+                        structural_new_by_id = {
+                            c["cell_id"]: c
+                            for c in structural_result.get("prompt_cells", [])
+                        }
+                    except Exception:
+                        logger.exception(
+                            "Structural rewriter failed; falling back to "
+                            "vibe_rewriter for these cells"
+                        )
+                        # Fallback: merge back into surface bucket so they still
+                        # get some treatment instead of being silently dropped.
+                        buckets["surface"].extend(structural_cells)
+
+                # ③ surface + template — 走原 vibe_rewriter
+                vibe_cells = buckets["surface"] + buckets["template"]
+                vibe_new_by_id: dict = {}
+                if vibe_cells:
+                    rewriter_input = {
+                        "failed_cells": vibe_cells,
+                        "shared_skeleton": shared_skeleton,
+                    }
+                    if reference_packs_by_platform:
+                        rewriter_input["reference_packs_by_platform"] = (
+                            reference_packs_by_platform
+                        )
+                    try:
+                        rewritten = await self.vibe_rewriter.run(
+                            rewriter_input, self.run_id, self.db,
+                        )
+                        vibe_new_by_id = {
+                            c["cell_id"]: c
+                            for c in rewritten.get("prompt_cells", [])
+                        }
+                    except Exception:
+                        logger.exception(
+                            "Vibe rewriter failed, keeping original cells for this batch"
+                        )
+
+                # Merge both rewriter outputs. If both emitted the same cell_id
+                # (shouldn't happen — we bucket disjointly — but defend anyway),
+                # structural wins because it's the more targeted surgery.
+                new_cells_by_id = {**vibe_new_by_id, **structural_new_by_id}
+            else:
+                # Legacy path (flag off): everything through vibe_rewriter.
+                rewriter_input = {
+                    "failed_cells": failed_full_cells,
+                    "shared_skeleton": shared_skeleton,
+                }
+                if reference_packs_by_platform:
+                    rewriter_input["reference_packs_by_platform"] = (
+                        reference_packs_by_platform
+                    )
+                try:
+                    rewritten = await self.vibe_rewriter.run(
+                        rewriter_input, self.run_id, self.db,
+                    )
+                except Exception:
+                    logger.exception("Vibe rewriter failed, keeping original cells")
+                    break
+                new_cells_by_id = {
+                    c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
+                }
+
             rewritten_ids = set(new_cells_by_id.keys())
             logger.info(
-                f"Vibe rewriter rewrote {len(rewritten_ids)} cells: "
+                f"Rewriters produced {len(rewritten_ids)} updated cells: "
                 f"{sorted(rewritten_ids)}"
             )
             prompt_cells = [
@@ -2676,6 +2799,51 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     thread = threading.Thread(target=_thread_target, daemon=True)
     thread.start()
     return thread
+
+
+_ROUTE_PRIORITY = (
+    "strategic",
+    "structural_identity",
+    "structural_gap",
+    "template",
+    "surface",
+)
+
+
+def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
+    """Split failed cells by root_cause_kind for critic-rewriter routing.
+
+    Priority (high→low): strategic > structural_identity > structural_gap
+    > template > surface. If a cell has no `root_cause_kind` (Gemini-flagged
+    cells or legacy critic output), default to "surface" so it still gets
+    treated by vibe_rewriter. Multiplier gate is inspected as a fallback
+    when root_cause_kind is missing — lets us route correctly even with an
+    older critic prompt that hasn't been updated yet.
+    """
+    buckets: dict[str, list[dict]] = {k: [] for k in _ROUTE_PRIORITY}
+
+    for fc in failed_cells:
+        kind = (fc.get("root_cause_kind") or "").strip()
+
+        if kind not in _ROUTE_PRIORITY:
+            # Fallback classification from multiplier_gate if critic didn't
+            # label root_cause_kind (e.g. Gemini arbitration entries).
+            gate = fc.get("multiplier_gate") or {}
+            if gate.get("interest_align") == "fail":
+                kind = "strategic"
+            elif gate.get("reward_signal") == "fail":
+                kind = "strategic"
+            elif gate.get("identity_consistency") == "fail":
+                kind = "structural_identity"
+            elif gate.get("gap_tension") == "fail":
+                kind = "structural_gap"
+            else:
+                # Unknown origin (pure Gemini flag) — treat as surface.
+                kind = "surface"
+
+        buckets[kind].append(fc)
+
+    return buckets
 
 
 def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:

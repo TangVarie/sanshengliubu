@@ -2,9 +2,14 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.28.3"
-VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "修正 _resolve_models docstring(planning 在 content_sonnet 下走 Opus 4.7,不是 Sonnet 4.6)"
+VERSION = "v0.29.0"
+VERSION_DATE = "2026-04-19"
+VERSION_NOTES = (
+    "critic-rewriter 责任分流: critic 新增 root_cause_kind(5 类);"
+    "orchestrator 按类分流 vibe_rewriter / structural_rewriter / strategic_warnings;"
+    "secretariat 新增 stop_trigger 字段作为 interest_align 判决锚点;"
+    "brief 新增 advertising_stance 让 identity_consistency 按姿态分流判决。"
+)
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -82,6 +87,9 @@ _STAGE_ROLES = {
     "persona_simulator": "content",    # simulates real humans
     "vibe_critic": "content",
     "vibe_rewriter": "content",
+    # v0.29.0: 叙事结构重写者 — 和 vibe_rewriter 同角色(内容写作),
+    # 走 content 池(Sonnet 3.7 网感)。
+    "structural_rewriter": "content",
 }
 
 
@@ -206,6 +214,7 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_works_builder": 32000,
     "vibe_critic": 20000,
     "vibe_rewriter": 24000,
+    "structural_rewriter": 24000,  # v0.29.0: 和 vibe_rewriter 一致
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
@@ -377,6 +386,14 @@ DEFAULT_PLATFORM = "小红书"
 VIBE_LOOP_HARD_CAP = 3       # absolute max iterations
 VIBE_LOOP_INITIAL_CAP = 2    # start with this many rounds
 VIBE_LOOP_ESCALATE_THRESHOLD = 0.30  # failure rate to unlock extra round
+
+# v0.29.0: critic-rewriter 责任分流 feature flag
+# 打开时:按 critic 输出的 root_cause_kind 把 fail 的 cell 分流到
+#   - structural_rewriter(身份错位 / 缺口方向错)
+#   - vibe_rewriter(表层钩子弱 / 模板性 fail)
+#   - strategic_warnings(策略层错配,rewriter 改不了)
+# 关闭时:全部塞给 vibe_rewriter(v0.28 及之前的行为),作为稳妥兜底。
+ENABLE_STRUCTURAL_REWRITER = True
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
 RED_BLUE_CONCURRENCY = 3
