@@ -1385,32 +1385,75 @@ if status not in ("running",):
                         if _selected_stage in _stage_order
                         else 0
                     )
-                    _to_delete = _stage_order[_idx:]
-                    # Also delete any numbered variants (chancellery_1..3)
-                    # that aren't in _stage_order
-                    _to_delete_extra = []
-                    for _sn in _to_delete:
-                        if _sn.startswith("chancellery") and not _sn.startswith("chancellery_final"):
-                            _to_delete_extra += [f"chancellery_{i}" for i in range(1, 10)]
-                    _to_delete = list(set(_to_delete + _to_delete_extra))
-                    # Also delete Gemini scout stages that depend on the
-                    # deleted Claude stages
-                    for _gs in [
-                        "gemini_trend_scout_pre",
-                        "gemini_reference_analyzer",
-                    ]:
-                        if _gs not in _to_delete and _idx <= _stage_order.index(_gs) if _gs in _stage_order else False:
-                            _to_delete.append(_gs)
+                    _to_delete = set(_stage_order[_idx:])
 
-                    _deleted = db.delete_stage_logs_by_names(run_id, _to_delete)
+                    # v0.29.7: 中书省 + 门下省实际以 strategy_debate_{turn}
+                    # 命名(多轮辩论,每轮一条 stage_log),不是 "secretariat"
+                    # 或 "chancellery_1..3"。之前 _stage_order 里的那些名字
+                    # 其实从不存在于 DB,所以上轮这些 debate log 永远删不掉,
+                    # UI 把 中书省+门下省 染成绿色。
+                    # MAX_DEBATE_TURNS 默认 8,这里给 20 的 buffer 防未来涨。
+                    if "secretariat" in _to_delete:
+                        _to_delete.update(
+                            f"strategy_debate_{i}" for i in range(20)
+                        )
+
+                    # Legacy chancellery_1..3 naming(debate 之前的老版本),
+                    # 保留以清理历史 run 的残留。
+                    _to_delete.update(f"chancellery_{i}" for i in range(1, 10))
+
+                    # v0.29.7: gemini_trend_scout_post_{direction_id} 是动态名
+                    # (每个 direction 一条),不在 _stage_order 里。delete 用
+                    # exact match,无法前缀匹配,所以要查一遍 run 的所有 log
+                    # 名字,把 post_* 都挑出来塞进 _to_delete。
+                    # 只有当 chancellery_final 及之前的阶段要重跑时,post 才
+                    # 需要跟着删(它在 final 之后才触发)。
+                    if "chancellery_final" in _to_delete:
+                        try:
+                            _all_logs = db.get_stage_logs(run_id) or []
+                            _to_delete.update(
+                                l.get("stage_name", "")
+                                for l in _all_logs
+                                if (l.get("stage_name") or "")
+                                   .startswith("gemini_trend_scout_post_")
+                            )
+                        except Exception:
+                            # 非致命:拿不到也只是 post 残留不影响主流程
+                            pass
+
+                    # Gemini pre 阶段依附 crown_prince,crown_prince 重跑时
+                    # 它们也要删(之前就有逻辑,保留)。
+                    for _gs in ("gemini_trend_scout_pre", "gemini_reference_analyzer"):
+                        if _gs in _stage_order and _idx <= _stage_order.index(_gs):
+                            _to_delete.add(_gs)
+
+                    _deleted = db.delete_stage_logs_by_names(
+                        run_id, sorted(_to_delete)
+                    )
 
                     # Reset project status so resume is allowed. "failed" is
                     # used as a "needs-resume" marker here — resume_pipeline's
                     # guard only refuses when status == "running", and the
                     # 继续执行 button requires status != "completed" (page 3
                     # line ~1424). We need both conditions lifted.
+                    # v0.29.7: 同时重置累计 totals(total_tokens / total_cost_usd /
+                    # completed_at),避免 header 继续展示上一轮的
+                    # 18/22 · $7.74 · 419K tokens 这种误导性数据。
+                    # 新的 totals 会在重跑过程中从 0 重新累加。
                     db.update_project(project_id, status="failed")
-                    db.update_pipeline_run(run_id, status="failed", completed_at=None)
+                    try:
+                        db.update_pipeline_run(
+                            run_id,
+                            status="failed",
+                            completed_at=None,
+                            total_tokens=0,
+                            total_cost_usd=0.0,
+                        )
+                    except Exception:
+                        # 老 schema 可能没 total_* 列,回退到只改 status。
+                        db.update_pipeline_run(
+                            run_id, status="failed", completed_at=None,
+                        )
 
                     # v0.29.5: 方案 B — 自动触发 resume,不再让用户找「继续执行」
                     # 按钮。之前的做法要用户点两次 + 还把 status 显示成 ❌ failed,

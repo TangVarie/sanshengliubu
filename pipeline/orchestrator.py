@@ -3644,6 +3644,26 @@ def revise_and_resume_pipeline_in_background(
             f"only D{'/D'.join(affected_direction_ids)} will be re-built"
         )
 
+    # v0.29.7: gemini_trend_scout_post_{d_id} 跟 chancellery_final 挂钩
+    # (final 批准后才跑 per-direction post scan),chancellery_final 要
+    # 重跑意味着 post 也要清。用 exact-match delete,所以先扫一遍 log
+    # 名字把所有 post_* 找出来。
+    try:
+        _all_logs = db.get_stage_logs(run_id) or []
+        _post_names = [
+            l.get("stage_name", "")
+            for l in _all_logs
+            if (l.get("stage_name") or "").startswith(
+                "gemini_trend_scout_post_"
+            )
+        ]
+        if _post_names:
+            stages_to_redo += _post_names
+    except Exception:
+        # Non-fatal: can't read logs = post stays, UI shows stale but main
+        # pipeline proceeds correctly.
+        pass
+
     deleted = db.delete_stage_logs_by_names(run_id, stages_to_redo)
     logger.info(
         f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"

@@ -2,15 +2,16 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.6"
+VERSION = "v0.29.7"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "补充重跑删除清单补漏: pages/3_pipeline_detail.py 的 _stage_order "
-    "和 orchestrator.py 的 revise_and_resume stages_to_redo 都漏了 "
-    "narrative_director / red_blue_refiner / persona_simulator / "
-    "structural_rewriter / structure_review。导致补完信息/终审驳回 "
-    "重跑后,这几个阶段的上轮 stage_log 残留在 DB,UI 把它们染色成 "
-    "『已完成』或『失败』,误导用户以为没真正重跑。补齐两处清单。"
+    "补充重跑删除清单第二波补漏: 中书省+门下省的 stage_log 实际名是 "
+    "strategy_debate_0..N(多轮辩论每轮一条),不是 secretariat/"
+    "chancellery_1..3;gemini_trend_scout_post_{direction_id} 是动态"
+    "名。v0.29.6 的 _stage_order 没覆盖这两类,导致 UI 依然显示这些"
+    "阶段为绿色。本版扫 DB log 名做动态匹配 + 枚举 strategy_debate "
+    "到 20 轮 buffer。另:补充提交时同步重置 pipeline_run 的累计"
+    "total_tokens/total_cost_usd=0,避免 header 继续展示上一轮数据。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
