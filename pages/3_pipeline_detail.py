@@ -710,10 +710,32 @@ with tabs[0]:
 
         # ── 完整 input_data 折叠面板(诊断丢内容用)──
         # 让用户能直接对比"我喂了什么"vs"模型看到了什么"vs"模型输出了什么"。
+        # v0.29.8: db.get_stage_logs() 为了减 payload 显式不 SELECT input_data
+        # 列,所以 log.get("input_data") 永远是 None,UI 之前一直显示"为空"。
+        # 这里点开面板时按 log_id 单独 SELECT("*") 把 input_data 拉回来,
+        # 结果缓存在 session_state 避免重复查。
         with st.expander("📥 太子接收的完整输入 input_data(诊断用)", expanded=False):
-            _id = log.get("input_data") or {}
+            _log_id = log.get("id")
+            _cache_key = f"_cp_input_data_cache_{_log_id}"
+            _id = st.session_state.get(_cache_key)
+            if _id is None and _log_id:
+                try:
+                    _full_log = db.get_stage_log_by_id(_log_id) or {}
+                    _id = _full_log.get("input_data") or {}
+                    st.session_state[_cache_key] = _id
+                except Exception as _fetch_err:
+                    st.warning(
+                        f"(input_data 拉取失败:{type(_fetch_err).__name__}"
+                        f"——这通常是 DB 连接抖动,刷新重试即可)"
+                    )
+                    _id = {}
+            _id = _id or {}
+
             if not _id:
-                st.caption("(input_data 为空)")
+                st.caption(
+                    "(input_data 为空 — 极少数情况:老版本写入时 input_data 字段"
+                    "被跳过;这一般不影响执行,因为 agent 的调用参数是从内存构造的)"
+                )
             else:
                 _free_text_in = (
                     _id.get("free_text")
@@ -728,7 +750,7 @@ with tabs[0]:
                         height=300,
                         disabled=True,
                         label_visibility="collapsed",
-                        key="cp_input_freetext_diag",
+                        key=f"cp_input_freetext_diag_{_log_id}",
                     )
                 _other = {k: v for k, v in _id.items() if k != "free_text"}
                 if _other:

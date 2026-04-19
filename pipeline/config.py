@@ -2,16 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.7"
+VERSION = "v0.29.8"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "补充重跑删除清单第二波补漏: 中书省+门下省的 stage_log 实际名是 "
-    "strategy_debate_0..N(多轮辩论每轮一条),不是 secretariat/"
-    "chancellery_1..3;gemini_trend_scout_post_{direction_id} 是动态"
-    "名。v0.29.6 的 _stage_order 没覆盖这两类,导致 UI 依然显示这些"
-    "阶段为绿色。本版扫 DB log 名做动态匹配 + 枚举 strategy_debate "
-    "到 20 轮 buffer。另:补充提交时同步重置 pipeline_run 的累计"
-    "total_tokens/total_cost_usd=0,避免 header 继续展示上一轮数据。"
+    "太子诊断面板 input_data 为空的假象修复: db.get_stage_logs() 为"
+    "降 payload 显式不 SELECT input_data 列,UI 读到的永远是 None。"
+    "改成展开面板时按 log_id 单独 get_stage_log_by_id(拿 select *),"
+    "结果缓存在 session_state 避免重复查。用户现在能直接看到太子"
+    "实际收到的 free_text + brief 全文,对比 output 里的 raw_materials"
+    "做留存诊断。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
