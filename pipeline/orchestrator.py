@@ -1578,14 +1578,24 @@ class PipelineOrchestrator:
 
         Runs cells in parallel (bounded by rate limiter). Refined
         demo_output replaces the original in prompt_matrix in place.
+
+        v0.29.2: 即使某个 cell 没改动/失败/跳过,也会在 cell 上写
+        `_red_blue_summary` + `_red_blue_status`,并在 final_system
+        上写 `_red_blue_stats` 总计,让 UI 能区分"没跑"/"跑了没改"/
+        "跑了失败"——此前这三种状态在前端完全一样(啥都没有)。
         """
         prompt_cells = final_system.get("prompt_matrix") or []
         if not prompt_cells:
+            final_system["_red_blue_stats"] = {
+                "attempted": 0, "refined": 0, "unchanged": 0, "failed": 0,
+                "note": "prompt_matrix 为空,跳过红蓝精炼",
+            }
             return
 
         semaphore = asyncio.Semaphore(RED_BLUE_CONCURRENCY)
 
-        async def refine_one(cell: dict) -> dict | None:
+        async def refine_one(cell: dict) -> tuple[dict | None, str | None]:
+            """Return (result_dict_or_None, error_str_or_None)."""
             cid = cell.get("cell_id", "?")
             async with semaphore:
                 try:
@@ -1601,35 +1611,83 @@ class PipelineOrchestrator:
                         self.run_id,
                         self.db,
                     )
-                    return result
+                    return result, None
                 except Exception as e:
                     logger.warning(
                         "[red_blue] cell %s failed: %r", cid, e
                     )
-                    return None
+                    return None, f"{type(e).__name__}: {e}"
 
         results = await asyncio.gather(
             *[refine_one(c) for c in prompt_cells]
         )
 
-        refined_count = 0
-        for i, (cell, result) in enumerate(zip(prompt_cells, results)):
-            if not result:
+        stats = {"attempted": len(prompt_cells), "refined": 0,
+                 "unchanged": 0, "failed": 0}
+        details: list[dict] = []
+
+        for i, (cell, (result, err)) in enumerate(zip(prompt_cells, results)):
+            cid = cell.get("cell_id", "?")
+            if err is not None or result is None:
+                # Agent crashed. Leave a visible marker on the cell AND
+                # in stats so the UI can surface "ran but failed" instead
+                # of showing a blank.
+                prompt_cells[i]["_red_blue_status"] = "failed"
+                prompt_cells[i]["_red_blue_summary"] = f"(红蓝精炼失败) {err or '未知错误'}"
+                stats["failed"] += 1
+                details.append({
+                    "cell_id": cid, "status": "failed",
+                    "summary": err or "未知错误", "attacks": [], "fixes": [],
+                })
                 continue
-            new_demo = result.get("refined_demo_output")
-            if new_demo and new_demo.strip():
+
+            attacks = result.get("attacks") or []
+            fixes = result.get("fixes") or []
+            new_demo = (result.get("refined_demo_output") or "").strip()
+            new_sp = (result.get("refined_system_prompt") or "").strip()
+            changes_summary = (result.get("changes_summary") or "").strip()
+
+            if new_demo:
                 prompt_cells[i]["demo_output"] = new_demo
-                prompt_cells[i]["_red_blue_summary"] = result.get(
-                    "changes_summary", ""
+                stats["refined"] += 1
+                prompt_cells[i]["_red_blue_status"] = "refined"
+                prompt_cells[i]["_red_blue_summary"] = (
+                    changes_summary or f"精修了 {len(fixes)} 处"
                 )
-                refined_count += 1
-            # Also apply system_prompt refinement if provided
-            new_sp = result.get("refined_system_prompt")
-            if new_sp and new_sp.strip():
+            else:
+                # No refined_demo returned — either Red Team found nothing
+                # or model returned empty string. Previously this was
+                # silent; now we record it so the UI can show "检查过,
+                # 无需修改" instead of "没跑".
+                stats["unchanged"] += 1
+                prompt_cells[i]["_red_blue_status"] = "unchanged"
+                prompt_cells[i]["_red_blue_summary"] = (
+                    changes_summary
+                    or (f"Red Team 找到 {len(attacks)} 个点但未产出精修文本"
+                        if attacks else "Red Team 检查通过,无需修改")
+                )
+
+            if new_sp:
                 prompt_cells[i]["system_prompt"] = new_sp
 
+            # Snapshot per-cell detail for UI expansion.
+            details.append({
+                "cell_id": cid,
+                "status": prompt_cells[i].get("_red_blue_status", "?"),
+                "summary": prompt_cells[i].get("_red_blue_summary", ""),
+                "attacks": attacks,
+                "fixes": fixes,
+                "refined_demo_output": new_demo,
+                "refined_system_prompt_changed": bool(new_sp),
+            })
+
+        stats["details"] = details
+        final_system["_red_blue_stats"] = stats
+
         logger.info(
-            "[red_blue] refined %d/%d cells", refined_count, len(prompt_cells)
+            "[red_blue] attempted=%d refined=%d unchanged=%d failed=%d",
+            stats["attempted"], stats["refined"],
+            stats["unchanged"], stats["failed"],
         )
 
     async def _run_persona_simulation(
@@ -1638,9 +1696,18 @@ class PipelineOrchestrator:
         """Persona simulation: 3 target-audience personas react to each
         cell's demo. Results stored on final_system for UI display and
         as supplementary input to vibe_critic.
+
+        v0.29.2: 之前失败路径(prompt_matrix 空 / 调用抛异常)完全不写
+        `_persona_reactions`,UI 只能显示"没产出"。现在所有路径都写一个
+        `{"status": ..., "error"/"result": ...}` 结构,让 UI 区分
+        "没跑"/"跑了失败"/"跑了成功"。
         """
         prompt_cells = final_system.get("prompt_matrix") or []
         if not prompt_cells:
+            final_system["_persona_reactions"] = {
+                "status": "skipped",
+                "reason": "prompt_matrix 为空,未调用 persona_simulator",
+            }
             return
 
         target_audience = brief.get("target_audience", "")
@@ -1669,11 +1736,23 @@ class PipelineOrchestrator:
                 self.db,
             )
         except Exception as e:
-            logger.warning("[persona_sim] failed: %r", e)
+            logger.exception("[persona_sim] failed")
+            final_system["_persona_reactions"] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+                "reason": (
+                    "persona_simulator 调用失败。stage_log 里应有完整 traceback; "
+                    "常见原因: (1) JSON 解析失败 (2) Claude rate limit / 5xx "
+                    "(3) 模型返回为空。"
+                ),
+            }
             return
 
-        final_system["_persona_reactions"] = result
-        summary = result.get("summary") or {}
+        # Success. Tag with status for UI consistency and preserve raw result.
+        tagged = {"status": "ok", **(result or {})}
+        final_system["_persona_reactions"] = tagged
+
+        summary = (result or {}).get("summary") or {}
         weak = summary.get("weak_cells") or []
         if weak:
             logger.warning(
@@ -2802,6 +2881,10 @@ class PipelineOrchestrator:
         """
         prompt_cells = final_system.get("prompt_matrix") or []
         if not prompt_cells:
+            final_system["_consumer_simulation"] = {
+                "status": "skipped",
+                "reason": "prompt_matrix 为空,未调用 consumer_simulation",
+            }
             return
 
         direction_index = getattr(self, "_direction_index", {}) or {}
@@ -2837,13 +2920,21 @@ class PipelineOrchestrator:
                 self.run_id,
                 self.db,
             )
-        except Exception:
+        except Exception as e:
             logger.exception(
                 "[consumer_sim] persona_simulator failed; skipping 2nd-level check"
             )
+            final_system["_consumer_simulation"] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+                "reason": (
+                    "consumer_simulation 调用失败。常见原因: JSON 解析失败 / "
+                    "rate limit / 模型返回空。stage_log 里有完整 traceback。"
+                ),
+            }
             return
 
-        final_system["_consumer_simulation"] = result
+        final_system["_consumer_simulation"] = {"status": "ok", **(result or {})}
 
         # Cells where the modeled consumer would scroll = interest_align
         # second-layer fail. Append to strategic_warnings so UI surfaces them.

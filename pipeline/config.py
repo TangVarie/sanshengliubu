@@ -2,15 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.1"
+VERSION = "v0.29.2"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "策略层自动升级(C.2.1): strategic_warnings 触发 secretariat 修订受"
-    "影响 direction 的 stop_trigger/reward_type/role_embodiment 后再跑"
-    "一次 vibe_loop(上限 1 轮);"
-    "消费者二层校验(C.2.2): persona_simulator 新增 consumer_simulation"
-    "模式,vibe_loop 后按 stop_trigger 构造目标用户对每个 cell 做"
-    "stop/scroll 二元判决,scroll 的 cell 追加进 strategic_warnings。"
+    "红蓝精炼 / 画像模拟可观测性修复: 失败 / 无需修改 / 未跑 三种状态"
+    "都会在 final_system 上写 `_red_blue_stats` / `_persona_reactions` / "
+    "`_consumer_simulation` 的 status 字段,输出中心 UI 新增总计卡片 + "
+    "per-cell 攻击/修复清单 + 每个画像对每条 cell 的反应展开面板。"
+    "此前失败是静默 — stage_log 里有错但 final_system 啥都没写,UI 只能"
+    "显示"没产出"。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────

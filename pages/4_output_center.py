@@ -96,6 +96,23 @@ if matrix:
                     if rewrite_summary:
                         st.info(f"🎯 网感重写：{rewrite_summary}")
 
+                    # v0.29.2: 红蓝精炼 per-cell 状态 — 即使没改动也显示,
+                    # 让用户能区分"跑了没改" vs "跑了失败" vs "没跑"
+                    rb_status = cell.get("_red_blue_status")
+                    rb_summary = cell.get("_red_blue_summary", "")
+                    if rb_status:
+                        _rb_icon = {
+                            "refined": "⚔️",
+                            "unchanged": "✅",
+                            "failed": "❗",
+                        }.get(rb_status, "⚔️")
+                        _rb_func = {
+                            "refined": st.success,
+                            "unchanged": st.caption,
+                            "failed": st.error,
+                        }.get(rb_status, st.info)
+                        _rb_func(f"{_rb_icon} 红蓝精炼 [{rb_status}]: {rb_summary}")
+
                     # A2: per-direction reference posts (Gemini pulled
                     # real current Xiaohongshu content with same direction
                     # theme). Side-by-side comparison anchor — did we
@@ -148,6 +165,120 @@ elif templates:
                 with st.expander("示例输出"):
                     st.markdown(demo)
 
+# v0.29.2: 红蓝精炼总计 — 即使整批失败/全部 unchanged 也会显示,
+# 和之前"啥都没有"的行为对齐不上,让用户能看到阶段真的跑了。
+rb_stats = prompt_system.get("_red_blue_stats")
+if rb_stats:
+    attempted = rb_stats.get("attempted", 0)
+    refined = rb_stats.get("refined", 0)
+    unchanged = rb_stats.get("unchanged", 0)
+    failed = rb_stats.get("failed", 0)
+    note = rb_stats.get("note", "")
+    label = (
+        f"⚔️ 红蓝精炼: {refined} 已修复 · {unchanged} 无需修改 · "
+        f"{failed} 失败 / 总计 {attempted}"
+    )
+    if failed > 0 and failed == attempted:
+        st.error(f"{label} — 全部失败,请检查 stage_log 里的 red_blue_refiner 报错")
+    elif failed > 0:
+        st.warning(label)
+    elif refined == 0 and attempted > 0:
+        st.info(f"{label} — 这轮所有 cell 都通过 Red Team 检查,无需精修")
+    elif attempted == 0:
+        st.caption(f"⚔️ 红蓝精炼: {note or '未执行'}")
+    else:
+        st.success(label)
+
+    details = rb_stats.get("details") or []
+    if details:
+        with st.expander(
+            f"展开红蓝精炼详情({len(details)} 条 cell 的攻击 / 修复清单)",
+            expanded=False,
+        ):
+            for d in details:
+                cid = d.get("cell_id", "?")
+                status = d.get("status", "?")
+                st.markdown(
+                    f"**{cid}** · `{status}` — {d.get('summary', '')}"
+                )
+                attacks = d.get("attacks") or []
+                fixes = d.get("fixes") or []
+                if attacks:
+                    st.caption("Red Team 攻击:")
+                    for a in attacks:
+                        st.markdown(
+                            f"- [{a.get('severity', '?')}] "
+                            f"`{a.get('target', '')[:80]}` — {a.get('issue', '')}"
+                        )
+                if fixes:
+                    st.caption("Blue Team 修复:")
+                    for fx in fixes:
+                        st.markdown(
+                            f"- `{fx.get('original', '')[:60]}` → "
+                            f"**{fx.get('replacement', '')[:100]}**"
+                        )
+                if d.get("refined_demo_output"):
+                    with st.expander(f"精修后的 demo ({cid})", expanded=False):
+                        st.markdown(d["refined_demo_output"])
+                st.divider()
+
+# v0.29.2: 画像模拟反应(3 个画像对每个 cell 的 click/skip/save 反应)
+persona_reactions = prompt_system.get("_persona_reactions")
+if persona_reactions:
+    ps_status = persona_reactions.get("status", "ok")
+    if ps_status == "failed":
+        st.error(
+            f"👤 画像模拟: 调用失败 — {persona_reactions.get('error', '未知错误')}"
+        )
+        if persona_reactions.get("reason"):
+            st.caption(persona_reactions["reason"])
+    elif ps_status == "skipped":
+        st.caption(
+            f"👤 画像模拟: 跳过 — {persona_reactions.get('reason', '')}"
+        )
+    else:
+        summary = persona_reactions.get("summary", {}) or {}
+        strong = summary.get("strong_cells", []) or []
+        narrow = summary.get("narrow_cells", []) or []
+        weak = summary.get("weak_cells", []) or []
+        label = (
+            f"👤 画像模拟: {len(strong)} 强 · {len(narrow)} 窄 · {len(weak)} 弱"
+        )
+        if weak:
+            st.error(f"{label} — 弱 cell (3 个画像都划走): {weak}")
+        elif narrow:
+            st.warning(label)
+        else:
+            st.success(label)
+
+        overall = summary.get("overall", "")
+        if overall:
+            st.caption(f"📊 {overall}")
+
+        personas = persona_reactions.get("personas") or []
+        if personas:
+            with st.expander(
+                f"展开 {len(personas)} 个画像对每个 cell 的反应",
+                expanded=False,
+            ):
+                for p in personas:
+                    pid = p.get("id", "?")
+                    profile = p.get("profile", "")
+                    st.markdown(f"### 👤 {pid}")
+                    st.caption(profile)
+                    for r in p.get("reactions", []) or []:
+                        action = r.get("action", "?")
+                        _act_icon = {
+                            "click": "👆", "save": "⭐", "skip": "⏭️",
+                        }.get(action, "❓")
+                        st.markdown(
+                            f"- {_act_icon} **{r.get('cell_id', '?')}** · "
+                            f"`{action}` — "
+                            f"*「{r.get('reaction', '')}」* "
+                            f"({r.get('reason', '')})"
+                        )
+                    st.divider()
+
 # Vibe critic summary
 vibe_result = prompt_system.get("vibe_critic_result")
 if vibe_result:
@@ -163,7 +294,18 @@ if vibe_result:
 # strategic_warnings(下面那块),这里单独展示 binary 结果让用户看到
 # "谁真的会被钩住"的直观对比。
 consumer_sim = prompt_system.get("_consumer_simulation")
-if consumer_sim and consumer_sim.get("judgments"):
+# v0.29.2: 处理失败 / 跳过状态(之前只处理 judgments 非空的成功路径)
+if consumer_sim and consumer_sim.get("status") == "failed":
+    st.error(
+        f"👥 消费者二层校验: 调用失败 — {consumer_sim.get('error', '未知错误')}"
+    )
+    if consumer_sim.get("reason"):
+        st.caption(consumer_sim["reason"])
+elif consumer_sim and consumer_sim.get("status") == "skipped":
+    st.caption(
+        f"👥 消费者二层校验: 跳过 — {consumer_sim.get('reason', '')}"
+    )
+elif consumer_sim and consumer_sim.get("judgments"):
     summary = consumer_sim.get("summary", {}) or {}
     stop_n = summary.get("stop_count", 0)
     scroll_n = summary.get("scroll_count", 0)
