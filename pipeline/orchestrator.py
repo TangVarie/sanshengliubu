@@ -3606,8 +3606,22 @@ def revise_and_resume_pipeline_in_background(
     db.update_project(project_id, brief=brief)
 
     # 3. Selective deletion: only re-run what's actually needed.
-    # Always re-run: vibe loop + chancellery_final (they evaluate the full matrix)
-    stages_to_redo = ["vibe_critic", "vibe_rewriter", "chancellery_final"]
+    # Always re-run: 中间精炼层 + vibe loop + chancellery_final
+    # (这些都 evaluate full matrix,任何一个 cell 变了它们就得重跑)。
+    # v0.29.6: 补上 narrative_director / red_blue_refiner /
+    # persona_simulator / structural_rewriter / structure_review,之前
+    # 只删 vibe+final 会让这 5 个阶段的上轮 stage_log 残留 → UI 误染色
+    # + orchestrator cell 级 resume 时用到陈旧数据。
+    stages_to_redo = [
+        "narrative_director",
+        "red_blue_refiner",
+        "persona_simulator",
+        "ministry_works_structure_review",
+        "vibe_critic",
+        "vibe_rewriter",
+        "structural_rewriter",
+        "chancellery_final",
+    ]
 
     if is_global_revision:
         # Global concern (persona_library / title_rules etc.)
@@ -3618,7 +3632,7 @@ def revise_and_resume_pipeline_in_background(
             "ministry_works_builder",
         ]
         logger.info(
-            "[revise] global revision → deleting ALL works stages + vibe + final"
+            "[revise] global revision → deleting ALL works stages + 中间精炼 + vibe + final"
         )
     else:
         # Cell-specific revision → keep builder stage_logs intact.

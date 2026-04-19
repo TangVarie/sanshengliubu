@@ -2,15 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.5"
+VERSION = "v0.29.6"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "补充信息后自动 resume(方案 B): 之前『补充信息 / 部分重跑』提交后"
-    "把 status 写成 failed 当『待 resume』的中间标记,但 UI 顶部徽章"
-    "直接渲染成 ❌ failed,看起来像真失败,且用户需要额外点一次"
-    "『继续执行』。现在补完即跑——提交后自动触发 resume,success "
-    "提示改成『已自动从 X 阶段开始重跑』。启动失败(罕见)回退到"
-    "原手动提示。"
+    "补充重跑删除清单补漏: pages/3_pipeline_detail.py 的 _stage_order "
+    "和 orchestrator.py 的 revise_and_resume stages_to_redo 都漏了 "
+    "narrative_director / red_blue_refiner / persona_simulator / "
+    "structural_rewriter / structure_review。导致补完信息/终审驳回 "
+    "重跑后,这几个阶段的上轮 stage_log 残留在 DB,UI 把它们染色成 "
+    "『已完成』或『失败』,误导用户以为没真正重跑。补齐两处清单。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────

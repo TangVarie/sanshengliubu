@@ -1298,7 +1298,13 @@ if status not in ("running",):
         )
 
         # Downstream stage names for deletion. Order matters — we delete
-        # everything at and below the selected stage.
+        # everything at and below the selected stage. 必须和 orchestrator
+        # 实际跑的阶段全集对齐,否则上一轮的 stage_log 会残留,UI 把它们
+        # 染色成"已完成/失败",误导用户以为部分阶段没重跑。
+        #
+        # v0.29.6: 补漏 — narrative_director / red_blue_refiner /
+        # persona_simulator / structural_rewriter 四个阶段之前没列进来,
+        # 用户反馈"补完重跑后叙事导演 + 红蓝 + 画像还带颜色"就是这个 bug。
         _stage_order = [
             "crown_prince",
             "gemini_reference_analyzer",
@@ -1311,8 +1317,15 @@ if status not in ("running",):
             "ministry_works",
             "ministry_works_cell_planner",
             "ministry_works_builder",
+            # v0.29.6 补:cross-cell + 精炼 + 画像 + 结构审
+            "narrative_director",
+            "red_blue_refiner",
+            "persona_simulator",
             "ministry_works_structure_review",
-            "vibe_critic", "vibe_rewriter",
+            "vibe_critic",
+            "vibe_rewriter",
+            # v0.29.6 补:结构手术(v0.29.0 新 agent,和 vibe_rewriter 并列)
+            "structural_rewriter",
             "chancellery_final",
         ]
 
