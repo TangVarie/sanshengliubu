@@ -450,5 +450,10 @@ PIPELINE_STAGES = [
     ("persona_simulator", "画像模拟", "👥"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
+    # v0.29.3: 补展示 — 这两个阶段其实一直在跑也各自记 stage_log,
+    # 但 PIPELINE_STAGES 漏了,导致 Settings 页面"模型配置"看不到它们
+    # 用的是哪个模型(用户手动在 secrets 里配了 override 也找不到对应行)。
+    ("vibe_rewriter", "网感重写", "✏️"),
+    ("structural_rewriter", "叙事结构重写", "🧱"),
     ("chancellery_final", "终审", "✅"),
 ]
