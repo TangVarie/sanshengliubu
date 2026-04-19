@@ -1038,9 +1038,17 @@ class BaseAgent:
                 )
                 return repaired
 
+        # v0.29.12: 老错误只报 last 200 chars,debug 时还得翻 stage_log
+        # 才能看全貌。把首 200 + 末 200 都塞进去,并报告中间遗漏了多少,
+        # 让运行时日志就能判断是"整段不是 JSON"还是"尾部截断"。
+        _preview_front = response_text[:200]
+        _preview_tail = response_text[-200:] if len(response_text) > 200 else ""
+        _gap = max(0, len(response_text) - 400)
         raise ValueError(
-            f"Could not extract JSON from response (len={len(response_text)}, "
-            f"last 200 chars: ...{response_text[-200:]!r})"
+            f"Could not extract JSON from response (len={len(response_text)}); "
+            f"first 200 chars: {_preview_front!r}; "
+            f"...[{_gap} chars omitted]... "
+            f"last 200 chars: {_preview_tail!r}"
         )
 
     @staticmethod
@@ -1078,8 +1086,13 @@ class BaseAgent:
             elif ch == ",":
                 cut_points.append(i)  # cut BEFORE comma is also valid
 
-        # Try cut points from most recent to earliest (keep as much data as possible)
-        for cp in reversed(cut_points[-300:]):
+        # Try cut points from most recent to earliest (keep as much data as possible).
+        # v0.29.12: 老版本 `cut_points[-300:]` 硬限在 13K+ 响应里常常不够
+        # ——最后 300 个 cut point 可能都深埋在一个没闭合的嵌套结构里,
+        # 每个 candidate 都不合法。放开限制,扫所有 cut point。即使 5000
+        # 个 candidate 每个 re-scan 也就 ~50ms,总共 <1s,比整条流水线
+        # 报错重跑强得多。
+        for cp in reversed(cut_points):
             candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
             # Strip a dangling partial field. Order matters — more specific
             # patterns first. All regexes assume the candidate has no unclosed

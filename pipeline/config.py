@@ -2,10 +2,17 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.11"
+VERSION = "v0.29.12"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "画像模拟接入反馈链(方案 A): 之前 persona_simulator 只写 "
+    "吏部 ValueError JSON extraction 修复: (1) STAGE_MAX_TOKENS["
+    "ministry_personnel] 20K→32K,多画像 × authenticity_card 字段长容易"
+    "撞上限导致响应截断;(2) _try_repair_truncated_json 的 "
+    "cut_points[-300:] 硬限放开——13K+ 响应最后 300 个 cut point 常常"
+    "都卡在深层嵌套里,每个 candidate 都不合法,扫全部才能找到有效"
+    "cut;(3) JSON 提取失败错误消息改成 first 200 + last 200 双端"
+    "预览,方便判断是整段不是 JSON 还是只是尾部截断。"
+    "功能同 v0.29.11(画像模拟接入反馈链): 之前 persona_simulator 只写 "
     "_persona_reactions 给 UI 显示,不参与任何决策,跑了等于白烧 token。"
     "现在每条 cell 扫 3 个画像的 action,全 skip 的 cell 追加进 "
     "strategic_warnings,和 consumer_simulation 走同一条告警通道 —— "
@@ -218,7 +225,10 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
     "dispatcher": 20000,
-    "ministry_personnel": 20000,
+    # v0.29.12: 吏部经常超 20K(多画像 × authenticity_card 字段长),撞
+    # max_tokens 截断产出破损 JSON。修复 JSON 重建能救大多数,但直接
+    # 给足上限从源头减少截断。
+    "ministry_personnel": 32000,
     "ministry_revenue": 20000,
     "ministry_rites": 20000,
     "ministry_war": 20000,
