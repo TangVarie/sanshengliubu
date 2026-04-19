@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 import time
 
 import streamlit as st
@@ -81,6 +82,120 @@ def render_stage_meta(log: dict | None) -> None:
         bits.append(f"状态 {status}")
     if bits:
         st.caption(" · ".join(bits))
+
+
+def _sanitize_freetext_for_display(text: str) -> str:
+    """折叠 free_text 里的 base64 图片原文,便于人阅读。
+
+    v0.26.0 之前的项目把整张图的 base64 直接塞进 free_text,单张图就能
+    吃掉几百行"乱码"。新数据走 Gemini Vision OCR 不会有,但历史项目
+    每次 re-run 都继承老 free_text → base64 一直在。
+    这里只动显示,不动存储:实际喂给 agent 的 input_data 保持原样。
+    """
+    if not text:
+        return text
+    # [BASE64_IMAGE:xxxx...] 块:v0.26.0 前的原始 base64 占位
+    text = re.sub(
+        r"\[BASE64_IMAGE:([A-Za-z0-9+/=]{40,})\]",
+        lambda m: f"[📎 图片 base64 已折叠 · {len(m.group(1)):,} 字符]",
+        text,
+    )
+    # 极长的裸 base64(没有包装标签)也折叠 — 超过 500 字符的连续
+    # base64 字符视为图片残留。
+    text = re.sub(
+        r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/=]{500,})(?![A-Za-z0-9+/=])",
+        lambda m: f"[📎 未包装 base64 已折叠 · {len(m.group(1)):,} 字符]",
+        text,
+    )
+    return text
+
+
+def _extract_file_summary_from_freetext(text: str) -> list[dict]:
+    """扫 free_text 找出所有已接收的文件及其状态。
+
+    统一的外层包装是 page 2 的 process_uploaded_files 产的
+    `[参考文件: name]...[/参考文件]` 块,包括 txt/md/json/pdf/docx/图片
+    所有类型。从 body 内容推断具体 kind + status:
+    - 内含 `[图片AI识别:` → Gemini OCR 成功的图片
+    - 内含 `[图片占位符:` → Gemini 未配置/失败的图片占位
+    - 内含 `[BASE64_IMAGE:` 或 `base64长度:` → v0.26 前的 base64 残留
+    - 都不含 → 普通文本/Word/PDF 提取文本
+
+    另外扫 `[历史样本: X]...[/历史样本]`(样本库插入,走另一条路径)。
+    返回 [{filename, kind, status, size_hint, preview}]。
+    """
+    if not text:
+        return []
+    files: list[dict] = []
+
+    # 主:外层 [参考文件:...] 块 — txt/md/pdf/docx/图片全走这条
+    for m in re.finditer(
+        r"\[参考文件:\s*([^\]]+?)\]\n(.*?)(?=\n\[/参考文件\]|$)",
+        text, flags=re.DOTALL,
+    ):
+        filename = (m.group(1) or "").strip()
+        body = (m.group(2) or "").strip()
+
+        # 按扩展名 + body 内容推断类型
+        _ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if "[图片AI识别:" in body:
+            kind = "图片(Gemini OCR)"
+            status = "transcribed"
+        elif "[图片占位符:" in body:
+            kind = "图片(占位符)"
+            status = "placeholder_only"
+        elif "[BASE64_IMAGE:" in body or "base64长度:" in body:
+            kind = "图片(旧 base64)"
+            status = "legacy_base64"
+        elif _ext == "pdf":
+            kind = "PDF"
+            status = "extracted"
+        elif _ext == "docx":
+            kind = "Word"
+            status = "extracted"
+        elif _ext in ("txt", "md"):
+            kind = "文本"
+            status = "extracted"
+        elif _ext == "json":
+            kind = "JSON"
+            status = "extracted"
+        elif _ext in ("png", "jpg", "jpeg", "gif", "webp"):
+            # 图片扩展名但没命中上面几种 body 标记 — 罕见,可能是
+            # 早期未处理状态或新格式。
+            kind = "图片(未知格式)"
+            status = "unknown"
+        else:
+            kind = "其他"
+            status = "extracted"
+
+        # 空 body 提示(上传成功但解析失败也算一种状态)
+        if not body and status == "extracted":
+            status = "empty"
+
+        files.append({
+            "filename": filename,
+            "kind": kind,
+            "status": status,
+            "size_hint": len(body),
+            "preview": _sanitize_freetext_for_display(body)[:180],
+        })
+
+    # 历史样本(样本库插入,不经 process_uploaded_files 包装)
+    for m in re.finditer(
+        r"\[历史样本:\s*([^\]]+?)\]\n(.*?)(?=\n\[/历史样本\]|$)",
+        text, flags=re.DOTALL,
+    ):
+        filename = (m.group(1) or "").strip()
+        body = (m.group(2) or "").strip()
+        files.append({
+            "filename": filename,
+            "kind": "历史样本",
+            "status": "extracted",
+            "size_hint": len(body),
+            "preview": _sanitize_freetext_for_display(body)[:180],
+        })
+
+    return files
 
 
 def render_stage_output(output_data: dict):
@@ -645,13 +760,64 @@ st.divider()
 st.subheader("各环节详情")
 
 # Group stages into tabs
-tab_names = ["太子", "中书省", "门下省", "尚书省", "六部", "网感", "终审"]
+# v0.29.9: 新增"中间精炼"tab(叙事导演/红蓝精炼/画像模拟),之前这三个
+# 阶段跑了但 UI 完全没位置展示,图标染色了点进去也看不到内容。
+tab_names = [
+    "太子", "中书省", "门下省", "尚书省", "六部",
+    "中间精炼", "网感", "终审",
+]
 tabs = st.tabs(tab_names)
 
 # Tab 0: Crown Prince
 with tabs[0]:
     log = log_map.get("crown_prince")
     render_stage_meta(log)
+
+    # v0.29.9: 上传文件清单 — 不管太子跑没跑,先把 project.free_text 里
+    # 识别到的参考文件列出来,让用户一眼知道"我传的 N 个文件系统收到没、
+    # 解析出了什么"。解决原来要翻几百行 base64 才知道有没有收到的问题。
+    try:
+        _proj_for_files = db.get_project(project_id) or {}
+        _proj_free_text = _proj_for_files.get("free_text", "") or ""
+        _files_received = _extract_file_summary_from_freetext(_proj_free_text)
+        if _files_received:
+            _status_icons = {
+                "extracted": "✅",
+                "transcribed": "🔍",
+                "placeholder_only": "⚠️",
+                "legacy_base64": "📦",
+                "empty": "❌",
+                "unknown": "❓",
+            }
+            _status_labels = {
+                "extracted": "已提取文本",
+                "transcribed": "Gemini 已转写",
+                "placeholder_only": "仅占位符(未转写)",
+                "legacy_base64": "老版 base64 残留",
+                "empty": "body 为空(提取失败?)",
+                "unknown": "未知格式",
+            }
+            with st.expander(
+                f"📎 接收到的参考文件({len(_files_received)} 个)",
+                expanded=True,
+            ):
+                st.caption(
+                    "这里列出 project.free_text 里识别到的所有文件及其处理状态。"
+                    "base64 残留来自 v0.26 之前的老数据,每次 re-run 会继承。"
+                    "只想看『收到没』就看这个表,不用翻下面的正文。"
+                )
+                for _fi in _files_received:
+                    _icon = _status_icons.get(_fi["status"], "❓")
+                    _label = _status_labels.get(_fi["status"], _fi["status"])
+                    st.markdown(
+                        f"{_icon} **{_fi['filename']}** · _{_fi['kind']}_ · "
+                        f"`{_label}` · {_fi['size_hint']:,} 字"
+                    )
+                    if _fi["preview"]:
+                        st.caption(f"预览:{_fi['preview']}…")
+    except Exception as _fs_err:
+        st.caption(f"(文件清单解析失败:{type(_fs_err).__name__})")
+
     if log and log.get("output_data"):
         # ── 留存率诊断(v0.26.0)──
         # 用户喂的 raw 内容(free_text 里的 [参考文件: ...] 块)在
@@ -743,10 +909,24 @@ with tabs[0]:
                     or ""
                 )
                 if _free_text_in:
-                    st.markdown(f"**free_text 长度:** {len(_free_text_in):,} 字")
+                    # v0.29.9: 折叠 base64 图片块,让用户能真的看懂内容。
+                    # 原始字数仍然显示(那是真实传给 agent 的体量)。
+                    _sanitized_ft = _sanitize_freetext_for_display(_free_text_in)
+                    _orig_len = len(_free_text_in)
+                    _sanit_len = len(_sanitized_ft)
+                    if _sanit_len < _orig_len:
+                        st.markdown(
+                            f"**free_text 长度:** {_orig_len:,} 字 "
+                            f"(base64 折叠后显示 {_sanit_len:,} 字 — "
+                            f"实际喂给 agent 的是完整原文)"
+                        )
+                    else:
+                        st.markdown(
+                            f"**free_text 长度:** {_orig_len:,} 字"
+                        )
                     st.text_area(
-                        "free_text(只读)",
-                        value=_free_text_in,
+                        "free_text(只读,base64 已折叠)",
+                        value=_sanitized_ft,
                         height=300,
                         disabled=True,
                         label_visibility="collapsed",
@@ -1084,8 +1264,100 @@ with tabs[4]:
                     else:
                         st.caption(f"状态：{sr_status}")
 
-# Tab 5: Vibe (网感复检 + Gemini 仲裁)
+# Tab 5: 中间精炼 (v0.29.9 新增 — 叙事导演/红蓝精炼/画像模拟)
+# 这三个阶段在 orchestrator 里 builder 之后 vibe 之前跑,之前 UI 没
+# 对应 tab 所以用户点不到。每个 stage 的 status 图标 + 简要摘要 +
+# 点开看完整 output。
 with tabs[5]:
+    _mid_layout = [
+        ("narrative_director", "🎬 叙事导演",
+         "看完整矩阵,诊断钩子类型是否重复 / 人设是否立住 / 正反比例"),
+        ("red_blue_refiner", "⚔️ 红蓝精炼",
+         "每个 cell 独立:Red Team 攻 AI 腔,Blue Team 做最小修复"),
+        ("persona_simulator", "👥 画像模拟",
+         "3 个画像 + v0.29.1 起新增 consumer_simulation 目标用户二层校验"),
+    ]
+    for _mid_stage_name, _mid_label, _mid_desc in _mid_layout:
+        _mid_log = log_map.get(_mid_stage_name)
+        with st.expander(
+            f"{_mid_label} — {_mid_desc}",
+            expanded=(_mid_log and _mid_log.get("status") == "completed"),
+        ):
+            if not _mid_log:
+                st.caption("(此阶段未执行,或已被清理等待重跑)")
+                continue
+            render_stage_meta(_mid_log)
+            _mid_status = _mid_log.get("status", "pending")
+            _mid_out = _mid_log.get("output_data") or {}
+
+            if _mid_status == "failed":
+                render_stage_error(_mid_log)
+                continue
+            if not _mid_out:
+                st.caption(f"状态:{_mid_status}")
+                continue
+
+            # 按阶段类型给一个简要摘要 + 完整 output expander
+            if _mid_stage_name == "narrative_director":
+                _issues = _mid_out.get("issues") or []
+                _rebuild = _mid_out.get("cells_to_rebuild") or []
+                if _rebuild:
+                    st.warning(
+                        f"诊断出 {len(_issues)} 个问题,需要重建 "
+                        f"{len(_rebuild)} 个 cell:{_rebuild}"
+                    )
+                else:
+                    st.success(
+                        f"矩阵一致性诊断通过"
+                        f"({len(_issues)} 个 minor issue,无需重建)"
+                    )
+            elif _mid_stage_name == "red_blue_refiner":
+                # Per-cell agent (并发跑),每次调用产一条 log。
+                # final_system._red_blue_stats 汇总在 output_center 显示,
+                # 这里只显示本条 log 的 attacks/fixes 摘要。
+                _attacks = _mid_out.get("attacks") or []
+                _fixes = _mid_out.get("fixes") or []
+                _ref_demo = bool((_mid_out.get("refined_demo_output") or "").strip())
+                if _ref_demo:
+                    st.success(
+                        f"Red Team 找到 {len(_attacks)} 个点 → "
+                        f"Blue Team 做了 {len(_fixes)} 处替换"
+                    )
+                elif _attacks:
+                    st.warning(
+                        f"Red Team 找到 {len(_attacks)} 个点但未产出 refined demo"
+                    )
+                else:
+                    st.info("Red Team 检查通过,无需精修")
+            elif _mid_stage_name == "persona_simulator":
+                _mode = _mid_out.get("mode", "persona_spectrum")
+                if _mode == "consumer_simulation":
+                    _sumc = _mid_out.get("summary") or {}
+                    _stop = _sumc.get("stop_count", 0)
+                    _scroll = _sumc.get("scroll_count", 0)
+                    st.info(
+                        f"消费者模拟:{_stop} stop · {_scroll} scroll "
+                        f"({_mode})"
+                    )
+                else:
+                    _sump = _mid_out.get("summary") or {}
+                    _strong = _sump.get("strong_cells") or []
+                    _weak = _sump.get("weak_cells") or []
+                    if _weak:
+                        st.warning(
+                            f"强 cell:{len(_strong)} · 弱 cell:{len(_weak)} "
+                            f"({_weak})"
+                        )
+                    else:
+                        st.success(
+                            f"强 cell:{len(_strong)} · 无弱 cell"
+                        )
+
+            with st.expander("🔍 完整 output_data", expanded=False):
+                st.json(_mid_out)
+
+# Tab 6: Vibe (网感复检 + Gemini 仲裁 + 重写 + 结构重写)
+with tabs[6]:
     # Vibe critic
     _vc_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_critic"]
     _vr_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_rewriter"]
@@ -1185,8 +1457,42 @@ with tabs[5]:
                 elif vrl.get("status") == "failed":
                     render_stage_error(vrl)
 
-# Tab 6: Final Review
-with tabs[6]:
+    # v0.29.9: 叙事结构重写(structural_rewriter)— v0.29.0 新 agent,
+    # 专门处理 identity_consistency/gap_tension fail 的结构性手术。
+    # 不是每次 vibe_loop 都触发(看 critic 的 root_cause_kind 分流),
+    # 有 log 才显示。
+    _sr_logs = [
+        l for l in stage_logs if l.get("stage_name") == "structural_rewriter"
+    ]
+    if _sr_logs:
+        st.divider()
+        for idx, srl in enumerate(_sr_logs):
+            with st.expander(
+                f"🧱 叙事结构重写 轮次 {idx + 1}",
+                expanded=False,
+            ):
+                render_stage_meta(srl)
+                _sr_out = srl.get("output_data") or {}
+                if _sr_out:
+                    _sr_cells = _sr_out.get("prompt_cells") or []
+                    st.info(f"结构手术 {len(_sr_cells)} 个 cell")
+                    for _sc in _sr_cells:
+                        _sc_cid = _sc.get("cell_id", "?")
+                        _sc_mode = _sc.get("rewrite_mode", "?")
+                        _sc_summary = _sc.get("rewrite_summary", "")
+                        _mode_icon = {
+                            "identity_restructure": "🎭",
+                            "gap_restructure": "🔀",
+                        }.get(_sc_mode, "🧱")
+                        st.caption(
+                            f"{_mode_icon} **{_sc_cid}** ({_sc_mode})："
+                            f"{_sc_summary[:150]}"
+                        )
+                elif srl.get("status") == "failed":
+                    render_stage_error(srl)
+
+# Tab 7: Final Review
+with tabs[7]:
     log = log_map.get("chancellery_final")
     render_stage_meta(log)
     if log and log.get("output_data"):

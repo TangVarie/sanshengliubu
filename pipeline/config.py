@@ -2,15 +2,19 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.8"
+VERSION = "v0.29.9"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "太子诊断面板 input_data 为空的假象修复: db.get_stage_logs() 为"
-    "降 payload 显式不 SELECT input_data 列,UI 读到的永远是 None。"
-    "改成展开面板时按 log_id 单独 get_stage_log_by_id(拿 select *),"
-    "结果缓存在 session_state 避免重复查。用户现在能直接看到太子"
-    "实际收到的 free_text + brief 全文,对比 output 里的 raw_materials"
-    "做留存诊断。"
+    "流水线详情页可观测性大升级: (1) 新增『中间精炼』tab 展示 "
+    "叙事导演 / 红蓝精炼 / 画像模拟 三个阶段,之前 UI 没位置、"
+    "图标染色点进去看不到内容; (2) 网感 tab 补上 叙事结构重写 "
+    "(structural_rewriter) 的 per-cell 摘要; (3) 太子 tab 顶部新增 "
+    "『📎 接收到的参考文件』清单,按 txt/md/pdf/docx/图片 统一识别 "
+    "[参考文件: name] 包装 + 从 body 推断 kind/status,每个文件"
+    "一行状态图标 + 字数 + 预览,不再需要翻几百行 base64 确认"
+    "收到没;(4) free_text 显示一律折叠 BASE64_IMAGE 块和裸 "
+    "base64 串,用『📎 已折叠 · N 字符』代替,实际喂 agent 的是"
+    "完整原文不受影响。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
