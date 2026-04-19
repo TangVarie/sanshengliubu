@@ -1390,13 +1390,47 @@ if status not in ("running",):
                             _to_delete.append(_gs)
 
                     _deleted = db.delete_stage_logs_by_names(run_id, _to_delete)
-                    st.success(
-                        f"✅ 补充信息已追加，{_deleted} 个 stage_log 已清除。"
-                        f"点下方「▶️ 继续执行」从 {_rerun_stages[_selected_stage]} 重跑。"
-                    )
-                    # Reset project status so resume is allowed
+
+                    # Reset project status so resume is allowed. "failed" is
+                    # used as a "needs-resume" marker here — resume_pipeline's
+                    # guard only refuses when status == "running", and the
+                    # 继续执行 button requires status != "completed" (page 3
+                    # line ~1424). We need both conditions lifted.
                     db.update_project(project_id, status="failed")
                     db.update_pipeline_run(run_id, status="failed", completed_at=None)
+
+                    # v0.29.5: 方案 B — 自动触发 resume,不再让用户找「继续执行」
+                    # 按钮。之前的做法要用户点两次 + 还把 status 显示成 ❌ failed,
+                    # 看起来像真失败。现在"补完即跑",出错回退到老提示。
+                    try:
+                        from pipeline.orchestrator import (
+                            PipelineAlreadyRunningError,
+                            resume_pipeline_in_background,
+                        )
+                        from pipeline.agents import init_api_config
+                        init_api_config()
+                        resume_pipeline_in_background(project_id, run_id, db)
+                        st.success(
+                            f"✅ 补充信息已追加,{_deleted} 个 stage_log 已清除。"
+                            f"已自动从 {_rerun_stages[_selected_stage]} 开始重跑——"
+                            f"页面会自动刷新显示进度。"
+                        )
+                    except PipelineAlreadyRunningError as _resume_err:
+                        # 旁路 running 冲突(罕见:刚好另一个 tab 也在启动)。
+                        # 回退到原提示让用户手动处理。
+                        st.warning(
+                            f"✅ 补充信息已追加,但自动重跑失败:{_resume_err}\n\n"
+                            f"请手动点下方「▶️ 继续执行」从 "
+                            f"{_rerun_stages[_selected_stage]} 重跑。"
+                        )
+                    except Exception as _resume_err:
+                        # 其他启动错误(API 配置 / 线程起不来等)。提示后回退。
+                        st.warning(
+                            f"✅ 补充信息已追加,但自动重跑启动失败:"
+                            f"{type(_resume_err).__name__}: {_resume_err}\n\n"
+                            f"请手动点下方「▶️ 继续执行」从 "
+                            f"{_rerun_stages[_selected_stage]} 重跑。"
+                        )
                     time.sleep(1)
                     st.rerun()
                 except Exception as _err:

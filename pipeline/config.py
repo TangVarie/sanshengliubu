@@ -2,13 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.4"
+VERSION = "v0.29.5"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "Settings 页模型配置补漏: PIPELINE_STAGES 增加 vibe_rewriter + "
-    "structural_rewriter 两行——前者老遗漏、后者是 v0.29.0 新 agent,"
-    "在 secrets.toml 里手动配了 model_overrides 也能在 Settings UI "
-    "看到对应模型路由了。"
+    "补充信息后自动 resume(方案 B): 之前『补充信息 / 部分重跑』提交后"
+    "把 status 写成 failed 当『待 resume』的中间标记,但 UI 顶部徽章"
+    "直接渲染成 ❌ failed,看起来像真失败,且用户需要额外点一次"
+    "『继续执行』。现在补完即跑——提交后自动触发 resume,success "
+    "提示改成『已自动从 X 阶段开始重跑』。启动失败(罕见)回退到"
+    "原手动提示。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
