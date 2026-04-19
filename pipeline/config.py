@@ -10,7 +10,7 @@ VERSION_NOTES = (
     "`_consumer_simulation` 的 status 字段,输出中心 UI 新增总计卡片 + "
     "per-cell 攻击/修复清单 + 每个画像对每条 cell 的反应展开面板。"
     "此前失败是静默 — stage_log 里有错但 final_system 啥都没写,UI 只能"
-    "显示"没产出"。"
+    "显示『没产出』。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
