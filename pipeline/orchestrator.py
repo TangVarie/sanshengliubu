@@ -1766,6 +1766,68 @@ class PipelineOrchestrator:
                 summary.get("weak_cells", []),
             )
 
+        # v0.29.11(方案 A):把"3 个画像全部 skip"的 cell 追加进
+        # strategic_warnings,和 consumer_simulation 对齐,走现有的
+        # UI 告警通道 + 可选的 strategic_escalation 自动升级链。
+        # 不信任 summary.weak_cells(模型有时给的是 direction_id 而非
+        # cell_id),直接从 personas[*].reactions 计算:每个 cell_id 统计
+        # 3 个画像的 action,全 skip = weak。
+        try:
+            _personas = (result or {}).get("personas") or []
+            _actions_per_cell: dict[str, list[str]] = {}
+            _reactions_per_cell: dict[str, list[str]] = {}
+            for _p in _personas:
+                _pid = _p.get("id", "?")
+                for _r in (_p.get("reactions") or []):
+                    _cid = _r.get("cell_id")
+                    if not _cid:
+                        continue
+                    _actions_per_cell.setdefault(_cid, []).append(
+                        (_r.get("action") or "").lower()
+                    )
+                    _reactions_per_cell.setdefault(_cid, []).append(
+                        f"{_pid}: {(_r.get('reaction') or '')[:60]}"
+                    )
+
+            _weak_cell_ids = [
+                _cid for _cid, _acts in _actions_per_cell.items()
+                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts)
+            ]
+
+            if _weak_cell_ids:
+                _matrix = final_system.get("prompt_matrix") or []
+                _cell_idx = {c.get("cell_id"): c for c in _matrix}
+
+                for _cid in _weak_cell_ids:
+                    _cell = _cell_idx.get(_cid, {})
+                    _sample = " | ".join(_reactions_per_cell.get(_cid, [])[:3])
+                    final_system.setdefault("strategic_warnings", []).append({
+                        "cell_id": _cid,
+                        "direction_id": _cell.get("direction_id", ""),
+                        "platform": _cell.get("platform", ""),
+                        "root_cause_explanation": (
+                            f"persona_simulator: 3 个画像全部 skip — {_sample}"
+                        ),
+                        # 和 consumer_simulation 对齐用 interest_align fail
+                        # 触发策略升级链(如果 ENABLE_STRATEGIC_ESCALATION)。
+                        "multiplier_gate": {"interest_align": "fail"},
+                        "iteration": "persona_sim",
+                        "source": "persona_simulator",
+                    })
+
+                logger.warning(
+                    "[persona_sim] %d weak cells flagged into "
+                    "strategic_warnings: %s",
+                    len(_weak_cell_ids),
+                    _weak_cell_ids,
+                )
+        except Exception:
+            # 反馈链失败不阻塞主流程,persona 结果仍然在 UI 上可见。
+            logger.exception(
+                "[persona_sim] weak-cell fan-out into strategic_warnings "
+                "failed (non-fatal)"
+            )
+
     async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
         """B: fetch user-pasted xiaohongshu post URLs via Gemini url_context.
 

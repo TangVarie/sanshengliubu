@@ -2,13 +2,17 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.10"
+VERSION = "v0.29.11"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "hotfix: google-genai SDK Part.from_text() 位置参数改关键字参数。"
-    "之前写 Part.from_text(user_message) 新版 SDK 直接 TypeError,所有"
-    "带图片的 Gemini 调用(image transcriber / reference_analyzer)全挂,"
-    "上传的图片都显示『未经过视觉转写』。改为 Part.from_text(text=...)。"
+    "画像模拟接入反馈链(方案 A): 之前 persona_simulator 只写 "
+    "_persona_reactions 给 UI 显示,不参与任何决策,跑了等于白烧 token。"
+    "现在每条 cell 扫 3 个画像的 action,全 skip 的 cell 追加进 "
+    "strategic_warnings,和 consumer_simulation 走同一条告警通道 —— "
+    "UI 红色警告 + 如果 ENABLE_STRATEGIC_ESCALATION 开启会触发 "
+    "secretariat 修订 direction 的 stop_trigger/reward_type。"
+    "不依赖 summary.weak_cells(模型有时给 direction_id 而非 cell_id),"
+    "直接从 personas[*].reactions 逐 cell 统计更稳。"
     "功能同 v0.29.9(流水线详情页可观测性大升级): (1) 新增『中间精炼』tab 展示 "
     "叙事导演 / 红蓝精炼 / 画像模拟 三个阶段,之前 UI 没位置、"
     "图标染色点进去看不到内容; (2) 网感 tab 补上 叙事结构重写 "
