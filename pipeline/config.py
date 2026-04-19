@@ -2,12 +2,13 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.3"
+VERSION = "v0.29.4"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "hotfix: v0.29.2 的 VERSION_NOTES 字面量用英文双引号嵌在 \"...\" 里"
-    "导致模块 import 失败,Streamlit 启动直接崩。改用中文书名号绕开。"
-    "阶段功能同 v0.29.2(红蓝精炼 / 画像模拟 / 消费者校验可观测性修复)。"
+    "Settings 页模型配置补漏: PIPELINE_STAGES 增加 vibe_rewriter + "
+    "structural_rewriter 两行——前者老遗漏、后者是 v0.29.0 新 agent,"
+    "在 secrets.toml 里手动配了 model_overrides 也能在 Settings UI "
+    "看到对应模型路由了。"
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
