@@ -286,15 +286,63 @@ class PipelineOrchestrator:
                 structured_brief = done["crown_prince"]
             else:
                 project = self.db.get_project(self.project_id)
+                _free_text = project.get("free_text", "") or ""
+                _brief_dict = project.get("brief") or {}
+
+                # v0.30.3 fix #1: 把截图分析文本拼进 free_text 的 [参考文件]
+                # 包装,让它受 crown_prince 的 60% 硬留存规则保护。之前
+                # _screenshot_analysis_text 只挂在 brief 字段上,crown_prince
+                # 把它当成普通 brief 字段自由概括,几百字的 Gemini 视觉转写
+                # 被压成一句话总结。
+                _shot_txt = (_brief_dict.get("_screenshot_analysis_text") or "").strip()
+                if _shot_txt and "[参考文件: gemini_screenshot_analysis]" not in _free_text:
+                    _free_text = (
+                        _free_text
+                        + "\n\n[参考文件: gemini_screenshot_analysis]\n"
+                        + _shot_txt
+                        + "\n[/参考文件]"
+                    )
+                    logger.info(
+                        "[crown_prince] 注入 _screenshot_analysis_text "
+                        "(%d 字)进 free_text 的 [参考文件] 包装",
+                        len(_shot_txt),
+                    )
+
+                # v0.30.3 fix #2: strip 流水线内部状态(如 _revision_context、
+                # strategic_warnings、_strategic_escalation_history)避免重跑时
+                # 这些上一轮的修订意见污染 crown_prince 的输入,让它误以为是
+                # 用户原始 brief 的一部分写进 raw_materials/reference_summary。
+                # 保留以下用户原始输入信号:_screenshot_analysis* /
+                # _reference_post_urls / _library_sample_analyses 等。
+                _internal_state_keys = (
+                    "_revision_context",
+                    "strategic_warnings",
+                    "_strategic_escalation_history",
+                    "_prior_strategic_warnings",
+                )
+                _clean_brief = {
+                    k: v for k, v in _brief_dict.items()
+                    if k not in _internal_state_keys
+                }
+                if len(_clean_brief) < len(_brief_dict):
+                    _stripped = sorted(
+                        set(_brief_dict.keys()) - set(_clean_brief.keys())
+                    )
+                    logger.info(
+                        "[crown_prince] stripped 内部 state 字段 %s 防止"
+                        "污染上游输入",
+                        _stripped,
+                    )
+
                 raw_input = {
-                    "free_text": project.get("free_text", ""),
-                    "brief": project.get("brief") or {},
+                    "free_text": _free_text,
+                    "brief": _clean_brief,
                 }
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
                 # Preserve original free_text on the brief so downstream stages
                 # (especially 工部) can access rich raw materials directly,
                 # not just Crown Prince's summarized fields.
-                _raw_text = project.get("free_text", "")
+                _raw_text = project.get("free_text", "") or ""
                 if _raw_text:
                     structured_brief["_raw_input_text"] = _raw_text
                 self.db.update_project(self.project_id, brief=structured_brief)

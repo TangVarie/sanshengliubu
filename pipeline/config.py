@@ -2,10 +2,17 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.2"
+VERSION = "v0.30.3"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.2 hotfix: claude-opus-4-7-thinking 在 tdyun 中转管理员后台"
+    "v0.30.3 太子输入两处修复: (1) 截图分析(Gemini Vision)文本现在"
+    "会被 orchestrator 自动包装成 [参考文件: gemini_screenshot_analysis] "
+    "块拼进 free_text,自动受 60% 硬留存规则保护——之前只挂在 brief 字段,"
+    "几百字识图被太子压成一句总结;(2) 重跑时从 brief 里 strip "
+    "_revision_context / strategic_warnings 等流水线内部 state,避免上一"
+    "轮的修订意见污染 crown_prince 输入。用户原始信号(_screenshot_analysis* "
+    "/ _reference_post_urls / _library_sample_analyses)保留。"
+    "v0.30.2 历史: tdyun 中转 claude-opus-4-7-thinking 没配价导致 400,"
     "未配置定价(BadRequestError type=new_api_error)。把所有策略阶段"
     "改用 claude-opus-4-7 base(无 -thinking 后缀)— 4.7 base 内部仍"
     "做 extended reasoning,只是不接受外部 thinking budget 控制。"
