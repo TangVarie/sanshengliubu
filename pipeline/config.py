@@ -2,10 +2,18 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.9"
+VERSION = "v0.30.10"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.9 红蓝精炼真异模型对抗 + 创意/内容阶段统一改用 4.6/3.7: "
+    "v0.30.10 hotfix: strategy_loop 每次 resume 都强制重跑的老 bug — "
+    "_strategy_loop 实际写 strategy_debate_N 那种 stage_log,但 line 383 "
+    "的 resume 检查 done[\"secretariat\"] 永远拿不到 → 每次应用修订意见"
+    "或继续执行都重跑整个策略辩论,secretariat 看到 _revision_context "
+    "可能新增 direction(D6/D7),下游 cell_planner 给新 D 生成新 cell,"
+    "用户感觉『一直在跑新的 D』。修复:从 strategy_debate_* 反推最后一个"
+    "完整 plan(取最后一个偶数 turn = secretariat 发言的轮次,plan 在 "
+    "current_plan 字段),合成 done[\"secretariat\"] 让 resume 能跳过策略层。"
+    "v0.30.9 历史: 红蓝精炼真异模型对抗 + 创意/内容阶段统一改用 4.6/3.7: "
     "(1) 红蓝精炼拆 RedBlueRed (Opus 4.6) + RedBlueBlue (Sonnet 3.7),"
     "两个独立 stage_log 串行调用,Red 找 attacks 蓝队接力修复,"
     "Red 空数组就跳过蓝队省 token;(2) 创意/内容相关阶段一律 4.6 或 "

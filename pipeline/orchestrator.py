@@ -380,6 +380,48 @@ class PipelineOrchestrator:
             await self._run_gemini_trend_scout_pre(structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
+            # v0.30.10: 修复"strategy_loop 每次 resume 都强制重跑"的老 bug。
+            # _strategy_loop 实际写的是 strategy_debate_N 那种 stage_log,
+            # 根本没有 "secretariat" 这个 key,所以 done["secretariat"] 永远
+            # 拿不到 → 每次 resume / 应用修订意见后都重跑整个策略辩论 →
+            # secretariat 看到 _revision_context 可能新增 direction(D6/D7),
+            # 下游 cell_planner 给新 D 生成新 cell,用户感觉"一直在跑新 D"。
+            #
+            # 修复:从 strategy_debate_* 反推最后一个完整 plan(取最后一个
+            # 偶数 turn = secretariat 发言的轮次,plan 在 current_plan 字段)。
+            if "secretariat" not in done:
+                _debate_turns = sorted(
+                    [
+                        (int(k.rsplit("_", 1)[-1]), k)
+                        for k in done.keys()
+                        if k.startswith("strategy_debate_")
+                        and k.rsplit("_", 1)[-1].isdigit()
+                    ],
+                    reverse=True,
+                )
+                for _turn_num, _turn_key in _debate_turns:
+                    if _turn_num % 2 != 0:
+                        continue  # 奇数轮是门下省,跳过
+                    _turn_out = done.get(_turn_key) or {}
+                    _candidate_plan = (
+                        _turn_out.get("current_plan") or _turn_out
+                    )
+                    if not isinstance(_candidate_plan, dict):
+                        continue
+                    if not _candidate_plan.get("tactical_directions"):
+                        continue
+                    done["secretariat"] = _candidate_plan
+                    logger.info(
+                        "[resume] strategy_loop reconstructed from %s "
+                        "(turn %d) — directions=%s",
+                        _turn_key, _turn_num,
+                        [
+                            d.get("direction_id")
+                            for d in _candidate_plan.get("tactical_directions", [])
+                        ],
+                    )
+                    break
+
             if "secretariat" in done:
                 logger.info("Resuming: skipping strategy loop (already completed)")
                 plan = done["secretariat"]
