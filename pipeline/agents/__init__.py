@@ -160,6 +160,26 @@ def init_api_config():
     presets = _list_claude_relay_presets()
     active_name = get_active_claude_relay_name()
 
+    # v0.30.0: DeepSeek 走官方 anthropic-compatible 端点(api.deepseek.com/
+    # anthropic),独立 secret + 独立 base_url。stage 级用 deepseek-* 模型时,
+    # _get_client_for_model 会路由到这里。和 tdyun/Claude/GPT 共存。
+    _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
+    if _ds_key:
+        _api_config["deepseek"] = {
+            "api_key": _ds_key,
+            "base_url": (
+                st.secrets.get("DEEPSEEK_BASE_URL")
+                or "https://api.deepseek.com/anthropic"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] DeepSeek anthropic-compat 端点已配置 "
+            "(base=%s)",
+            _api_config["deepseek"]["base_url"],
+        )
+    else:
+        _api_config.pop("deepseek", None)
+
     if not presets or not active_name:
         raise RuntimeError(
             "找不到可用的 Claude 接入配置：既没有 Vertex（GCP_PROJECT_ID），"
@@ -625,27 +645,74 @@ class BaseAgent:
                 )
 
     def _get_client(self) -> anthropic.Anthropic:
+        """Default client for the active relay/Vertex preset.
+        Backwards-compat shim — new code should call _get_client_for_model
+        which routes by model-name prefix (deepseek/gpt/claude → 不同
+        backend)。"""
+        return self._get_client_for_model(self.model)
+
+    def _get_client_for_model(self, model: str) -> anthropic.Anthropic:
+        """Select the right Anthropic-compatible client based on model name.
+
+        v0.30.0 引入多 vendor 路由:
+        - `deepseek-*` → DeepSeek 官方 anthropic-compat 端点(独立 base_url
+          和 api_key,从 _api_config["deepseek"] 读)
+        - `gpt-*` 或 `claude-*` → 走当前激活 preset 的 base_url(用户的
+          tdyun 中转同时支持 Claude 和 GPT,model 字符串决定 relay 内部
+          路由到哪家)
+        - Vertex 模式 → 仍然走 AnthropicVertex(只有 Claude 模型)
+
+        Vertex 不支持 deepseek/gpt:如果 vertex 模式下被要求 deepseek-*,
+        会 fallback 到独立的 DeepSeek 配置(如果配了);否则报错。
+        """
         if not _api_config:
             init_api_config()
 
+        _mlow = (model or "").lower()
+        _is_deepseek = _mlow.startswith("deepseek-")
+
+        if _is_deepseek:
+            ds_cfg = _api_config.get("deepseek")
+            if not ds_cfg or not ds_cfg.get("api_key"):
+                raise RuntimeError(
+                    f"模型 {model!r} 需要 DeepSeek backend,但 "
+                    "secrets.toml 里没配 DEEPSEEK_API_KEY。"
+                    "去 .streamlit/secrets.toml 加上 "
+                    "`DEEPSEEK_API_KEY = \"sk-...\"` 后重启。"
+                )
+            kwargs: dict[str, Any] = {
+                "api_key": ds_cfg["api_key"],
+                "base_url": ds_cfg["base_url"],
+                "timeout": 900.0,
+            }
+            return anthropic.Anthropic(**kwargs)
+
+        # Vertex 模式只能跑 Claude(GPT 也不行,Vertex AI Anthropic 是
+        # Anthropic-only endpoint)
         if _api_config.get("mode") == "vertex":
+            if _mlow.startswith("gpt-"):
+                raise RuntimeError(
+                    f"Vertex 模式不支持 GPT 模型 {model!r}。"
+                    "需要切换到 relay preset(支持多模型路由的中转)"
+                    "或在 GCP_PROJECT_ID 之外另配 ANTHROPIC_API_KEY。"
+                )
             from anthropic import AnthropicVertex
             vertex_kwargs: dict[str, Any] = {
                 "project_id": _api_config["project_id"],
                 "region": _api_config["region"],
                 "timeout": 900.0,
             }
-            # Pass explicit credentials if service account JSON was in secrets
             if "credentials" in _api_config:
                 vertex_kwargs["credentials"] = _api_config["credentials"]
             return AnthropicVertex(**vertex_kwargs)
-        else:
-            # Direct Anthropic / relay proxy
-            kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
-            if _api_config.get("base_url"):
-                kwargs["base_url"] = _api_config["base_url"]
-            kwargs["timeout"] = 900.0  # 15 min
-            return anthropic.Anthropic(**kwargs)
+
+        # Direct relay/Anthropic 模式 — Claude 和 GPT 都走这里
+        # (用户的 tdyun 中转 model 字符串路由到 Anthropic 或 OpenAI)
+        kwargs = {"api_key": _api_config["api_key"]}
+        if _api_config.get("base_url"):
+            kwargs["base_url"] = _api_config["base_url"]
+        kwargs["timeout"] = 900.0
+        return anthropic.Anthropic(**kwargs)
 
     # Agents that need strategy-level methodology (差异化/真实感/平台感知)
     _STRATEGY_STAGES = frozenset({
@@ -761,7 +828,6 @@ class BaseAgent:
         `{"type": "enabled", "budget_tokens": N}` which is the universal
         format.
         """
-        client = self._get_client()
         is_vertex = _api_config.get("mode") == "vertex"
 
         # Build content (may include image blocks)
@@ -797,6 +863,18 @@ class BaseAgent:
         # (which was set from MODELS at agent construction time).
         _model_overrides = _api_config.get("model_overrides") or {}
         effective_model = _model_overrides.get(self.stage_name) or self.model
+
+        # v0.30.0: 按模型族选 backend(Claude/GPT 走 default relay,DeepSeek
+        # 走独立官方 anthropic-compat 端点)。client 必须按 effective_model
+        # 来挑,不能用全局 _get_client。
+        client = self._get_client_for_model(effective_model)
+
+        # GPT 走 anthropic-compat relay 时,thinking JSON 参数会被 relay
+        # 转发到 OpenAI 接口,OpenAI 不认这个字段会 400。所以 GPT 系列
+        # 强制不发 thinking,即使 stage 在 THINKING_STAGES 里。DeepSeek
+        # 的 anthropic-compat 端点理论上支持 thinking,保持发送。
+        _model_low = (effective_model or "").lower()
+        _is_gpt_family = _model_low.startswith("gpt-")
 
         kwargs: dict[str, Any] = {
             "model": effective_model,
@@ -844,7 +922,13 @@ class BaseAgent:
             or "claude-opus-4-7" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
-        if self._use_thinking and not _preset_uses_suffix:
+        # v0.30.0: GPT 模型即使 stage 在 THINKING_STAGES 里也强制不发
+        # thinking 参数(relay 转给 OpenAI 接口会 400)。代码上层把
+        # _use_thinking 留着用于日志标签的"我们打算 think 但 GPT 不接",
+        # 但 kwargs 里啥都不加。
+        if self._use_thinking and _is_gpt_family:
+            pass  # 跳过 thinking 注入,后面 thinking_fired 会自然记录 ✗
+        elif self._use_thinking and not _preset_uses_suffix:
             if _is_adaptive_thinking_family and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:

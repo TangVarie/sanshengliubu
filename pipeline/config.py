@@ -2,10 +2,18 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.29.12"
+VERSION = "v0.30.0"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "吏部 ValueError JSON extraction 修复: (1) STAGE_MAX_TOKENS["
+    "v0.30.0 多 vendor 路由 + 高质量模型预设(premium_multi_vendor): "
+    "(1) DeepSeek 走官方 anthropic-compat 端点(api.deepseek.com/anthropic),"
+    "新增 DEEPSEEK_API_KEY secret + per-model 路由器 _get_client_for_model;"
+    "(2) GPT 走 tdyun 中转的 anthropic-compat 路径(model='gpt-5.5'),"
+    "thinking 参数对 GPT 强制屏蔽(避免 OpenAI 后端 400);"
+    "(3) 各 stage 模型映射写入 PREMIUM_MULTI_VENDOR_MAP(代码层),"
+    "user 在 secrets.toml 删 model_overrides 即可启用;"
+    "(4) 中书省 ↔ 门下省 故意异厂家(Claude vs GPT)避免辩论同色彩。"
+    "v0.29.12 历史: (1) STAGE_MAX_TOKENS["
     "ministry_personnel] 20K→32K,多画像 × authenticity_card 字段长容易"
     "撞上限导致响应截断;(2) _try_repair_truncated_json 的 "
     "cut_points[-300:] 硬限放开——13K+ 响应最后 300 个 cut point 常常"
@@ -83,7 +91,49 @@ SONNET_MODEL = "claude-sonnet-4-6"
 #   ...
 SONNET_CONTENT_MODEL = "claude-sonnet-3-7"
 
-MODEL_PRESET = "content_sonnet"
+# v0.30.0: 在代码层面直接锁定每个 stage 用哪个模型(高质量配置),用户
+# 不必再在 secrets.toml 里维护 model_overrides。可选 preset:
+#
+#   premium_multi_vendor(v0.30.0 默认,推荐) — 不限成本求最优组合,
+#     - 推理 / 长上下文 / 中文锐度都拉满
+#     - 中书省 vs 门下省 故意用不同厂家(Claude vs GPT)避免辩论同色彩
+#     - 内容生成保留 Sonnet 3.7(短中文网感实战最强)
+#     - 兵部 / chancellery 用 GPT 提供异色彩对抗
+#     - 需要 secrets.toml 同时配 Claude 中转 + (可选)DEEPSEEK_API_KEY
+#
+#   content_sonnet(v0.29.x 历史默认) — 保留兼容
+#   all_opus / all_sonnet — 单厂家全跑,降级方案
+MODEL_PRESET = "premium_multi_vendor"
+
+# v0.30.0: 各阶段精确模型映射 — 写在代码里防止 secrets.toml 误覆盖。
+# 用户实际中转里的模型 ID,要和 tdyun-style anthropic-compat relay 对齐。
+# 注:thinking 模式由模型名后缀 `-thinking` 控制(tdyun 约定),不是
+# 通过 thinking JSON 参数传(老路径)。
+PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
+    # ── 策略 / 推理核心 — Opus 4.7 thinking ──
+    "crown_prince": "claude-opus-4-7-thinking",          # 长上下文 + 文件留存
+    "secretariat": "claude-opus-4-7-thinking",            # 中书省发言,锐利 insight
+    "chancellery_final": "claude-opus-4-7-thinking",      # 终审 holistic 判断
+    "ministry_works": "claude-opus-4-7-thinking",         # 工部架构,搭整脊柱
+    "narrative_director": "claude-opus-4-7-thinking",     # 跨 cell 一致性诊断
+    "vibe_critic": "claude-opus-4-7-thinking",            # judge 必须锐
+    "structural_rewriter": "claude-opus-4-7-thinking",    # 身份/缺口手术,要推理
+    # ── 异厂家辩论(Claude vs GPT)— 中书省 ↔ 门下省 ──
+    "chancellery": "gpt-5.5",                             # 门下省,异色彩 critic
+    "ministry_war": "gpt-5.5",                            # 兵部,刁钻竞争设计
+    # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
+    "dispatcher": "claude-opus-4-6",
+    "ministry_personnel": "claude-opus-4-7",              # 画像创作偏 Opus 4.7
+    "ministry_revenue": "claude-opus-4-6",
+    "ministry_rites": "claude-opus-4-6",
+    "ministry_justice": "claude-opus-4-6-thinking",       # 合规要严谨
+    "ministry_works_cell_planner": "claude-opus-4-6",
+    # ── 内容生成 — Sonnet 3.7(短中文网感实战最佳) ──
+    "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",
+    "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",
+    "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",
+    "persona_simulator": "claude-3-7-sonnet-20250219-thinking",
+}
 
 _STAGE_ROLES = {
     # Strategy / review: needs reasoning depth
@@ -149,6 +199,14 @@ def _resolve_models(preset: str) -> dict[str, str]:
         return {
             k: (SONNET_CONTENT_MODEL if role == "content" else OPUS_MODEL)
             for k, role in _STAGE_ROLES.items()
+        }
+    if preset == "premium_multi_vendor":
+        # v0.30.0:每个 stage 都从 PREMIUM_MULTI_VENDOR_MAP 直接拿模型名;
+        # 没在 map 里的 stage(罕见,通常是新增的 stage 还没补)fallback 到
+        # OPUS_MODEL,既保证能跑也提示要补。
+        return {
+            k: PREMIUM_MULTI_VENDOR_MAP.get(k, OPUS_MODEL)
+            for k in _STAGE_ROLES
         }
     # Default / fallback: all_opus
     return {k: OPUS_MODEL for k in _STAGE_ROLES}
