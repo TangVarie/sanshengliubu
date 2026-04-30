@@ -76,7 +76,11 @@ from pipeline.agents.ministries.works import (
     StructuralRewriter,
 )
 from pipeline.agents.narrative_director import NarrativeDirector
-from pipeline.agents.red_blue_refiner import RedBlueRefiner
+from pipeline.agents.red_blue_refiner import (
+    RedBlueRefiner,  # legacy
+    RedBlueRed,
+    RedBlueBlue,
+)
 from pipeline.agents.persona_simulator import PersonaSimulator, PersonaSimulatorAlt
 
 logger = logging.getLogger(__name__)
@@ -113,7 +117,10 @@ class PipelineOrchestrator:
         # 未启用 flag 时对象还是创建(零成本),但 _run_vibe_loop 不会调它。
         self.structural_rewriter = StructuralRewriter()
         self.narrative_director = NarrativeDirector()
-        self.red_blue_refiner = RedBlueRefiner()
+        self.red_blue_refiner = RedBlueRefiner()  # legacy(v0.30.9 起不再调用)
+        # v0.30.9: 真对抗 — 红队 / 蓝队 用不同模型独立跑
+        self.red_blue_red = RedBlueRed()
+        self.red_blue_blue = RedBlueBlue()
         self.persona_simulator = PersonaSimulator()
         # v0.30.8: 异厂家画像副本(DeepSeek),和主 PersonaSimulator 并行跑,
         # 提供不同 distribution 的画像反应。如果 DEEPSEEK_API_KEY 没配,
@@ -1701,33 +1708,91 @@ class PipelineOrchestrator:
         semaphore = asyncio.Semaphore(RED_BLUE_CONCURRENCY)
 
         async def refine_one(cell: dict) -> tuple[dict | None, str | None]:
-            """Return (result_dict_or_None, error_str_or_None)."""
+            """v0.30.9: 真异模型对抗(Red=Opus 4.6 → Blue=Sonnet 3.7)。
+
+            Two-step:
+              1. 红队跑(找 attacks)
+              2. attacks 非空才调蓝队(给 fixes + 修复 demo);为空跳过省 token
+
+            Return (result_dict_or_None, error_str_or_None)。result 字段保持
+            和老版兼容: attacks / fixes / refined_demo_output /
+            refined_system_prompt / changes_summary。
+            """
             cid = cell.get("cell_id", "?")
             async with semaphore:
+                _common_input = {
+                    "cell_id": cid,
+                    "direction_name": cell.get("direction_name", ""),
+                    "platform": cell.get("platform", ""),
+                    "system_prompt": cell.get("system_prompt", ""),
+                    "demo_output": cell.get("demo_output", ""),
+                    "paradigm": cell.get("paradigm", "A_emotional_hook"),
+                }
+
+                # Step 1: 红队找 attacks
                 try:
-                    # v0.30.6 fix M3: 传完整 system_prompt 而非前 500 字。
-                    # red_blue_refiner.md 第 4 条说"保护合规条款 / 关键词 /
-                    # 人设设定不许攻击",但合规块、banlist、关键词列表通常
-                    # 在 system_prompt 的中后段(2000+ 字处),前 500 字 Red
-                    # Team 看不到 → "fixes" 可能误改合规词。
-                    result = await self.red_blue_refiner.run(
-                        {
-                            "cell_id": cid,
-                            "direction_name": cell.get("direction_name", ""),
-                            "platform": cell.get("platform", ""),
-                            "system_prompt": cell.get("system_prompt", ""),
-                            "demo_output": cell.get("demo_output", ""),
-                            "paradigm": cell.get("paradigm", "A_emotional_hook"),
-                        },
-                        self.run_id,
-                        self.db,
+                    red_result = await self.red_blue_red.run(
+                        _common_input, self.run_id, self.db,
                     )
-                    return result, None
                 except Exception as e:
-                    logger.warning(
-                        "[red_blue] cell %s failed: %r", cid, e
+                    logger.warning("[red_blue] cell %s 红队失败: %r", cid, e)
+                    return None, f"red:{type(e).__name__}: {e}"
+
+                attacks = red_result.get("attacks") or []
+                red_summary = red_result.get("_red_summary", "")
+
+                # Red Team 找不到问题 → 直接 unchanged 退出,省蓝队那次 API 调用
+                if not attacks:
+                    return ({
+                        "cell_id": cid,
+                        "attacks": [],
+                        "fixes": [],
+                        "refined_demo_output": "",
+                        "refined_system_prompt": "",
+                        "changes_summary": (
+                            f"Red Team 检查通过,无需精修。{red_summary}"
+                        ),
+                        "_red_summary": red_summary,
+                    }, None)
+
+                # Step 2: 蓝队接 attacks 给 fixes
+                try:
+                    blue_input = {
+                        **_common_input,
+                        "attacks": attacks,
+                        "_red_summary": red_summary,
+                    }
+                    blue_result = await self.red_blue_blue.run(
+                        blue_input, self.run_id, self.db,
                     )
-                    return None, f"{type(e).__name__}: {e}"
+                except Exception as e:
+                    logger.warning("[red_blue] cell %s 蓝队失败: %r", cid, e)
+                    # Red 跑通了但 Blue 挂了。返回 Red 的 attacks 让 UI 能看到,
+                    # 但不修改 demo。
+                    return ({
+                        "cell_id": cid,
+                        "attacks": attacks,
+                        "fixes": [],
+                        "refined_demo_output": "",
+                        "refined_system_prompt": "",
+                        "changes_summary": (
+                            f"红队找到 {len(attacks)} 个问题但蓝队修复失败: "
+                            f"{type(e).__name__}: {e}"
+                        ),
+                        "_red_summary": red_summary,
+                    }, None)
+
+                # 合并红蓝输出,保持和老 RedBlueRefiner 同样的字段结构
+                merged = {
+                    "cell_id": cid,
+                    "attacks": attacks,
+                    "fixes": blue_result.get("fixes") or [],
+                    "refined_demo_output": blue_result.get("refined_demo_output", ""),
+                    "refined_system_prompt": blue_result.get("refined_system_prompt", ""),
+                    "changes_summary": blue_result.get("changes_summary", ""),
+                    "_red_summary": red_summary,
+                }
+                return merged, None
 
         results = await asyncio.gather(
             *[refine_one(c) for c in prompt_cells]

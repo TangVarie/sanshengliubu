@@ -2,10 +2,18 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.8"
+VERSION = "v0.30.9"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.8 启用 DeepSeek + 画像模拟双模型并跑: persona_simulator_alt "
+    "v0.30.9 红蓝精炼真异模型对抗 + 创意/内容阶段统一改用 4.6/3.7: "
+    "(1) 红蓝精炼拆 RedBlueRed (Opus 4.6) + RedBlueBlue (Sonnet 3.7),"
+    "两个独立 stage_log 串行调用,Red 找 attacks 蓝队接力修复,"
+    "Red 空数组就跳过蓝队省 token;(2) 创意/内容相关阶段一律 4.6 或 "
+    "3.7 — vibe_critic / narrative_director / structural_rewriter / "
+    "ministry_personnel 从 Opus 4.7 降到 Opus 4.6(4.7 太精致,中文短"
+    "社交内容反而失真)。Opus 4.7 仅留给纯策略推理(crown_prince / "
+    "secretariat / chancellery_final / ministry_works)。"
+    "v0.30.8 历史: 启用 DeepSeek + 画像模拟双模型并跑: persona_simulator_alt "
     "新 stage(deepseek-v4-pro)和主 persona_simulator(Sonnet 3.7)并行,"
     "orchestrator asyncio.gather 启动两个 agent → 合并 personas 数组,"
     "每条画像加 _source 字段(claude/deepseek)。同 id 自动改名避免冲突。"
@@ -168,37 +176,41 @@ MODEL_PRESET = "premium_multi_vendor"
 # 注:thinking 模式由模型名后缀 `-thinking` 控制(tdyun 约定),不是
 # 通过 thinking JSON 参数传(老路径)。
 PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
-    # ── 策略 / 推理核心 ──
-    # v0.30.2: 换用 claude-opus-4-7(无 -thinking 后缀)。tdyun 中转上
-    # `claude-opus-4-7-thinking` 还没被管理员配置定价(BadRequestError
-    # type=new_api_error: 模型价格尚未配置)。Opus 4.7 base 内部仍然做
-    # extended reasoning,只是不接受外部 thinking budget 控制——足够用。
-    "crown_prince": "claude-opus-4-7",
-    "secretariat": "claude-opus-4-7",
-    "chancellery_final": "claude-opus-4-7",
-    "ministry_works": "claude-opus-4-7",
-    "narrative_director": "claude-opus-4-7",
-    "vibe_critic": "claude-opus-4-7",
-    "structural_rewriter": "claude-opus-4-7",
-    # ── 异厂家辩论(Claude vs GPT)— 中书省 ↔ 门下省 ──
-    "chancellery": "gpt-5.5",                             # 门下省,异色彩 critic
-    "ministry_war": "gpt-5.5",                            # 兵部,刁钻竞争设计
-    # ── 结构化派发 / 五部 ──
+    # ── 策略 / 推理核心(深推理,Opus 4.7)──
+    # v0.30.2: 不带 -thinking 后缀,tdyun 上 -thinking 没定价。Opus 4.7
+    # base 自带内部 reasoning。
+    "crown_prince": "claude-opus-4-7",                    # 太子(整理 + 索引)
+    "secretariat": "claude-opus-4-7",                     # 中书省(策略发言)
+    "chancellery_final": "claude-opus-4-7",               # 终审(holistic 把关)
+    "ministry_works": "claude-opus-4-7",                  # 工部架构(整脊柱)
+    # ── 异厂家辩论(Claude vs GPT)──
+    "chancellery": "gpt-5.5",                             # 门下省(critic)
+    "ministry_war": "gpt-5.5",                            # 兵部(刁钻竞争)
+    # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
     "dispatcher": "claude-opus-4-6",
-    "ministry_personnel": "claude-opus-4-7",              # 画像创作偏 Opus 4.7
     "ministry_revenue": "claude-opus-4-6",
     "ministry_rites": "claude-opus-4-6",
-    "ministry_justice": "claude-opus-4-6-thinking",       # 4-6-thinking 已定价可用
+    "ministry_justice": "claude-opus-4-6-thinking",       # 合规要严
     "ministry_works_cell_planner": "claude-opus-4-6",
-    # ── 内容生成 — Sonnet 3.7 thinking(短中文网感实战最佳) ──
-    "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",
-    "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",
-    "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",
-    # ── 画像模拟双模型并跑(v0.30.8) ──
-    # Claude 系扮演 P_core / P_edge(目标用户精细反应,Sonnet 3.7 中文细腻)
-    "persona_simulator": "claude-3-7-sonnet-20250219-thinking",
-    # DeepSeek 系扮演 P_anti / 破圈视角(异 distribution,中文最强,扮演更草根)
-    "persona_simulator_alt": "deepseek-v4-pro",
+    # ── 创意 / 内容相关阶段(v0.30.9 user 规定):一律 4.6 或 3.7 ──
+    # Opus 4.7 太"精致 / 端正",对短中文社交内容反而失真。4.6 内容感稍松,
+    # Sonnet 3.7 写作语感最强但缺反思深度。按"判断 vs 写作"分:
+    "ministry_personnel": "claude-opus-4-6",              # 画像创作(创意)
+    "narrative_director": "claude-opus-4-6",              # 跨 cell 一致性诊断(创意判断)
+    "vibe_critic": "claude-opus-4-6",                     # 网感复检(judge)
+    "structural_rewriter": "claude-opus-4-6",             # 身份/缺口手术(content 重写)
+    "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",  # 内容写作
+    "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",           # 内容重写
+    # ── 红蓝精炼真对抗(v0.30.9):异模型 Red vs Blue ──
+    # 之前 Red 和 Blue 都用 Sonnet 3.7,同模型同盲区不构成真对抗。现在拆:
+    # Red Team 用 Opus 4.6(异 distribution,善找 AI 腔指纹和结构问题)
+    # Blue Team 用 Sonnet 3.7(写作语感,做最小修复保留人味)
+    "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",  # legacy 兼容,实际不用
+    "red_blue_red": "claude-opus-4-6",                    # 攻方
+    "red_blue_blue": "claude-3-7-sonnet-20250219-thinking",  # 守方
+    # ── 画像模拟双 backend(v0.30.8) ──
+    "persona_simulator": "claude-3-7-sonnet-20250219-thinking",  # Claude 系
+    "persona_simulator_alt": "deepseek-v4-pro",           # DeepSeek 异厂家
 }
 
 _STAGE_ROLES = {
@@ -220,7 +232,9 @@ _STAGE_ROLES = {
     "narrative_director": "strategy",
     # Content generation + taste judgment: voice quality matters
     "ministry_works_builder": "content",
-    "red_blue_refiner": "content",     # needs natural language feel
+    "red_blue_refiner": "content",     # legacy(v0.30.9 拆分后基本不用)
+    "red_blue_red": "content",          # v0.30.9: 红蓝攻方
+    "red_blue_blue": "content",         # v0.30.9: 红蓝守方
     "persona_simulator": "content",    # simulates real humans (Claude 系)
     "persona_simulator_alt": "content",  # v0.30.8: DeepSeek 异厂家画像
     "vibe_critic": "content",
@@ -356,6 +370,8 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_personnel": 32000,
     "ministry_revenue": 20000,
     "persona_simulator_alt": 20000,  # v0.30.8: 和主 persona_simulator 同档
+    "red_blue_red": 16000,             # v0.30.9: 攻方输出 attacks 列表,不需要太大
+    "red_blue_blue": 24000,            # v0.30.9: 守方输出 fixes + refined demo + system_prompt
     "ministry_rites": 20000,
     "ministry_war": 20000,
     "ministry_justice": 20000,
@@ -597,7 +613,8 @@ PIPELINE_STAGES = [
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
     ("narrative_director", "叙事导演", "🎬"),
-    ("red_blue_refiner", "红蓝精炼", "⚔️"),
+    ("red_blue_red", "红队·攻", "🔴"),
+    ("red_blue_blue", "蓝队·守", "🔵"),
     ("persona_simulator", "画像模拟·Claude", "👥"),
     ("persona_simulator_alt", "画像模拟·DeepSeek", "🔮"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
