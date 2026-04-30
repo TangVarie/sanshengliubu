@@ -2,10 +2,17 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.6"
+VERSION = "v0.30.7"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.6 Commit B — 1 个 HIGH + 3 个 MEDIUM 流程修复(audit 后续):"
+    "v0.30.7 GPT 改走 vectorengine.ai 的 OpenAI-compat 接口: tdyun "
+    "anthropic-compat 中转不支持 GPT 模型,新增独立 OpenAI SDK 后端 "
+    "(api.vectorengine.ai/v1/chat/completions)。secrets.toml 加 "
+    "VECTORENGINE_API_KEY,_call_claude 检测到 gpt-* 自动 dispatch 到 "
+    "_call_openai_chat helper,返回元组同 _call_claude,上层无需分支。"
+    "兼容 OpenAI / o1 / gpt-5 系的 max_completion_tokens 自动切换。"
+    "requirements.txt 加 openai>=1.40。"
+    "v0.30.6 历史: Commit B — 1 个 HIGH + 3 个 MEDIUM 流程修复(audit 后续):"
     "(M3)红蓝精炼传完整 system_prompt 而非前 500 字,Red Team 现在能"
     "看到合规块/关键词避免误改。(M4)画像模拟和消费者模拟按 cell.platform "
     "评判,多平台 brief 不再用 xhs 画像评 douyin cell;persona_simulator.md"

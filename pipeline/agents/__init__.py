@@ -180,6 +180,26 @@ def init_api_config():
     else:
         _api_config.pop("deepseek", None)
 
+    # v0.30.7: GPT 走 vectorengine.ai 的 OpenAI 兼容 chat/completions 接口
+    # (tdyun 中转的 anthropic-compat 转发不支持 gpt 模型)。需要单独的
+    # OpenAI SDK + 独立 base_url + 独立 api_key,和 Claude/DeepSeek 共存。
+    _ve_key = (st.secrets.get("VECTORENGINE_API_KEY") or "").strip()
+    if _ve_key:
+        _api_config["vectorengine"] = {
+            "api_key": _ve_key,
+            "base_url": (
+                st.secrets.get("VECTORENGINE_BASE_URL")
+                or "https://api.vectorengine.ai/v1"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] VectorEngine OpenAI-compat 端点已配置 "
+            "(base=%s),GPT 系列将通过这里调用",
+            _api_config["vectorengine"]["base_url"],
+        )
+    else:
+        _api_config.pop("vectorengine", None)
+
     if not presets or not active_name:
         raise RuntimeError(
             "找不到可用的 Claude 接入配置：既没有 Vertex（GCP_PROJECT_ID），"
@@ -803,6 +823,96 @@ class BaseAgent:
 
         return blocks if blocks else text
 
+    def _call_openai_chat(
+        self,
+        system_prompt: str,
+        user_message: str,
+        effective_model: str,
+        max_tokens: int,
+    ) -> tuple[str, int, int, int, int, bool]:
+        """OpenAI-compat chat/completions backend(v0.30.7 起走 vectorengine.ai)。
+
+        GPT 系列模型不能通过 anthropic SDK 调用——tdyun-style anthropic-compat
+        中转转发不过去。所以单独走 OpenAI SDK + vectorengine 端点。
+
+        返回和 _call_claude 同样的 6-tuple,让上层调度逻辑不用分支处理:
+        (text, input_tokens, output_tokens, cache_read, cache_creation,
+        thinking_fired)。GPT 没有 anthropic 风格的 thinking 块,
+        thinking_fired 永远是 False。OpenAI 的 prompt caching 走 usage.
+        prompt_tokens_details.cached_tokens,映射到 cache_read。
+
+        失败模式:
+        - vectorengine 没配 → RuntimeError 提示去 secrets.toml 加 key
+        - openai SDK 未安装 → ImportError 一样,但 requirements.txt 已经
+          固定了 openai>=1.40 所以正常环境不会触发
+        """
+        ve_cfg = _api_config.get("vectorengine") if _api_config else None
+        if not ve_cfg or not ve_cfg.get("api_key"):
+            raise RuntimeError(
+                f"模型 {effective_model!r} 需要 OpenAI-compat backend "
+                "(vectorengine.ai),但 secrets.toml 里没配 "
+                "VECTORENGINE_API_KEY。去 .streamlit/secrets.toml 加上 "
+                "`VECTORENGINE_API_KEY = \"sk-...\"` 后重启,或者把这个 "
+                "stage 的模型改回 Claude 系列。"
+            )
+
+        import openai as _openai_sdk  # 延迟 import,Streamlit 未配置时不触发
+
+        client = _openai_sdk.OpenAI(
+            api_key=ve_cfg["api_key"],
+            base_url=ve_cfg["base_url"],
+            timeout=900.0,
+        )
+
+        # 把 anthropic 风格的 system + messages 转成 OpenAI ChatCompletion
+        # messages 格式:第一条是 role=system,后面是 user/assistant。
+        oai_messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # 大多数 OpenAI-compat 中转支持 max_tokens(传统)和 max_completion_tokens
+        # (新版 reasoning 模型用)。先传 max_tokens,如 vectorengine 在
+        # gpt-5/gpt-5.5 时报 400 再切换 max_completion_tokens。
+        oai_kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": oai_messages,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        try:
+            response = client.chat.completions.create(**oai_kwargs)
+        except _openai_sdk.BadRequestError as e:
+            # gpt-5 / o1 / o3 / o4 系列不接受 max_tokens,要 max_completion_tokens
+            _err_msg = str(e).lower()
+            if "max_tokens" in _err_msg or "max_completion_tokens" in _err_msg:
+                oai_kwargs.pop("max_tokens", None)
+                oai_kwargs["max_completion_tokens"] = max_tokens
+                response = client.chat.completions.create(**oai_kwargs)
+            else:
+                raise
+
+        # 解析返回
+        text = ""
+        if response.choices:
+            _msg = response.choices[0].message
+            text = (_msg.content or "").strip()
+
+        # Token 统计 + cache 信息
+        usage = response.usage
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        cache_read = 0
+        try:
+            _ptd = getattr(usage, "prompt_tokens_details", None)
+            if _ptd is not None:
+                cache_read = int(getattr(_ptd, "cached_tokens", 0) or 0)
+        except Exception:
+            pass
+
+        return (text, input_tokens, output_tokens, cache_read, 0, False)
+
     def _call_claude(
         self, system_prompt: str, user_message: str
     ) -> tuple[str, int, int, int, int, bool]:
@@ -875,6 +985,18 @@ class BaseAgent:
         # 的 anthropic-compat 端点理论上支持 thinking,保持发送。
         _model_low = (effective_model or "").lower()
         _is_gpt_family = _model_low.startswith("gpt-")
+
+        # v0.30.7: GPT 走 vectorengine 的 OpenAI-compat chat/completions 接口,
+        # 不能用 anthropic SDK。提前 dispatch 到独立 helper,返回相同的
+        # (text, in_tok, out_tok, cache_read, cache_creation, thinking_fired)
+        # 元组,让上层 run() 不需要分支处理。
+        if _is_gpt_family:
+            return self._call_openai_chat(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                effective_model=effective_model,
+                max_tokens=self.max_tokens,
+            )
 
         kwargs: dict[str, Any] = {
             "model": effective_model,

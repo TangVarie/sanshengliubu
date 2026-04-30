@@ -13,3 +13,7 @@ supabase>=2.4.0,<3.0.0
 pydantic>=2.6.0,<3.0.0
 PyPDF2>=3.0.0,<4.0.0
 python-docx>=1.0.0,<2.0.0
+# OpenAI-compatible SDK — GPT (走 vectorengine.ai 中转) 用,DeepSeek
+# 只走 anthropic-compat 不需要这个。Streamlit Cloud / 本地 pip install
+# 都会装上。
+openai>=1.40.0,<2.0.0
