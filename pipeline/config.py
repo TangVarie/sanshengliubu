@@ -2,10 +2,17 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.3"
+VERSION = "v0.30.4"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.3 太子输入两处修复: (1) 截图分析(Gemini Vision)文本现在"
+    "v0.30.4 架构层修复: 太子不再是单点瓶颈。"
+    "orchestrator 把用户原始 free_text 挂到 brief._user_raw_input,"
+    "所有下游 agent 都能直接读原文(之前的 _raw_input_text 是 dead drop,"
+    "零 prompt 引用)。foundation_common.md 加『用户原始输入访问协议』,"
+    "统一指引下游何时翻原文 vs 信任太子。crown_prince.md 强化角色边界:"
+    "保管员 + 索引制作者,不是策略分析师——产品定位/目标人群/竞品策略"
+    "都是中书省/六部的活,太子只做结构化字段填充 + verbatim 保留素材。"
+    "v0.30.3 历史: 太子输入两处修复: (1) 截图分析(Gemini Vision)文本现在"
     "会被 orchestrator 自动包装成 [参考文件: gemini_screenshot_analysis] "
     "块拼进 free_text,自动受 60% 硬留存规则保护——之前只挂在 brief 字段,"
     "几百字识图被太子压成一句总结;(2) 重跑时从 brief 里 strip "

@@ -339,12 +339,17 @@ class PipelineOrchestrator:
                     "brief": _clean_brief,
                 }
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
-                # Preserve original free_text on the brief so downstream stages
-                # (especially 工部) can access rich raw materials directly,
-                # not just Crown Prince's summarized fields.
-                _raw_text = project.get("free_text", "") or ""
-                if _raw_text:
-                    structured_brief["_raw_input_text"] = _raw_text
+                # v0.30.4 升级: 把用户原始 free_text(含 [参考文件:] 包装、
+                # 截图分析等)透传给所有下游 agent,作为太子整理结果的"原始档案"。
+                # foundation_common.md 的"用户原始输入访问协议"统一指引下游
+                # 何时翻原文。两个字段:
+                #   _user_raw_input  — 主字段(本版起)
+                #   _raw_input_text  — 老字段名,保留兼容(老 prompt 可能引用)
+                # 注意:_free_text 是已经包了 _screenshot_analysis_text 的版本,
+                # 比 project.free_text 更全。
+                if _free_text:
+                    structured_brief["_user_raw_input"] = _free_text
+                    structured_brief["_raw_input_text"] = _free_text  # 兼容
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             # 1a. User-pasted reference posts (B) — if page 2 recorded
