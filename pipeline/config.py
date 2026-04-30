@@ -2,10 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.1"
+VERSION = "v0.30.2"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.1 输出中心简化 + 修订按钮智能分流提示: 输出中心顶部新增"
+    "v0.30.2 hotfix: claude-opus-4-7-thinking 在 tdyun 中转管理员后台"
+    "未配置定价(BadRequestError type=new_api_error)。把所有策略阶段"
+    "改用 claude-opus-4-7 base(无 -thinking 后缀)— 4.7 base 内部仍"
+    "做 extended reasoning,只是不接受外部 thinking budget 控制。"
+    "刑部保留 claude-opus-4-6-thinking(已定价)。"
+    "v0.30.1 历史: 输出中心简化 + 修订按钮智能分流提示: 输出中心顶部新增"
     "『成品提示词清单』主区,直接列 N 个不重复 prompt 的完整内容 + "
     "示例文稿(代替原来要翻平台 tab + 多层 expander 的繁琐结构)。"
     "应用修订按钮文字按实际行为校正:扫 mandatory_revisions 文本里的 "
@@ -115,25 +120,29 @@ MODEL_PRESET = "premium_multi_vendor"
 # 注:thinking 模式由模型名后缀 `-thinking` 控制(tdyun 约定),不是
 # 通过 thinking JSON 参数传(老路径)。
 PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
-    # ── 策略 / 推理核心 — Opus 4.7 thinking ──
-    "crown_prince": "claude-opus-4-7-thinking",          # 长上下文 + 文件留存
-    "secretariat": "claude-opus-4-7-thinking",            # 中书省发言,锐利 insight
-    "chancellery_final": "claude-opus-4-7-thinking",      # 终审 holistic 判断
-    "ministry_works": "claude-opus-4-7-thinking",         # 工部架构,搭整脊柱
-    "narrative_director": "claude-opus-4-7-thinking",     # 跨 cell 一致性诊断
-    "vibe_critic": "claude-opus-4-7-thinking",            # judge 必须锐
-    "structural_rewriter": "claude-opus-4-7-thinking",    # 身份/缺口手术,要推理
+    # ── 策略 / 推理核心 ──
+    # v0.30.2: 换用 claude-opus-4-7(无 -thinking 后缀)。tdyun 中转上
+    # `claude-opus-4-7-thinking` 还没被管理员配置定价(BadRequestError
+    # type=new_api_error: 模型价格尚未配置)。Opus 4.7 base 内部仍然做
+    # extended reasoning,只是不接受外部 thinking budget 控制——足够用。
+    "crown_prince": "claude-opus-4-7",
+    "secretariat": "claude-opus-4-7",
+    "chancellery_final": "claude-opus-4-7",
+    "ministry_works": "claude-opus-4-7",
+    "narrative_director": "claude-opus-4-7",
+    "vibe_critic": "claude-opus-4-7",
+    "structural_rewriter": "claude-opus-4-7",
     # ── 异厂家辩论(Claude vs GPT)— 中书省 ↔ 门下省 ──
     "chancellery": "gpt-5.5",                             # 门下省,异色彩 critic
     "ministry_war": "gpt-5.5",                            # 兵部,刁钻竞争设计
-    # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
+    # ── 结构化派发 / 五部 ──
     "dispatcher": "claude-opus-4-6",
     "ministry_personnel": "claude-opus-4-7",              # 画像创作偏 Opus 4.7
     "ministry_revenue": "claude-opus-4-6",
     "ministry_rites": "claude-opus-4-6",
-    "ministry_justice": "claude-opus-4-6-thinking",       # 合规要严谨
+    "ministry_justice": "claude-opus-4-6-thinking",       # 4-6-thinking 已定价可用
     "ministry_works_cell_planner": "claude-opus-4-6",
-    # ── 内容生成 — Sonnet 3.7(短中文网感实战最佳) ──
+    # ── 内容生成 — Sonnet 3.7 thinking(短中文网感实战最佳) ──
     "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",
     "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",
     "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",
