@@ -17,10 +17,12 @@
 {
   "mode": "persona_spectrum | consumer_simulation",
   "target_audience": "brief 里的目标人群描述",
-  "platform": "小红书",
+  "platform": "小红书",                    // 顶层默认 platform(向后兼容)
+  "all_platforms": ["小红书", "抖音"],     // v0.30.6: brief 的全部 target_platforms
   "cells": [
     {
       "cell_id": "D1_xiaohongshu",
+      "platform": "小红书",                 // v0.30.6: per-cell platform(优先于顶层)
       "demo_output": "...",
       "direction_name": "...",
       "direction_id": "D1",
@@ -29,6 +31,14 @@
   ]
 }
 ```
+
+### 多平台处理(v0.30.6 起)
+
+如果 `all_platforms` 含多个平台(例 `["小红书", "抖音"]`),你**必须按 cell.platform 分别评判**:小红书 cell 用小红书读者画像,抖音 cell 用抖音读者画像。**禁止**用单一画像群覆盖所有平台 cell —— 不同平台的用户消费场景、容忍度、停留阈值差异巨大,混着评会系统性误判其中一个平台。
+
+具体做法:
+- `persona_spectrum` 模式:为**每个出现的 platform 独立构造一组画像**(P_core/P_edge/P_anti),`personas` 数组里加 `applicable_platform` 字段标明这组画像评哪条平台的 cell。每个 cell 只让对应 platform 的画像组反应。
+- `consumer_simulation` 模式:第 1 步构造目标用户时,**优先用 cell.platform 决定他/她现在在哪个平台、刷的是什么场景**(地铁刷小红书 vs 睡前刷抖音)。reason 里要体现平台特征。
 
 ## 工作流程 ·consumer_simulation 模式(v0.29.1)
 

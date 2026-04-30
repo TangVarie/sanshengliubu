@@ -2,10 +2,20 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.5"
+VERSION = "v0.30.6"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.5 Commit A — 4 处 dead drop 注入修复(audit HIGH 级):"
+    "v0.30.6 Commit B — 1 个 HIGH + 3 个 MEDIUM 流程修复(audit 后续):"
+    "(M3)红蓝精炼传完整 system_prompt 而非前 500 字,Red Team 现在能"
+    "看到合规块/关键词避免误改。(M4)画像模拟和消费者模拟按 cell.platform "
+    "评判,多平台 brief 不再用 xhs 画像评 douyin cell;persona_simulator.md"
+    "新加多平台处理段。(M1)Gemini 结构审 hint 不再被 critic-pass 吃掉:"
+    "critic 让该 cell 过但 missing_items 非空时,强制 force-fail "
+    "borderline 进 rewriter 补结构。(H5)策略升级后清理受影响 cell 的"
+    "advisory 数据(persona_reactions/narrative_director/red_blue/"
+    "consumer_simulation),终审不再读过期诊断。"
+    "M2(cell_planner 跨批次共享 path 分配)留作后续单独决策。"
+    "v0.30.5 历史: Commit A — 4 处 dead drop 注入修复(audit HIGH 级):"
     "(H1)工部·构建拿到 brief — slim_brief 含 target_audience / "
     "core_claim / competitive_context / _user_raw_input,builder.md "
     "新加『输入访问指南』教它何时翻原文;narrative_director rebuild "

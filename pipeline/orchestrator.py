@@ -1700,12 +1700,17 @@ class PipelineOrchestrator:
             cid = cell.get("cell_id", "?")
             async with semaphore:
                 try:
+                    # v0.30.6 fix M3: 传完整 system_prompt 而非前 500 字。
+                    # red_blue_refiner.md 第 4 条说"保护合规条款 / 关键词 /
+                    # 人设设定不许攻击",但合规块、banlist、关键词列表通常
+                    # 在 system_prompt 的中后段(2000+ 字处),前 500 字 Red
+                    # Team 看不到 → "fixes" 可能误改合规词。
                     result = await self.red_blue_refiner.run(
                         {
                             "cell_id": cid,
                             "direction_name": cell.get("direction_name", ""),
                             "platform": cell.get("platform", ""),
-                            "system_prompt": (cell.get("system_prompt") or "")[:500],
+                            "system_prompt": cell.get("system_prompt", ""),
                             "demo_output": cell.get("demo_output", ""),
                             "paradigm": cell.get("paradigm", "A_emotional_hook"),
                         },
@@ -1815,22 +1820,28 @@ class PipelineOrchestrator:
         if isinstance(target_audience, list):
             target_audience = ", ".join(str(t) for t in target_audience)
 
+        # v0.30.6 fix M4: 每个 cell 自己带 platform,持出去给画像模拟,
+        # 避免多平台 brief 里 douyin cell 用 xhs 画像评判。
         slim_cells = [
             {
                 "cell_id": c.get("cell_id"),
                 "direction_name": c.get("direction_name"),
+                "platform": c.get("platform", ""),
                 "demo_output": (c.get("demo_output") or "")[:500],
             }
             for c in prompt_cells
         ]
 
+        # 顶层 platform 仍传一个(向后兼容旧 prompt),但优先级:cell.platform。
+        _platforms = brief.get("target_platforms") or []
+        _top_platform = _platforms[0] if _platforms else DEFAULT_PLATFORM
+
         try:
             result = await self.persona_simulator.run(
                 {
                     "target_audience": target_audience or "未指定（请根据 brief 推断）",
-                    "platform": brief.get("target_platforms", [DEFAULT_PLATFORM])[0]
-                    if brief.get("target_platforms")
-                    else DEFAULT_PLATFORM,
+                    "platform": _top_platform,
+                    "all_platforms": list(_platforms) or [DEFAULT_PLATFORM],
                     "cells": slim_cells,
                 },
                 self.run_id,
@@ -2681,6 +2692,45 @@ class PipelineOrchestrator:
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
 
+            # v0.30.6 fix M1: Gemini 结构审标了 _structure_hint(missing_items
+            # 非空)但 critic 让该 cell 过了 → 之前 hint 永远到不了 rewriter,
+            # 漂亮但结构不全的 cell 直接发货。这里把这些 cell 强制加进
+            # failed 列表(severity=borderline,带合成的 rewrite_directives)。
+            existing_failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+            structurally_incomplete_ids: set[str] = set()
+            for _c in cells_to_critique:
+                _hint = _c.get("_structure_hint") or {}
+                _missing = _hint.get("missing_items") or []
+                _hint_rev = _hint.get("revision_hint") or ""
+                if not _missing and not _hint_rev:
+                    continue
+                _cid = _c.get("cell_id")
+                if not _cid or _cid in existing_failed_ids:
+                    continue
+                # critic 让它过了,但结构审说缺。force fail 让 rewriter 补结构。
+                _synthesized = (
+                    f"【结构审强制补漏】critic 判 pass 但 Gemini 结构审检测到本 "
+                    f"cell 缺失关键模块: {', '.join(str(m) for m in _missing) or '(未列)'}。"
+                    f"建议: {_hint_rev or '补齐缺失模块,保持原 demo 网感和钩子不变'}。"
+                )
+                failed.append({
+                    "cell_id": _cid,
+                    "platform": _c.get("platform", ""),
+                    "severity": "borderline",
+                    "rewrite_directives": _synthesized,
+                    "root_cause_kind": "surface",
+                    "root_cause_explanation": "structure_review 强制补漏",
+                    "_flagged_by": "structure_review",
+                })
+                structurally_incomplete_ids.add(_cid)
+            if structurally_incomplete_ids:
+                logger.info(
+                    "[vibe_loop] structure_review 强制补漏 %d 个 critic-pass "
+                    "但缺结构的 cell: %s",
+                    len(structurally_incomplete_ids),
+                    sorted(structurally_incomplete_ids),
+                )
+
             if not failed:
                 logger.info(f"Vibe critic passed all {len(prompt_cells)} cells "
                             f"on iteration {iteration + 1} (Claude + Gemini both cleared)")
@@ -3006,6 +3056,68 @@ class PipelineOrchestrator:
                 "change_log": change_log,
             })
 
+            # v0.30.6 fix H5: 失效掉受影响 direction 的 advisory 数据。
+            # secretariat 改了这些 direction 的 stop_trigger / reward_type 等
+            # 锚点,vibe_loop 会重写对应 cell 的 system_prompt + demo,所以
+            # _persona_reactions / _narrative_director_result / _red_blue_stats
+            # 里关于这些 cell 的旧记录已经过期。chancellery 和 UI 会读这些字段
+            # 当作 ground truth,留着会误导。这里只清"受影响 cell 的部分",
+            # 保留其他 cell 的有效数据。
+            _affected_cell_ids: set[str] = set()
+            for _c in (final_system.get("prompt_matrix") or []):
+                if _c.get("direction_id") in affected_direction_ids:
+                    _cid = _c.get("cell_id")
+                    if _cid:
+                        _affected_cell_ids.add(_cid)
+
+            # 1. _persona_reactions: 清掉受影响 cell 的反应
+            _pr = final_system.get("_persona_reactions") or {}
+            if _pr.get("status") == "ok" and _pr.get("personas"):
+                for _persona in _pr.get("personas", []):
+                    _persona["reactions"] = [
+                        r for r in (_persona.get("reactions") or [])
+                        if r.get("cell_id") not in _affected_cell_ids
+                    ]
+                _pr["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            # 2. _narrative_director_result: 清掉 cells_to_revise 里的受影响项
+            _nd = final_system.get("_narrative_director_result") or {}
+            if _nd:
+                _nd["cells_to_revise"] = [
+                    c for c in (_nd.get("cells_to_revise") or [])
+                    if c.get("cell_id") not in _affected_cell_ids
+                ]
+                _nd["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            # 3. _red_blue_stats.details: 清掉受影响 cell 的诊断
+            _rb = final_system.get("_red_blue_stats") or {}
+            if _rb.get("details"):
+                _rb["details"] = [
+                    d for d in _rb["details"]
+                    if d.get("cell_id") not in _affected_cell_ids
+                ]
+                # 总计也减一下(失效的部分不再计入"已修复"统计)
+                _rb["_stale_purged_count"] = len(_affected_cell_ids)
+
+            # 4. _consumer_simulation.judgments: 清掉受影响 cell 的判决
+            _cs = final_system.get("_consumer_simulation") or {}
+            if _cs.get("status") == "ok" and _cs.get("judgments"):
+                _cs["judgments"] = [
+                    j for j in _cs["judgments"]
+                    if j.get("cell_id") not in _affected_cell_ids
+                ]
+                _cs["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            if _affected_cell_ids:
+                logger.info(
+                    "[strategic_escalation] purged stale advisory data for "
+                    "%d cells across %d directions: persona / narrative_director / "
+                    "red_blue / consumer_simulation 里关于这些 cell 的旧记录全部清掉,"
+                    "下游 chancellery_final 不会读到过期诊断。",
+                    len(_affected_cell_ids),
+                    len(affected_direction_ids),
+                )
+
             logger.info(
                 "[strategic_escalation] round %d applied — re-running vibe_loop "
                 "with updated direction anchors (%s)",
@@ -3076,6 +3188,8 @@ class PipelineOrchestrator:
 
         # Build per-cell consumer context. Cells whose direction has no
         # stop_trigger fall back to target_audience from brief.
+        # v0.30.6 fix M4: 每个 cell 带自己的 platform,避免多平台 brief
+        # 里 douyin cell 被用 xhs 标准评判。
         fallback_audience = structured_brief.get("target_audience", "") or ""
         slim_cells = []
         for c in prompt_cells:
@@ -3086,20 +3200,21 @@ class PipelineOrchestrator:
                 "cell_id": c.get("cell_id"),
                 "direction_id": did,
                 "direction_name": c.get("direction_name"),
+                "platform": c.get("platform", ""),
                 "stop_trigger": stop_trigger or fallback_audience,
                 "demo_output": (c.get("demo_output") or "")[:600],
             })
+
+        _platforms_list = structured_brief.get("target_platforms") or []
+        _top_platform = _platforms_list[0] if _platforms_list else DEFAULT_PLATFORM
 
         try:
             result = await self.persona_simulator.run(
                 {
                     "mode": "consumer_simulation",
                     "target_audience": fallback_audience,
-                    "platform": (
-                        structured_brief.get("target_platforms", [DEFAULT_PLATFORM])[0]
-                        if structured_brief.get("target_platforms")
-                        else DEFAULT_PLATFORM
-                    ),
+                    "platform": _top_platform,
+                    "all_platforms": list(_platforms_list) or [DEFAULT_PLATFORM],
                     "cells": slim_cells,
                 },
                 self.run_id,
