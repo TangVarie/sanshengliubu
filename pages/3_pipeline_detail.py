@@ -406,24 +406,63 @@ if status == "needs_revision":
                     ):
                         st.json(_final_review)
 
-                # ── Apply revision button ─────────────────────────────────
+                # ── Apply revision button(v0.30.0 文字校正) ─────────
                 st.markdown("---")
-                st.markdown(
-                    "**应用修订**：把上面的 mandatory_revisions 反喂给工部，"
-                    "只重跑 工部架构 → 格子规划 → 构建 → 网感复检 → 终审，"
-                    "保留前面已完成的太子/中书省/尚书省/五部，不浪费 token。"
+                # v0.30.0:实际行为是按 affected_direction_ids 智能分流——
+                # mandatory_revisions 里只标了 D5 → 只重建 D5 这一个 cell,
+                # 其他已完成 cell 的 stage_log 完全保留(builder 用 cell-level
+                # resume 跳过)。只有当修订文本里出现"全局/所有方向/
+                # shared_skeleton"等关键词时,才触发全工部重建(罕见)。
+                # 老版本提示文字误导用户以为每次都全部重跑,本版校正。
+                #
+                # 提取 affected_direction_ids 给用户预览,告诉他实际会重建几个 cell。
+                import re as _re_dir
+                _all_revision_text = " ".join(
+                    [r for r in (_revisions or []) if isinstance(r, str)]
+                    + [_final_review.get("revision_instructions", "") or ""]
                 )
+                _affected_dirs = sorted(set(
+                    _re_dir.findall(r"D\d+", _all_revision_text)
+                ))
+                _global_kw = any(
+                    kw in _all_revision_text
+                    for kw in [
+                        "shared_skeleton", "persona_library", "title_rules",
+                        "全局", "所有方向", "所有cell", "全部cell", "每个方向",
+                        "每个cell", "统一", "全部方向",
+                    ]
+                )
+                if _global_kw:
+                    st.warning(
+                        "**应用修订**:检测到全局关键词(如『全局/所有方向』),"
+                        "**会重跑整个工部**(architect → cell_planner → builder)"
+                        "+ 中间精炼层 + 网感复检 + 终审。已完成的太子 / 中书省 / "
+                        "尚书省 / 五部 stage 不动。"
+                    )
+                elif _affected_dirs:
+                    st.info(
+                        f"**应用修订**:只针对 **{', '.join(_affected_dirs)}** "
+                        f"做 cell-level 重建,其他已完成 cell 的产出"
+                        f"完全保留(builder cell-level resume),不浪费 token。"
+                        f"中间精炼 / 网感复检 / 终审会重跑(因为它们"
+                        f"evaluate full matrix)。"
+                    )
+                else:
+                    st.markdown(
+                        "**应用修订**:把上面的 mandatory_revisions 反喂给工部,"
+                        "只重跑必要的阶段,保留已完成的产出不浪费 token。"
+                    )
                 _busy_key = f"pipeline_busy_{project_id}"
                 _is_busy = st.session_state.get(_busy_key, False)
                 if st.button(
-                    "✅ 应用修订意见并重跑工部",
+                    "✅ 应用修订意见并重跑(智能分流)",
                     type="primary",
                     key="apply_revision_btn",
                     disabled=_is_busy,
-                    help="读取终审的 mandatory_revisions 和 revision_instructions，"
-                         "存到 project.brief._revision_context，删除 ministry_works/"
-                         "cell_planner/builder/vibe_critic/vibe_rewriter/chancellery_final 的 "
-                         "stage_logs，然后触发 resume — 工部会拿到修订指令做针对性修复。",
+                    help="按 mandatory_revisions 文本里的 D\\d+ 编号 + 全局关键词,"
+                         "智能判断重跑范围:cell-specific 只重建受影响 cell,global "
+                         "才重跑整个工部。中间精炼 + 网感复检 + 终审 always 重跑"
+                         "因为它们看完整矩阵。",
                 ):
                     st.session_state[_busy_key] = True
                     from pipeline.orchestrator import (

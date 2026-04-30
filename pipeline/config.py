@@ -2,10 +2,15 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.0"
+VERSION = "v0.30.1"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.0 多 vendor 路由 + 高质量模型预设(premium_multi_vendor): "
+    "v0.30.1 输出中心简化 + 修订按钮智能分流提示: 输出中心顶部新增"
+    "『成品提示词清单』主区,直接列 N 个不重复 prompt 的完整内容 + "
+    "示例文稿(代替原来要翻平台 tab + 多层 expander 的繁琐结构)。"
+    "应用修订按钮文字按实际行为校正:扫 mandatory_revisions 文本里的 "
+    "D\\d+ 和全局关键词,提前告诉用户『只会重建 D5』vs『会重跑整个工部』。"
+    "v0.30.0 历史: 多 vendor 路由 + 高质量模型预设(premium_multi_vendor): "
     "(1) DeepSeek 走官方 anthropic-compat 端点(api.deepseek.com/anthropic),"
     "新增 DEEPSEEK_API_KEY secret + per-model 路由器 _get_client_for_model;"
     "(2) GPT 走 tdyun 中转的 anthropic-compat 路径(model='gpt-5.5'),"

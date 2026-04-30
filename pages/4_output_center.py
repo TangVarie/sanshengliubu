@@ -49,6 +49,80 @@ final_review = output_data.get("final_review", {})
 
 st.subheader(f"📄 {project['name']}")
 
+# v0.30.0: 成品清单(顶层主视图)— 用户反馈"看不懂分类",这一块用最简
+# 形式回答"产出了什么":几个不重复的 prompt + 每个的内容 + 示例输出。
+# 详细矩阵 / 诊断信息保留在下方。
+_matrix_for_summary = (
+    prompt_system.get("prompt_matrix")
+    or prompt_system.get("prompt_templates")
+    or []
+)
+if _matrix_for_summary:
+    # 去重(同 cell_id 只算一次)+ 按 cell_id 排序方便对照
+    _seen_ids: set[str] = set()
+    _unique_cells: list[dict] = []
+    for _c in _matrix_for_summary:
+        _cid = _c.get("cell_id", "")
+        if _cid and _cid not in _seen_ids:
+            _seen_ids.add(_cid)
+            _unique_cells.append(_c)
+    _unique_cells.sort(key=lambda c: c.get("cell_id", ""))
+
+    st.markdown(
+        f"### 📋 成品提示词清单 · 共 **{len(_unique_cells)}** 个不重复的提示词"
+    )
+    st.caption(
+        "每条 prompt 自带完整 system_prompt + user_prompt_template + 一段示例文稿,"
+        "复制 system_prompt 装载一次,按 user template 填变量就能直接用。"
+        "下方『Prompt 矩阵』按平台 × 方向展示同样的内容 + 对标参考帖子;"
+        "再下方『诊断详情』是网感复检 / 红蓝精炼 / 画像模拟等中间过程,"
+        "通常不需要看。"
+    )
+
+    for _idx, _c in enumerate(_unique_cells, 1):
+        _cid = _c.get("cell_id", "?")
+        _dname = _c.get("direction_name", "")
+        _platform = _c.get("platform", "")
+        _label = (
+            f"**#{_idx}** · `{_cid}` · {_dname or '(无方向名)'}"
+            f" · 平台:{_platform}"
+        )
+        with st.expander(_label, expanded=(_idx == 1)):
+            _sp = _c.get("system_prompt", "") or ""
+            _up = _c.get("user_prompt_template", "") or ""
+            _vars = _c.get("variables", {}) or {}
+            _demo = _c.get("demo_output", "") or ""
+
+            st.markdown(
+                f"**📋 system_prompt** _{len(_sp):,} 字_"
+            )
+            st.code(_sp, language="markdown")
+
+            st.markdown(
+                f"**📝 user_prompt_template** _{len(_up):,} 字_"
+            )
+            st.code(_up, language="markdown")
+
+            if _vars:
+                st.markdown("**🔣 变量列表**")
+                for _vn, _vd in _vars.items():
+                    st.markdown(f"- `{{{{{_vn}}}}}`: {_vd}")
+
+            if _demo:
+                st.markdown("**✨ 示例文稿(用上面这条 prompt 跑出来的)**")
+                # 用 success-styled markdown 区分,避免和 prompt 代码混淆
+                st.markdown(
+                    f"<div style='background:#f0f9f0;padding:12px 16px;"
+                    f"border-left:3px solid #4caf50;border-radius:4px;"
+                    f"white-space:pre-wrap;font-family:system-ui;"
+                    f"line-height:1.7'>{_demo}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("(没有示例文稿 — 流水线被中断或这条 cell 走的是不带 demo 的旧路径)")
+
+    st.divider()
+
 # Final review summary
 if final_review:
     verdict = final_review.get("verdict", "unknown")
