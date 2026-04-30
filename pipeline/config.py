@@ -2,10 +2,21 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.4"
+VERSION = "v0.30.5"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.4 架构层修复: 太子不再是单点瓶颈。"
+    "v0.30.5 Commit A — 4 处 dead drop 注入修复(audit HIGH 级):"
+    "(H1)工部·构建拿到 brief — slim_brief 含 target_audience / "
+    "core_claim / competitive_context / _user_raw_input,builder.md "
+    "新加『输入访问指南』教它何时翻原文;narrative_director rebuild "
+    "也带 brief。(H2)Gemini 趋势取样的真实小红书帖子 (_trend_intel."
+    "formatted_block) 显式注入 secretariat input,secretariat.md 加"
+    "『趋势取样校准』段把它当第一性输入。(H3)persona_simulator 的"
+    "per-cell 反应进 vibe_critic input,critic.md 加第 0.4 步『画像"
+    "反应交叉校验』,3 画像 ≥2 skip 强制 borderline。(H4)叙事导演"
+    "诊断 slim 摘要进 chancellery_final input,chancellery.md 加"
+    "『跨 cell 一致性』必查段。"
+    "v0.30.4 历史: 架构层修复: 太子不再是单点瓶颈。"
     "orchestrator 把用户原始 free_text 挂到 brief._user_raw_input,"
     "所有下游 agent 都能直接读原文(之前的 _raw_input_text 是 dead drop,"
     "零 prompt 引用)。foundation_common.md 加『用户原始输入访问协议』,"

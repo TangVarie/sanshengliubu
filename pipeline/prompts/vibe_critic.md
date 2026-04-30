@@ -214,6 +214,37 @@
 
 ---
 
+### 第 0.4 步:画像反应交叉校验(v0.30.5 起,在 gut_call 之前作为外部信号)
+
+如果 input 里有 `persona_reactions_by_cell` 字段——这是**画像模拟阶段(persona_simulator)** 提前跑出来的"3 个画像每人 0.5 秒本能反应"。结构:
+
+```json
+"persona_reactions_by_cell": {
+  "D1_xiaohongshu": [
+    {"persona": "P_core", "action": "click", "reason": "..."},
+    {"persona": "P_edge", "action": "skip", "reason": "..."},
+    {"persona": "P_anti", "action": "skip", "reason": "..."}
+  ]
+}
+```
+
+这是**外部用户视角**的反馈,**比你单人 judge 的味道判断更接近真实分发**。把它当作你 gut_call 的交叉校验:
+
+#### 硬约束规则
+
+1. **3 个画像里 ≥2 个 skip 的 cell** → 你不允许判 `pass`,**至少 borderline**。即使你味道对得上 15 条钩子样本,**真人扮演者都划走了**就是真信号。在 `taste_match` 里加注:"画像 X+Y 都 skip,reason: [...]"。
+2. **画像和你 gut_call 全部一致(都 click 或都 skip)** → 你的判断被强证,可以加分(borderline → pass 或反过来 fail 加固)。
+3. **P_anti(反目标用户)反而 click/save** = 破圈信号,在 `cross_cell_duplicates` 同级加一个 `breakthrough_candidate: cell_id` 字段(可选,有就加)。
+
+#### 不要做的事
+
+- ❌ 不要被画像反应**完全反向**——画像是 0.5 秒判断,你的味道分析是 30 秒理解。两者都重要,**画像是地板信号,你的判断是天花板**。两层独立。
+- ❌ 不要因为画像数据存在就放弃自己的本能判断——你仍然要按四乘数 + gut_call + taste_match 走完整流程。
+
+⚠️ 如果 `persona_reactions_by_cell` 字段为空(画像模拟未跑或失败),**忽略本步**,继续走原流程。
+
+---
+
 ### 第 0.5 步：AI 空话硬否决（在 gut_call 之前作为前置 filter）
 
 在做 gut_call 之前，先扫一遍 demo_output 的全文。如果**命中以下任意一条黑名单短语**，`gut_call` 直接强制写 `"不会点"`，`severity = "fail"`——不允许用"方向对但差点意思"来开脱：

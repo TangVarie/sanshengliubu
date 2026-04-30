@@ -121,6 +121,24 @@ class Chancellery(BaseAgent):
                 "brief": brief,
                 "round_number": round_number,
             }
+
+            # v0.30.5 fix H4: 把叙事导演的诊断结果显式提取出来给终审,
+            # final_system 里有 _narrative_director_result 但 chancellery
+            # prompt 不知道去翻 final_system 子字段,所以等于看不到。
+            # 抽 slim 摘要(verdict + 重建过的 cell 列表 + issues 简表)。
+            _nd = final_system.get("_narrative_director_result") or {}
+            if _nd:
+                input_data["narrative_director_summary"] = {
+                    "verdict": _nd.get("verdict", "unknown"),
+                    "issues": (_nd.get("issues") or [])[:10],
+                    "cells_rebuilt": [
+                        c.get("cell_id")
+                        for c in (_nd.get("cells_to_revise") or [])
+                        if c.get("cell_id")
+                    ],
+                    "cross_cell_summary": _nd.get("cross_cell_summary", "")[:500],
+                }
+
             if prior_review and round_number > 1:
                 input_data["prior_review"] = {
                     "verdict": prior_review.get("verdict", "unknown"),

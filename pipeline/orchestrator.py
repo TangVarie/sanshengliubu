@@ -433,7 +433,7 @@ class PipelineOrchestrator:
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
             # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
-            final_system = await self._run_works_builders(works_plan)
+            final_system = await self._run_works_builders(works_plan, structured_brief)
 
             if not final_system.get("prompt_matrix"):
                 raise RuntimeError(
@@ -444,7 +444,7 @@ class PipelineOrchestrator:
             # 5c+. 叙事导演（Claude, 跨 cell 一致性+差异化诊断）
             # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
             # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
-            await self._run_narrative_director(final_system, works_plan)
+            await self._run_narrative_director(final_system, works_plan, structured_brief)
 
             # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
             # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
@@ -635,6 +635,14 @@ class PipelineOrchestrator:
             if is_secretariat:
                 # Secretariat's turn: propose or respond to challenges
                 input_data = {"brief": brief}
+                # v0.30.5 fix H2: 把 Gemini 趋势取样的真实小红书帖子原文
+                # (_trend_intel.formatted_block)显式注入,之前是 dead drop。
+                # secretariat.md 的"趋势取样校准"段会读 trend_intel_block。
+                _trend_block = (
+                    (brief.get("_trend_intel") or {}).get("formatted_block") or ""
+                )
+                if _trend_block:
+                    input_data["trend_intel_block"] = _trend_block
                 if debate_history:
                     input_data["debate_history"] = debate_history
                     input_data["debate_mode"] = True
@@ -1128,20 +1136,45 @@ class PipelineOrchestrator:
 
         return all_cell_plans
 
-    async def _run_works_builders(self, works_plan: dict) -> dict:
+    async def _run_works_builders(
+        self, works_plan: dict, brief: dict | None = None
+    ) -> dict:
         """Run WorksBuilder in batches with concurrency control.
 
         Smart batching: same-platform cells are grouped together for context reuse.
-        Builder only receives shared_skeleton + cell_plans (with ministry_digest),
-        NOT the full ministry outputs.
+        Builder receives shared_skeleton + cell_plans (with ministry_digest) +
+        a slim brief context(v0.30.5 fix H1):核心字段 target_audience /
+        competitive_context / constraints / core_claim,以及关键的
+        `_user_raw_input` 让 builder 在写 demo 时能直接翻用户原文找具体
+        细节(数字 / 用户原话 / 截图分析等),不至于因为 cell_plan 里
+        ministry_digest 是三层总结(太子→部→cell_planner)就只能写"效果显著"。
         """
         cell_plans = works_plan.get("cell_plans", [])
         shared_skeleton = works_plan.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
 
+        # v0.30.5 fix H1: 给 builder 一个 slim brief 让它能写细节。
+        # 不传整个 brief(里面 trend_intel / reference_posts / 内部 state 一堆
+        # 无关字段),只传 builder 实际能用上的:核心策略 + 用户原文。
+        # _user_raw_input 是关键——builder 写 demo 时如果发现 cell_plan
+        # 里没有具体数字/原话/产品参数,可以直接 grep 原文。
+        _brief = brief or {}
+        _slim_brief_for_builder = {
+            "product_name": _brief.get("product_name", ""),
+            "product_category": _brief.get("product_category", ""),
+            "core_claim": _brief.get("core_claim", ""),
+            "target_audience": _brief.get("target_audience", ""),
+            "campaign_objective": _brief.get("campaign_objective", []),
+            "competitive_context": _brief.get("competitive_context", ""),
+            "constraints": _brief.get("constraints", ""),
+            "_user_raw_input": _brief.get("_user_raw_input", "")
+                or _brief.get("_raw_input_text", ""),
+        }
+
         logger.info(
             f"Works builder: {len(cell_plans)} cell_plans, "
-            f"shared_skeleton keys: {list(shared_skeleton.keys()) if shared_skeleton else 'EMPTY'}"
+            f"shared_skeleton keys: {list(shared_skeleton.keys()) if shared_skeleton else 'EMPTY'},"
+            f" slim_brief: raw_input={len(_slim_brief_for_builder['_user_raw_input']):,} 字"
         )
 
         if not cell_plans:
@@ -1242,6 +1275,7 @@ class PipelineOrchestrator:
                 single_input = {
                     "cell_plans": [cell_plan],
                     "shared_skeleton": shared_skeleton,
+                    "brief": _slim_brief_for_builder,  # v0.30.5 H1
                     "_batch_info": {
                         "label": f"单cell修复 {cid}",
                         "round": "cell-retry",
@@ -1293,6 +1327,7 @@ class PipelineOrchestrator:
                     builder_input = {
                         "cell_plans": batch,
                         "shared_skeleton": shared_skeleton,
+                        "brief": _slim_brief_for_builder,  # v0.30.5 H1
                         "_batch_info": {
                             "label": f"批次 {batch_idx + 1} · {round_label}",
                             "round": round_label,
@@ -1502,7 +1537,7 @@ class PipelineOrchestrator:
         }
 
     async def _run_narrative_director(
-        self, final_system: dict, works_plan: dict
+        self, final_system: dict, works_plan: dict, brief: dict | None = None
     ) -> None:
         """Narrative Director: cross-cell coherence + diversity audit.
 
@@ -1584,9 +1619,22 @@ class PipelineOrchestrator:
                 fix[:100],
             )
             try:
+                # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
+                # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
+                _brief_for_rebuild = {
+                    "product_name": (brief or {}).get("product_name", ""),
+                    "core_claim": (brief or {}).get("core_claim", ""),
+                    "target_audience": (brief or {}).get("target_audience", ""),
+                    "competitive_context": (brief or {}).get("competitive_context", ""),
+                    "_user_raw_input": (
+                        (brief or {}).get("_user_raw_input")
+                        or (brief or {}).get("_raw_input_text", "")
+                    ),
+                } if brief else {}
                 rebuild_input = {
                     "active_cells": [cell_plan],
                     "shared_skeleton": shared_skeleton,
+                    "brief": _brief_for_rebuild,
                     "_batch_info": {
                         "label": f"叙事导演修复 {cid}",
                         "round": "narrative_fix",
@@ -2527,6 +2575,28 @@ class PipelineOrchestrator:
                 }
             if reference_packs_by_platform:
                 critic_input["reference_packs_by_platform"] = reference_packs_by_platform
+
+            # v0.30.5 fix H3: 把 persona_simulator 的 per-cell 反应注入 critic,
+            # 让"3 个画像里有 2 个划走"这种信号真的影响判决,而不是只在
+            # 全 skip 的 weak_cells 边缘场景才触发 strategic_warnings。
+            # 压缩成 {cell_id: [{persona, action, reason}, ...]} 紧凑形式。
+            _persona_pkg = final_system.get("_persona_reactions") or {}
+            if _persona_pkg.get("status") == "ok":
+                _per_cell_reactions: dict = {}
+                for _p in (_persona_pkg.get("personas") or []):
+                    _pid = _p.get("id", "?")
+                    for _r in (_p.get("reactions") or []):
+                        _cid_r = _r.get("cell_id")
+                        if not _cid_r:
+                            continue
+                        _per_cell_reactions.setdefault(_cid_r, []).append({
+                            "persona": _pid,
+                            "action": _r.get("action", "?"),
+                            "reason": (_r.get("reason") or "")[:80],
+                        })
+                if _per_cell_reactions:
+                    critic_input["persona_reactions_by_cell"] = _per_cell_reactions
+
             try:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
