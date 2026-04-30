@@ -77,7 +77,7 @@ from pipeline.agents.ministries.works import (
 )
 from pipeline.agents.narrative_director import NarrativeDirector
 from pipeline.agents.red_blue_refiner import RedBlueRefiner
-from pipeline.agents.persona_simulator import PersonaSimulator
+from pipeline.agents.persona_simulator import PersonaSimulator, PersonaSimulatorAlt
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,11 @@ class PipelineOrchestrator:
         self.narrative_director = NarrativeDirector()
         self.red_blue_refiner = RedBlueRefiner()
         self.persona_simulator = PersonaSimulator()
+        # v0.30.8: 异厂家画像副本(DeepSeek),和主 PersonaSimulator 并行跑,
+        # 提供不同 distribution 的画像反应。如果 DEEPSEEK_API_KEY 没配,
+        # 这个 agent 调用会报 RuntimeError,_run_persona_simulation 会软降级
+        # 只用 Claude 系结果。
+        self.persona_simulator_alt = PersonaSimulatorAlt()
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -1836,32 +1841,86 @@ class PipelineOrchestrator:
         _platforms = brief.get("target_platforms") or []
         _top_platform = _platforms[0] if _platforms else DEFAULT_PLATFORM
 
-        try:
-            result = await self.persona_simulator.run(
-                {
-                    "target_audience": target_audience or "未指定（请根据 brief 推断）",
-                    "platform": _top_platform,
-                    "all_platforms": list(_platforms) or [DEFAULT_PLATFORM],
-                    "cells": slim_cells,
-                },
-                self.run_id,
-                self.db,
-            )
-        except Exception as e:
-            logger.exception("[persona_sim] failed")
+        # v0.30.8: 双模型并跑画像 — Claude 系(Sonnet 3.7)+ DeepSeek 系
+        # (v4-pro)。两个 agent 用同一份 persona_simulator.md prompt,但不同
+        # 模型 distribution → 产出的 6 个画像 cover 更广(Claude 偏目标用户
+        # 细腻反应,DeepSeek 偏草根/破圈视角)。任一失败不阻塞另一个,只
+        # 缺谁的标记缺失,不会 fail 整个流水线。
+        _common_input = {
+            "target_audience": target_audience or "未指定（请根据 brief 推断）",
+            "platform": _top_platform,
+            "all_platforms": list(_platforms) or [DEFAULT_PLATFORM],
+            "cells": slim_cells,
+        }
+
+        async def _run_one(agent, label: str):
+            try:
+                _res = await agent.run(_common_input, self.run_id, self.db)
+                logger.info("[persona_sim] %s 跑通", label)
+                return _res, None
+            except Exception as _e:
+                logger.exception("[persona_sim] %s 失败", label)
+                return None, f"{type(_e).__name__}: {_e}"
+
+        # 并行启动两个 agent。如果 DeepSeek 没配 secret,alt 那条会立刻
+        # RuntimeError,但 Claude 那条不受影响。
+        _claude_pair, _ds_pair = await asyncio.gather(
+            _run_one(self.persona_simulator, "Claude(Sonnet 3.7)"),
+            _run_one(self.persona_simulator_alt, "DeepSeek(v4-pro)"),
+        )
+        _claude_result, _claude_err = _claude_pair
+        _ds_result, _ds_err = _ds_pair
+
+        # 至少一个成功才能继续
+        if not _claude_result and not _ds_result:
             final_system["_persona_reactions"] = {
                 "status": "failed",
-                "error": f"{type(e).__name__}: {e}",
+                "error": (
+                    f"Claude: {_claude_err or 'unknown'} | "
+                    f"DeepSeek: {_ds_err or 'unknown'}"
+                ),
                 "reason": (
-                    "persona_simulator 调用失败。stage_log 里应有完整 traceback; "
-                    "常见原因: (1) JSON 解析失败 (2) Claude rate limit / 5xx "
-                    "(3) 模型返回为空。"
+                    "双 backend 都失败。常见原因: 配置问题(secrets.toml)、"
+                    "rate limit / 5xx、模型返回为空。stage_log 里有完整 traceback。"
                 ),
             }
             return
 
-        # Success. Tag with status for UI consistency and preserve raw result.
-        tagged = {"status": "ok", **(result or {})}
+        # 合并 personas[],按 _source 标注来源。同 id 不去重(Claude 的 P_core
+        # 和 DeepSeek 的 P_core 是不同 distribution 下的扮演,UI 都该看到)。
+        merged_personas: list[dict] = []
+        for _src_label, _res in [("claude", _claude_result), ("deepseek", _ds_result)]:
+            if not _res:
+                continue
+            for _p in (_res.get("personas") or []):
+                _p_tagged = {**_p, "_source": _src_label}
+                # 如果两边 id 相同(都是 P_core),给 DeepSeek 那个改成 P_core_ds
+                # 避免下游 cell_id 计数时混淆
+                if _src_label == "deepseek":
+                    _orig_pid = _p_tagged.get("id", "")
+                    _p_tagged["id"] = f"{_orig_pid}_ds" if _orig_pid else "P_unknown_ds"
+                merged_personas.append(_p_tagged)
+
+        # 用 Claude 的 summary 当主(它通常更结构化),DeepSeek 的留作 _ds_summary
+        # 给 UI 展示。如果 Claude 失败就 fallback DeepSeek。
+        _primary = _claude_result or _ds_result or {}
+        _summary = _primary.get("summary", {}) or {}
+        if _ds_result and _claude_result:
+            _summary = {**_summary, "_ds_summary": (_ds_result.get("summary") or {})}
+
+        result = {
+            "status": "ok",
+            "mode": _primary.get("mode", "persona_spectrum"),
+            "personas": merged_personas,
+            "summary": _summary,
+            "_dual_backend": {
+                "claude_ok": bool(_claude_result),
+                "claude_error": _claude_err,
+                "deepseek_ok": bool(_ds_result),
+                "deepseek_error": _ds_err,
+            },
+        }
+        tagged = result
         final_system["_persona_reactions"] = tagged
 
         summary = (result or {}).get("summary") or {}

@@ -2,10 +2,16 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.7"
+VERSION = "v0.30.8"
 VERSION_DATE = "2026-04-19"
 VERSION_NOTES = (
-    "v0.30.7 GPT 改走 vectorengine.ai 的 OpenAI-compat 接口: tdyun "
+    "v0.30.8 启用 DeepSeek + 画像模拟双模型并跑: persona_simulator_alt "
+    "新 stage(deepseek-v4-pro)和主 persona_simulator(Sonnet 3.7)并行,"
+    "orchestrator asyncio.gather 启动两个 agent → 合并 personas 数组,"
+    "每条画像加 _source 字段(claude/deepseek)。同 id 自动改名避免冲突。"
+    "任一 backend 失败软降级,只缺谁的标记缺失,不阻塞流水线。"
+    "Claude 偏目标用户细腻反应,DeepSeek 偏草根/破圈视角,distribution 互补。"
+    "v0.30.7 历史: GPT 改走 vectorengine.ai 的 OpenAI-compat 接口: tdyun "
     "anthropic-compat 中转不支持 GPT 模型,新增独立 OpenAI SDK 后端 "
     "(api.vectorengine.ai/v1/chat/completions)。secrets.toml 加 "
     "VECTORENGINE_API_KEY,_call_claude 检测到 gpt-* 自动 dispatch 到 "
@@ -188,7 +194,11 @@ PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
     "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",
     "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",
     "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",
+    # ── 画像模拟双模型并跑(v0.30.8) ──
+    # Claude 系扮演 P_core / P_edge(目标用户精细反应,Sonnet 3.7 中文细腻)
     "persona_simulator": "claude-3-7-sonnet-20250219-thinking",
+    # DeepSeek 系扮演 P_anti / 破圈视角(异 distribution,中文最强,扮演更草根)
+    "persona_simulator_alt": "deepseek-v4-pro",
 }
 
 _STAGE_ROLES = {
@@ -211,7 +221,8 @@ _STAGE_ROLES = {
     # Content generation + taste judgment: voice quality matters
     "ministry_works_builder": "content",
     "red_blue_refiner": "content",     # needs natural language feel
-    "persona_simulator": "content",    # simulates real humans
+    "persona_simulator": "content",    # simulates real humans (Claude 系)
+    "persona_simulator_alt": "content",  # v0.30.8: DeepSeek 异厂家画像
     "vibe_critic": "content",
     "vibe_rewriter": "content",
     # v0.29.0: 叙事结构重写者 — 和 vibe_rewriter 同角色(内容写作),
@@ -344,6 +355,7 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     # 给足上限从源头减少截断。
     "ministry_personnel": 32000,
     "ministry_revenue": 20000,
+    "persona_simulator_alt": 20000,  # v0.30.8: 和主 persona_simulator 同档
     "ministry_rites": 20000,
     "ministry_war": 20000,
     "ministry_justice": 20000,
@@ -586,7 +598,8 @@ PIPELINE_STAGES = [
     ("ministry_works_builder", "工部·构建", "🔨"),
     ("narrative_director", "叙事导演", "🎬"),
     ("red_blue_refiner", "红蓝精炼", "⚔️"),
-    ("persona_simulator", "画像模拟", "👥"),
+    ("persona_simulator", "画像模拟·Claude", "👥"),
+    ("persona_simulator_alt", "画像模拟·DeepSeek", "🔮"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
     # v0.29.3: 补展示 — 这两个阶段其实一直在跑也各自记 stage_log,
