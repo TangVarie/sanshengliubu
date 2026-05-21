@@ -26,6 +26,7 @@ from pipeline.agents.gemini_client import (
     GeminiCallFailed,
     GeminiNotConfigured,
     call_gemini_json,
+    resolve_gemini_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ def transcribe_image_for_brief(
             ),
             images=[(image_bytes, mime_type)],
             max_output_tokens=8000,  # OCR + 描述够用
+            model=resolve_gemini_model("image_transcriber"),
         )
     except GeminiNotConfigured as e:
         logger.info("[image_transcribe] Gemini not configured, using fallback: %s", e)

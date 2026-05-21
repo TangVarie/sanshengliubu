@@ -2,10 +2,22 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.10"
-VERSION_DATE = "2026-04-19"
+VERSION = "v0.30.11"
+VERSION_DATE = "2026-05-21"
 VERSION_NOTES = (
-    "v0.30.10 hotfix: strategy_loop 每次 resume 都强制重跑的老 bug — "
+    "v0.30.11 feat: Gemini 按岗位 model override + 按模型计价表。"
+    "(1) 新加 GEMINI_MODEL_OVERRIDES dict(pipeline/config.py),6 个 "
+    "Gemini-driven agent (critic / structure_reviewer / trend_scout / "
+    "image_transcriber / screenshot_analyzer / reference_analyzer)各自岗位"
+    "独立挑模型;GEMINI_MODEL 退为全局默认。(2) 默认配置:vision + "
+    "structure + trend → gemini-3.5-flash (2026-05 发布,agentic/"
+    "multimodal 领先 3.1 Pro 且便宜 40%);critic + reference_analyzer 保 "
+    "3.1 Pro(烟火气判断 + 长文稠密召回还是 Pro 强,jury still out)。"
+    "(3) 新加 GEMINI_PRICE_TABLE,每模型独立费率;cost_usd 改用按模型查表"
+    "(以前全局一套率)。(4) gemini_client.py 暴露 resolve_gemini_model(role) "
+    "helper;6 个 agent 调用时各自传 role。(5) 设置页 → Gemini 区显示按岗位"
+    "映射表 + 阶段列表显示每阶段真实分配的模型。"
+    "v0.30.10 历史: strategy_loop 每次 resume 都强制重跑的老 bug — "
     "_strategy_loop 实际写 strategy_debate_N 那种 stage_log,但 line 383 "
     "的 resume 检查 done[\"secretariat\"] 永远拿不到 → 每次应用修订意见"
     "或继续执行都重跑整个策略辩论,secretariat 看到 _revision_context "
@@ -473,12 +485,53 @@ ENABLE_GEMINI_ASSIST = True
 # gemini-3.1-pro-preview), not dashes. `gemini-3-1-...` is wrong.
 #
 # Common picks:
-#   - gemini-3.1-pro-preview        (latest Gemini 3.1 Pro preview)
+#   - gemini-3.5-flash              (released 2026-05; agentic/multimodal lead, cheaper)
+#   - gemini-3.1-pro-preview        (best on dense reasoning + long-context recall)
 #   - gemini-3.1-pro-preview-customtools  (same + tool-use features)
 #   - gemini-3-pro-preview          (earlier Gemini 3 Pro preview)
 #   - gemini-2.5-pro                (stable, widely available)
-#   - gemini-2.5-flash              (cheapest, fine for critic role)
+#   - gemini-2.5-flash              (cheap legacy)
+#
+# This is the GLOBAL DEFAULT — applies to any role not listed in
+# GEMINI_MODEL_OVERRIDES below.
 GEMINI_MODEL = "gemini-3.1-pro-preview"
+
+# Per-role model override. Each Gemini-driven agent looks itself up here
+# (via resolve_gemini_model() in gemini_client.py); if absent, falls back
+# to GEMINI_MODEL above.
+#
+# Why per-role:
+#   Gemini 3.5 Flash (2026-05) leads 3.1 Pro on agentic / coding / multi-
+#   modal benchmarks, AND is ~40% cheaper. But Flash gives up ground on
+#   academic reasoning and dense long-context recall. So the "best" model
+#   genuinely depends on the role:
+#
+#   - Vision (image_transcriber, screenshot_analyzer):
+#       Flash wins outright on multimodal understanding → Flash.
+#   - Structural checklist (structure_reviewer):
+#       Agentic-style task, Flash wins on agentic benchmarks → Flash.
+#   - Search-grounded scout (trend_scout):
+#       Quality dominated by Google Search grounding (billed separately
+#       at ~$35/1k queries); model cost is small fraction → Flash for
+#       speed + savings.
+#   - Long-content URL reading (reference_analyzer):
+#       Posts can be long, dense recall matters → keep Pro.
+#   - "网感" / "烟火气" critic (critic):
+#       Nuanced judgment on AI-tone. Flash may flag more aggressively or
+#       miss subtle borderline cases. Jury still out — kept on Pro for
+#       now. Flip to Flash to A/B test; the critic's verdict change rate
+#       is the signal you're looking for.
+#
+# To override globally for ALL roles, leave this empty {} and just edit
+# GEMINI_MODEL above. To pin one role to a specific model, add it here.
+GEMINI_MODEL_OVERRIDES: dict[str, str] = {
+    "image_transcriber":   "gemini-3.5-flash",
+    "screenshot_analyzer": "gemini-3.5-flash",
+    "structure_reviewer":  "gemini-3.5-flash",
+    "trend_scout":         "gemini-3.5-flash",
+    "reference_analyzer":  "gemini-3.1-pro-preview",
+    "critic":              "gemini-3.1-pro-preview",
+}
 
 # Trend scout — when True, Gemini runs a live Google Search
 # (site:xiaohongshu.com) in two places:
@@ -508,12 +561,31 @@ GEMINI_TREND_SCOUT_TARGET_COUNT = 10
 # typically 2-8K so the model will stop early anyway.
 GEMINI_MAX_OUTPUT_TOKENS = 16384
 
-# Rough per-1M-token prices (USD) for cost accounting. Update when
-# Google publishes final pricing for the chosen model. These values are
-# intentionally on the high side so reported cost errs toward "expensive"
-# rather than "surprise bill".
+# Rough per-1M-token prices (USD) for cost accounting. Fallback used by
+# _estimate_cost_usd when the running model isn't in GEMINI_PRICE_TABLE
+# below. Intentionally on the high side so reported cost errs toward
+# "expensive" rather than "surprise bill".
 GEMINI_COST_PER_1M_INPUT = 1.25
 GEMINI_COST_PER_1M_OUTPUT = 10.0
+
+# Per-model price table. Keys must match the model IDs used in
+# GEMINI_MODEL / GEMINI_MODEL_OVERRIDES. Add new entries when you switch
+# to a new model — otherwise the fallback rates above kick in and cost
+# accounting drifts.
+#
+# Sources (verify before billing-critical decisions):
+#   - gemini-3.5-flash:        $1.50 / $9.00 per 1M (Google I/O 2026)
+#   - gemini-3.1-pro-preview:  $2.50 / $15.00 per 1M
+#   - gemini-2.5-pro:          $1.25 / $10.00 per 1M
+#   - gemini-2.5-flash:        $0.075 / $0.30 per 1M
+GEMINI_PRICE_TABLE: dict[str, dict[str, float]] = {
+    "gemini-3.5-flash":             {"input": 1.50,  "output": 9.00},
+    "gemini-3.1-pro-preview":       {"input": 2.50,  "output": 15.00},
+    "gemini-3.1-pro-preview-customtools": {"input": 2.50, "output": 15.00},
+    "gemini-3-pro-preview":         {"input": 2.50,  "output": 15.00},
+    "gemini-2.5-pro":               {"input": 1.25,  "output": 10.00},
+    "gemini-2.5-flash":             {"input": 0.075, "output": 0.30},
+}
 
 
 # ── Prompt Caching ────────────────────────────────────────────────────────

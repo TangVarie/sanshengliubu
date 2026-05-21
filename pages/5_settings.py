@@ -1,9 +1,11 @@
 """设置 — API keys, model preferences, Supabase status."""
 
 import streamlit as st
+from pipeline.agents.gemini_client import resolve_gemini_model
 from pipeline.config import (
     ENABLE_GEMINI_ASSIST,
     GEMINI_MODEL,
+    GEMINI_MODEL_OVERRIDES,
     MODELS,
     PIPELINE_STAGES,
     VERSION,
@@ -262,13 +264,46 @@ else:
         from pipeline.agents.gemini_client import is_available
         if is_available():
             st.success(
-                f"✅ 已配置 (***{_gemini_key[-4:]}) · 模型 `{GEMINI_MODEL}`"
+                f"✅ 已配置 (***{_gemini_key[-4:]}) · 默认模型 `{GEMINI_MODEL}`"
             )
             st.caption(
                 "Gemini 会作为 (1) 网感二审：Claude critic 判 pass 的 cell 由 Gemini "
                 "二次复核；(2) 结构审：工部构建后审查 system_prompt 的完整性。"
                 "调用失败会降级为只用 Claude 结果。"
             )
+
+            # Per-role override map. Each agent passes its role name to
+            # resolve_gemini_model() in gemini_client.py, which looks
+            # GEMINI_MODEL_OVERRIDES (in pipeline/config.py) and falls
+            # back to GEMINI_MODEL above when not pinned.
+            _role_descriptions: dict[str, str] = {
+                "critic":              "网感二审（烟火气判断）",
+                "structure_reviewer":  "结构审（system_prompt 完整性）",
+                "trend_scout":         "趋势取样（Google Search grounding）",
+                "image_transcriber":   "图片预转写（Vision）",
+                "screenshot_analyzer": "截图分析（Vision）",
+                "reference_analyzer":  "参考帖 URL 抓取分析",
+            }
+            with st.expander(
+                "📌 按岗位模型分配（pipeline/config.py · GEMINI_MODEL_OVERRIDES）",
+                expanded=False,
+            ):
+                _rows = []
+                for role, desc in _role_descriptions.items():
+                    pinned = GEMINI_MODEL_OVERRIDES.get(role)
+                    _rows.append(
+                        {
+                            "岗位 (role)": role,
+                            "用途": desc,
+                            "实际模型": pinned or f"{GEMINI_MODEL} (默认)",
+                            "是否 override": "✅" if pinned else "—",
+                        }
+                    )
+                st.dataframe(_rows, hide_index=True, use_container_width=True)
+                st.caption(
+                    "想全局切换：改 `GEMINI_MODEL`。想只动某一个岗位（例如把 critic "
+                    "从 Pro 换成 Flash 做 A/B）：改 `GEMINI_MODEL_OVERRIDES`。"
+                )
 
             # Live ping — sends a trivial request to verify the model ID,
             # API key, and network path all work end-to-end. Crucial for
@@ -398,16 +433,33 @@ st.caption(
 
 # Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
 # 这里列出"Gemini 会介入"的阶段，而不是"Gemini 是主判"的阶段。
-GEMINI_ASSIST_STAGES: dict[str, str] = {
-    "gemini_reference_analyzer": "主判（Gemini-only，url_context 抓用户贴的参考 URL）",
-    "gemini_trend_scout_pre": "主判（Gemini-only，Google 搜小红书原文）",
-    "vibe_critic": "二审（Claude 判 pass 的 cell 再过 Gemini）",
-    "ministry_works_structure_review": "主判（Gemini-only，结构完整性）",
+# Tuple shape: (role_key for resolve_gemini_model, human description).
+GEMINI_ASSIST_STAGES: dict[str, tuple[str, str]] = {
+    "gemini_reference_analyzer": (
+        "reference_analyzer",
+        "主判（Gemini-only，url_context 抓用户贴的参考 URL）",
+    ),
+    "gemini_trend_scout_pre": (
+        "trend_scout",
+        "主判（Gemini-only，Google 搜小红书原文）",
+    ),
+    "vibe_critic": (
+        "critic",
+        "二审（Claude 判 pass 的 cell 再过 Gemini）",
+    ),
+    "ministry_works_structure_review": (
+        "structure_reviewer",
+        "主判（Gemini-only，结构完整性）",
+    ),
 }
 
 for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
     model = MODELS.get(stage_key)
-    gemini_role = GEMINI_ASSIST_STAGES.get(stage_key)
+    gemini_assist = GEMINI_ASSIST_STAGES.get(stage_key)
+    gemini_role: str | None = None
+    gemini_desc: str | None = None
+    if gemini_assist:
+        gemini_role, gemini_desc = gemini_assist
 
     # Assemble the right-hand-side badges based on which backends run here
     parts: list[str] = []
@@ -415,13 +467,15 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
         tier = "🟣 Opus" if "opus" in model else "🔵 Sonnet"
         parts.append(f"`{model}` {tier}")
 
-    if gemini_role and ENABLE_GEMINI_ASSIST and _gemini_key:
-        # Gemini actually available
-        parts.append(f"+ `{GEMINI_MODEL}` 🟢 Gemini · {gemini_role}")
-    elif gemini_role:
+    if gemini_desc and ENABLE_GEMINI_ASSIST and _gemini_key:
+        # Gemini actually available — show the resolved (per-role) model
+        # so override-vs-default is visible at a glance.
+        _resolved = resolve_gemini_model(gemini_role)
+        parts.append(f"+ `{_resolved}` 🟢 Gemini · {gemini_desc}")
+    elif gemini_desc:
         # Gemini role designed but not configured — annotate so user
         # understands why this stage may look "only Claude" in logs
-        parts.append(f"+ 🟢 Gemini · {gemini_role} _(未配置 · 跳过)_")
+        parts.append(f"+ 🟢 Gemini · {gemini_desc} _(未配置 · 跳过)_")
 
     if not parts:
         # e.g. structure_review when Gemini disabled + unconfigured

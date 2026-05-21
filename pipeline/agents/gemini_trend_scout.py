@@ -33,6 +33,7 @@ from pipeline.agents.gemini_client import (
     GeminiCallFailed,
     GeminiNotConfigured,
     call_gemini_json,
+    resolve_gemini_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +183,7 @@ async def run_trend_scout(
             system_prompt,
             user_message,
             enable_search=True,
+            model=resolve_gemini_model("trend_scout"),
         )
     except GeminiNotConfigured as e:
         logger.debug("[trend_scout] not configured, skipping: %s", e)
