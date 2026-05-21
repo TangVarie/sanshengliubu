@@ -128,6 +128,45 @@ def init_api_config():
         picked by ACTIVE_CLAUDE_RELAY or session override. Falls back
         to legacy top-level ANTHROPIC_API_KEY when no presets defined.
     """
+    # DeepSeek / VectorEngine 是独立 backend,跟 Claude 走 Vertex 还是 relay
+    # 无关 — 任一模式下 stage 用 deepseek-*/gpt-* override 都应该能找到
+    # backend。所以这两个的初始化必须放在 mode 判定之前;以前(v0.30.0/0.30.7
+    # 引入时)关在 relay 分支里,Vertex 部署下永远拿不到 DS/VE 配置,GPT 阶段
+    # 在 _call_openai_chat 报"未配 VectorEngine",DeepSeek 阶段同理。
+    _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
+    if _ds_key:
+        _api_config["deepseek"] = {
+            "api_key": _ds_key,
+            "base_url": (
+                st.secrets.get("DEEPSEEK_BASE_URL")
+                or "https://api.deepseek.com/anthropic"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] DeepSeek anthropic-compat 端点已配置 "
+            "(base=%s)",
+            _api_config["deepseek"]["base_url"],
+        )
+    else:
+        _api_config.pop("deepseek", None)
+
+    _ve_key = (st.secrets.get("VECTORENGINE_API_KEY") or "").strip()
+    if _ve_key:
+        _api_config["vectorengine"] = {
+            "api_key": _ve_key,
+            "base_url": (
+                st.secrets.get("VECTORENGINE_BASE_URL")
+                or "https://api.vectorengine.ai/v1"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] VectorEngine OpenAI-compat 端点已配置 "
+            "(base=%s),GPT 系列将通过这里调用",
+            _api_config["vectorengine"]["base_url"],
+        )
+    else:
+        _api_config.pop("vectorengine", None)
+
     # Vertex AI mode
     if st.secrets.get("GCP_PROJECT_ID"):
         _api_config["mode"] = "vertex"
@@ -159,46 +198,6 @@ def init_api_config():
     # ── Relay / direct mode ──────────────────────────────────────────
     presets = _list_claude_relay_presets()
     active_name = get_active_claude_relay_name()
-
-    # v0.30.0: DeepSeek 走官方 anthropic-compatible 端点(api.deepseek.com/
-    # anthropic),独立 secret + 独立 base_url。stage 级用 deepseek-* 模型时,
-    # _get_client_for_model 会路由到这里。和 tdyun/Claude/GPT 共存。
-    _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
-    if _ds_key:
-        _api_config["deepseek"] = {
-            "api_key": _ds_key,
-            "base_url": (
-                st.secrets.get("DEEPSEEK_BASE_URL")
-                or "https://api.deepseek.com/anthropic"
-            ).rstrip("/"),
-        }
-        logger.info(
-            "[init_api_config] DeepSeek anthropic-compat 端点已配置 "
-            "(base=%s)",
-            _api_config["deepseek"]["base_url"],
-        )
-    else:
-        _api_config.pop("deepseek", None)
-
-    # v0.30.7: GPT 走 vectorengine.ai 的 OpenAI 兼容 chat/completions 接口
-    # (tdyun 中转的 anthropic-compat 转发不支持 gpt 模型)。需要单独的
-    # OpenAI SDK + 独立 base_url + 独立 api_key,和 Claude/DeepSeek 共存。
-    _ve_key = (st.secrets.get("VECTORENGINE_API_KEY") or "").strip()
-    if _ve_key:
-        _api_config["vectorengine"] = {
-            "api_key": _ve_key,
-            "base_url": (
-                st.secrets.get("VECTORENGINE_BASE_URL")
-                or "https://api.vectorengine.ai/v1"
-            ).rstrip("/"),
-        }
-        logger.info(
-            "[init_api_config] VectorEngine OpenAI-compat 端点已配置 "
-            "(base=%s),GPT 系列将通过这里调用",
-            _api_config["vectorengine"]["base_url"],
-        )
-    else:
-        _api_config.pop("vectorengine", None)
 
     if not presets or not active_name:
         raise RuntimeError(
@@ -974,22 +973,14 @@ class BaseAgent:
         _model_overrides = _api_config.get("model_overrides") or {}
         effective_model = _model_overrides.get(self.stage_name) or self.model
 
-        # v0.30.0: 按模型族选 backend(Claude/GPT 走 default relay,DeepSeek
-        # 走独立官方 anthropic-compat 端点)。client 必须按 effective_model
-        # 来挑,不能用全局 _get_client。
-        client = self._get_client_for_model(effective_model)
-
-        # GPT 走 anthropic-compat relay 时,thinking JSON 参数会被 relay
-        # 转发到 OpenAI 接口,OpenAI 不认这个字段会 400。所以 GPT 系列
-        # 强制不发 thinking,即使 stage 在 THINKING_STAGES 里。DeepSeek
-        # 的 anthropic-compat 端点理论上支持 thinking,保持发送。
+        # GPT 系列必须用 vectorengine 的 OpenAI-compat chat/completions 接口,
+        # 不能用 anthropic SDK。**提前** dispatch,在 _get_client_for_model
+        # 之前 — 否则 Vertex 模式下 _get_client_for_model 看到 gpt-* 会直接
+        # raise("Vertex 模式不支持 GPT"),GPT stage 在 Vertex 部署下永远跑
+        # 不起来。返回相同的 (text, in_tok, out_tok, cache_read,
+        # cache_creation, thinking_fired) 元组,上层 run() 不用分支处理。
         _model_low = (effective_model or "").lower()
         _is_gpt_family = _model_low.startswith("gpt-")
-
-        # v0.30.7: GPT 走 vectorengine 的 OpenAI-compat chat/completions 接口,
-        # 不能用 anthropic SDK。提前 dispatch 到独立 helper,返回相同的
-        # (text, in_tok, out_tok, cache_read, cache_creation, thinking_fired)
-        # 元组,让上层 run() 不需要分支处理。
         if _is_gpt_family:
             return self._call_openai_chat(
                 system_prompt=system_prompt,
@@ -997,6 +988,11 @@ class BaseAgent:
                 effective_model=effective_model,
                 max_tokens=self.max_tokens,
             )
+
+        # v0.30.0: 按模型族选 backend(Claude 走 default relay 或 Vertex,
+        # DeepSeek 走独立官方 anthropic-compat 端点)。client 必须按
+        # effective_model 来挑,不能用全局 _get_client。
+        client = self._get_client_for_model(effective_model)
 
         kwargs: dict[str, Any] = {
             "model": effective_model,
