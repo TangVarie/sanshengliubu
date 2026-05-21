@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS reference_samples (
     category TEXT,                           -- 护肤 / 食品 / 3C / ...
     ai_analysis JSONB,                       -- 太子式分析(vibe_tags/hook/tone/comment_dna)
     quality_score INTEGER DEFAULT 0,         -- A/B 反馈加权(可选)
+    source_truth_vault_note_id TEXT,         -- truth-vault sync 来源 note id;非 TV-synced 行为 NULL
     created_by TEXT DEFAULT 'default',
     created_at TIMESTAMPTZ DEFAULT now()
 );
@@ -99,6 +100,11 @@ CREATE INDEX IF NOT EXISTS idx_reference_samples_platform_category
     ON reference_samples(platform, category);
 CREATE INDEX IF NOT EXISTS idx_reference_samples_quality
     ON reference_samples(quality_score DESC, created_at DESC);
+-- TV sync 幂等性:同一 truth-vault note 重复 sync 不产生重复 pack。
+-- Partial index — 只对 TV-synced 行强制唯一,自建 pack(IS NULL)不受影响。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_samples_tv_note_id_unique
+    ON reference_samples(source_truth_vault_note_id)
+    WHERE source_truth_vault_note_id IS NOT NULL;
 
 -- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
 ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
