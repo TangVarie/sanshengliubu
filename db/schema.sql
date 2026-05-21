@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS reference_samples (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- ⚠ schema.sql 升级路径补丁:CREATE TABLE IF NOT EXISTS 对已存在的表是
+-- no-op,新增列必须通过 ALTER TABLE 单独补,否则下面的 partial unique
+-- index 会因列不存在报 42703。每次给 reference_samples 加新列时都要在
+-- CREATE TABLE 块和 CREATE INDEX 块之间补一行 ALTER。
+ALTER TABLE reference_samples
+    ADD COLUMN IF NOT EXISTS source_truth_vault_note_id TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_reference_samples_created
     ON reference_samples(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reference_samples_platform_category
