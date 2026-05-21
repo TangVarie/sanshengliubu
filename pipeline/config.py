@@ -2,9 +2,129 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.24.0"
-VERSION_DATE = "2026-04-18"
-VERSION_NOTES = "审查加固:DB 空结果守护 + 上传大小限制 + FK SET NULL(需跑 migration 004)+ 缓存降级锁 + 自动刷新开关"
+VERSION = "v0.30.11"
+VERSION_DATE = "2026-05-21"
+VERSION_NOTES = (
+    "v0.30.11 feat: Gemini 按岗位 model override + 按模型计价表。"
+    "(1) 新加 GEMINI_MODEL_OVERRIDES dict(pipeline/config.py),6 个 "
+    "Gemini-driven agent (critic / structure_reviewer / trend_scout / "
+    "image_transcriber / screenshot_analyzer / reference_analyzer)各自岗位"
+    "独立挑模型;GEMINI_MODEL 退为全局默认。(2) 默认配置:vision + "
+    "structure + trend → gemini-3.5-flash (2026-05 发布,agentic/"
+    "multimodal 领先 3.1 Pro 且便宜 40%);critic + reference_analyzer 保 "
+    "3.1 Pro(烟火气判断 + 长文稠密召回还是 Pro 强,jury still out)。"
+    "(3) 新加 GEMINI_PRICE_TABLE,每模型独立费率;cost_usd 改用按模型查表"
+    "(以前全局一套率)。(4) gemini_client.py 暴露 resolve_gemini_model(role) "
+    "helper;6 个 agent 调用时各自传 role。(5) 设置页 → Gemini 区显示按岗位"
+    "映射表 + 阶段列表显示每阶段真实分配的模型。"
+    "v0.30.10 历史: strategy_loop 每次 resume 都强制重跑的老 bug — "
+    "_strategy_loop 实际写 strategy_debate_N 那种 stage_log,但 line 383 "
+    "的 resume 检查 done[\"secretariat\"] 永远拿不到 → 每次应用修订意见"
+    "或继续执行都重跑整个策略辩论,secretariat 看到 _revision_context "
+    "可能新增 direction(D6/D7),下游 cell_planner 给新 D 生成新 cell,"
+    "用户感觉『一直在跑新的 D』。修复:从 strategy_debate_* 反推最后一个"
+    "完整 plan(取最后一个偶数 turn = secretariat 发言的轮次,plan 在 "
+    "current_plan 字段),合成 done[\"secretariat\"] 让 resume 能跳过策略层。"
+    "v0.30.9 历史: 红蓝精炼真异模型对抗 + 创意/内容阶段统一改用 4.6/3.7: "
+    "(1) 红蓝精炼拆 RedBlueRed (Opus 4.6) + RedBlueBlue (Sonnet 3.7),"
+    "两个独立 stage_log 串行调用,Red 找 attacks 蓝队接力修复,"
+    "Red 空数组就跳过蓝队省 token;(2) 创意/内容相关阶段一律 4.6 或 "
+    "3.7 — vibe_critic / narrative_director / structural_rewriter / "
+    "ministry_personnel 从 Opus 4.7 降到 Opus 4.6(4.7 太精致,中文短"
+    "社交内容反而失真)。Opus 4.7 仅留给纯策略推理(crown_prince / "
+    "secretariat / chancellery_final / ministry_works)。"
+    "v0.30.8 历史: 启用 DeepSeek + 画像模拟双模型并跑: persona_simulator_alt "
+    "新 stage(deepseek-v4-pro)和主 persona_simulator(Sonnet 3.7)并行,"
+    "orchestrator asyncio.gather 启动两个 agent → 合并 personas 数组,"
+    "每条画像加 _source 字段(claude/deepseek)。同 id 自动改名避免冲突。"
+    "任一 backend 失败软降级,只缺谁的标记缺失,不阻塞流水线。"
+    "Claude 偏目标用户细腻反应,DeepSeek 偏草根/破圈视角,distribution 互补。"
+    "v0.30.7 历史: GPT 改走 vectorengine.ai 的 OpenAI-compat 接口: tdyun "
+    "anthropic-compat 中转不支持 GPT 模型,新增独立 OpenAI SDK 后端 "
+    "(api.vectorengine.ai/v1/chat/completions)。secrets.toml 加 "
+    "VECTORENGINE_API_KEY,_call_claude 检测到 gpt-* 自动 dispatch 到 "
+    "_call_openai_chat helper,返回元组同 _call_claude,上层无需分支。"
+    "兼容 OpenAI / o1 / gpt-5 系的 max_completion_tokens 自动切换。"
+    "requirements.txt 加 openai>=1.40。"
+    "v0.30.6 历史: Commit B — 1 个 HIGH + 3 个 MEDIUM 流程修复(audit 后续):"
+    "(M3)红蓝精炼传完整 system_prompt 而非前 500 字,Red Team 现在能"
+    "看到合规块/关键词避免误改。(M4)画像模拟和消费者模拟按 cell.platform "
+    "评判,多平台 brief 不再用 xhs 画像评 douyin cell;persona_simulator.md"
+    "新加多平台处理段。(M1)Gemini 结构审 hint 不再被 critic-pass 吃掉:"
+    "critic 让该 cell 过但 missing_items 非空时,强制 force-fail "
+    "borderline 进 rewriter 补结构。(H5)策略升级后清理受影响 cell 的"
+    "advisory 数据(persona_reactions/narrative_director/red_blue/"
+    "consumer_simulation),终审不再读过期诊断。"
+    "M2(cell_planner 跨批次共享 path 分配)留作后续单独决策。"
+    "v0.30.5 历史: Commit A — 4 处 dead drop 注入修复(audit HIGH 级):"
+    "(H1)工部·构建拿到 brief — slim_brief 含 target_audience / "
+    "core_claim / competitive_context / _user_raw_input,builder.md "
+    "新加『输入访问指南』教它何时翻原文;narrative_director rebuild "
+    "也带 brief。(H2)Gemini 趋势取样的真实小红书帖子 (_trend_intel."
+    "formatted_block) 显式注入 secretariat input,secretariat.md 加"
+    "『趋势取样校准』段把它当第一性输入。(H3)persona_simulator 的"
+    "per-cell 反应进 vibe_critic input,critic.md 加第 0.4 步『画像"
+    "反应交叉校验』,3 画像 ≥2 skip 强制 borderline。(H4)叙事导演"
+    "诊断 slim 摘要进 chancellery_final input,chancellery.md 加"
+    "『跨 cell 一致性』必查段。"
+    "v0.30.4 历史: 架构层修复: 太子不再是单点瓶颈。"
+    "orchestrator 把用户原始 free_text 挂到 brief._user_raw_input,"
+    "所有下游 agent 都能直接读原文(之前的 _raw_input_text 是 dead drop,"
+    "零 prompt 引用)。foundation_common.md 加『用户原始输入访问协议』,"
+    "统一指引下游何时翻原文 vs 信任太子。crown_prince.md 强化角色边界:"
+    "保管员 + 索引制作者,不是策略分析师——产品定位/目标人群/竞品策略"
+    "都是中书省/六部的活,太子只做结构化字段填充 + verbatim 保留素材。"
+    "v0.30.3 历史: 太子输入两处修复: (1) 截图分析(Gemini Vision)文本现在"
+    "会被 orchestrator 自动包装成 [参考文件: gemini_screenshot_analysis] "
+    "块拼进 free_text,自动受 60% 硬留存规则保护——之前只挂在 brief 字段,"
+    "几百字识图被太子压成一句总结;(2) 重跑时从 brief 里 strip "
+    "_revision_context / strategic_warnings 等流水线内部 state,避免上一"
+    "轮的修订意见污染 crown_prince 输入。用户原始信号(_screenshot_analysis* "
+    "/ _reference_post_urls / _library_sample_analyses)保留。"
+    "v0.30.2 历史: tdyun 中转 claude-opus-4-7-thinking 没配价导致 400,"
+    "未配置定价(BadRequestError type=new_api_error)。把所有策略阶段"
+    "改用 claude-opus-4-7 base(无 -thinking 后缀)— 4.7 base 内部仍"
+    "做 extended reasoning,只是不接受外部 thinking budget 控制。"
+    "刑部保留 claude-opus-4-6-thinking(已定价)。"
+    "v0.30.1 历史: 输出中心简化 + 修订按钮智能分流提示: 输出中心顶部新增"
+    "『成品提示词清单』主区,直接列 N 个不重复 prompt 的完整内容 + "
+    "示例文稿(代替原来要翻平台 tab + 多层 expander 的繁琐结构)。"
+    "应用修订按钮文字按实际行为校正:扫 mandatory_revisions 文本里的 "
+    "D\\d+ 和全局关键词,提前告诉用户『只会重建 D5』vs『会重跑整个工部』。"
+    "v0.30.0 历史: 多 vendor 路由 + 高质量模型预设(premium_multi_vendor): "
+    "(1) DeepSeek 走官方 anthropic-compat 端点(api.deepseek.com/anthropic),"
+    "新增 DEEPSEEK_API_KEY secret + per-model 路由器 _get_client_for_model;"
+    "(2) GPT 走 tdyun 中转的 anthropic-compat 路径(model='gpt-5.5'),"
+    "thinking 参数对 GPT 强制屏蔽(避免 OpenAI 后端 400);"
+    "(3) 各 stage 模型映射写入 PREMIUM_MULTI_VENDOR_MAP(代码层),"
+    "user 在 secrets.toml 删 model_overrides 即可启用;"
+    "(4) 中书省 ↔ 门下省 故意异厂家(Claude vs GPT)避免辩论同色彩。"
+    "v0.29.12 历史: (1) STAGE_MAX_TOKENS["
+    "ministry_personnel] 20K→32K,多画像 × authenticity_card 字段长容易"
+    "撞上限导致响应截断;(2) _try_repair_truncated_json 的 "
+    "cut_points[-300:] 硬限放开——13K+ 响应最后 300 个 cut point 常常"
+    "都卡在深层嵌套里,每个 candidate 都不合法,扫全部才能找到有效"
+    "cut;(3) JSON 提取失败错误消息改成 first 200 + last 200 双端"
+    "预览,方便判断是整段不是 JSON 还是只是尾部截断。"
+    "功能同 v0.29.11(画像模拟接入反馈链): 之前 persona_simulator 只写 "
+    "_persona_reactions 给 UI 显示,不参与任何决策,跑了等于白烧 token。"
+    "现在每条 cell 扫 3 个画像的 action,全 skip 的 cell 追加进 "
+    "strategic_warnings,和 consumer_simulation 走同一条告警通道 —— "
+    "UI 红色警告 + 如果 ENABLE_STRATEGIC_ESCALATION 开启会触发 "
+    "secretariat 修订 direction 的 stop_trigger/reward_type。"
+    "不依赖 summary.weak_cells(模型有时给 direction_id 而非 cell_id),"
+    "直接从 personas[*].reactions 逐 cell 统计更稳。"
+    "功能同 v0.29.9(流水线详情页可观测性大升级): (1) 新增『中间精炼』tab 展示 "
+    "叙事导演 / 红蓝精炼 / 画像模拟 三个阶段,之前 UI 没位置、"
+    "图标染色点进去看不到内容; (2) 网感 tab 补上 叙事结构重写 "
+    "(structural_rewriter) 的 per-cell 摘要; (3) 太子 tab 顶部新增 "
+    "『📎 接收到的参考文件』清单,按 txt/md/pdf/docx/图片 统一识别 "
+    "[参考文件: name] 包装 + 从 body 推断 kind/status,每个文件"
+    "一行状态图标 + 字数 + 预览,不再需要翻几百行 base64 确认"
+    "收到没;(4) free_text 显示一律折叠 BASE64_IMAGE 块和裸 "
+    "base64 串,用『📎 已折叠 · N 字符』代替,实际喂 agent 的是"
+    "完整原文不受影响。"
+)
 
 # ── Model assignments per stage ────────────────────────────────────────────
 # All stages use the same Claude model family. Whether thinking is enabled
@@ -41,10 +161,77 @@ VERSION_NOTES = "审查加固:DB 空结果守护 + 上传大小限制 + FK SET N
 #                   chancellery_final) may produce lower-quality plans.
 #                   Mostly useful for dev loops / cost-tight pilots.
 
-OPUS_MODEL = "claude-opus-4-6"
+OPUS_MODEL = "claude-opus-4-7"
+# 用于 all_sonnet preset 以及 planning / 结构化任务(planning 阶段需要
+# Sonnet 4-6 的稳定 JSON 输出能力)。
 SONNET_MODEL = "claude-sonnet-4-6"
+# v0.28.0: 内容写作专用模型。老版本 Sonnet(3.7)在纯写作任务上对齐
+# 痕迹更少,常被反馈"网感更强 / 更像真人",所以把 content 角色单独
+# 绑到 3.7 而不是跟 planning 共用 Sonnet 4.6。
+# 注意:实际模型名可能因 relay / Vertex 不同而需要调整——比如
+# Anthropic 官方是 "claude-3-7-sonnet-20250219"。如果你的接入点不
+# 认识 "claude-sonnet-3-7",可在 secrets.toml 的
+# [claude_relay_presets.X.model_overrides] 里覆盖:
+#   ministry_works_builder = "claude-3-7-sonnet-latest"
+#   vibe_rewriter = "claude-3-7-sonnet-latest"
+#   ...
+SONNET_CONTENT_MODEL = "claude-sonnet-3-7"
 
-MODEL_PRESET = "content_sonnet"
+# v0.30.0: 在代码层面直接锁定每个 stage 用哪个模型(高质量配置),用户
+# 不必再在 secrets.toml 里维护 model_overrides。可选 preset:
+#
+#   premium_multi_vendor(v0.30.0 默认,推荐) — 不限成本求最优组合,
+#     - 推理 / 长上下文 / 中文锐度都拉满
+#     - 中书省 vs 门下省 故意用不同厂家(Claude vs GPT)避免辩论同色彩
+#     - 内容生成保留 Sonnet 3.7(短中文网感实战最强)
+#     - 兵部 / chancellery 用 GPT 提供异色彩对抗
+#     - 需要 secrets.toml 同时配 Claude 中转 + (可选)DEEPSEEK_API_KEY
+#
+#   content_sonnet(v0.29.x 历史默认) — 保留兼容
+#   all_opus / all_sonnet — 单厂家全跑,降级方案
+MODEL_PRESET = "premium_multi_vendor"
+
+# v0.30.0: 各阶段精确模型映射 — 写在代码里防止 secrets.toml 误覆盖。
+# 用户实际中转里的模型 ID,要和 tdyun-style anthropic-compat relay 对齐。
+# 注:thinking 模式由模型名后缀 `-thinking` 控制(tdyun 约定),不是
+# 通过 thinking JSON 参数传(老路径)。
+PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
+    # ── 策略 / 推理核心(深推理,Opus 4.7)──
+    # v0.30.2: 不带 -thinking 后缀,tdyun 上 -thinking 没定价。Opus 4.7
+    # base 自带内部 reasoning。
+    "crown_prince": "claude-opus-4-7",                    # 太子(整理 + 索引)
+    "secretariat": "claude-opus-4-7",                     # 中书省(策略发言)
+    "chancellery_final": "claude-opus-4-7",               # 终审(holistic 把关)
+    "ministry_works": "claude-opus-4-7",                  # 工部架构(整脊柱)
+    # ── 异厂家辩论(Claude vs GPT)──
+    "chancellery": "gpt-5.5",                             # 门下省(critic)
+    "ministry_war": "gpt-5.5",                            # 兵部(刁钻竞争)
+    # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
+    "dispatcher": "claude-opus-4-6",
+    "ministry_revenue": "claude-opus-4-6",
+    "ministry_rites": "claude-opus-4-6",
+    "ministry_justice": "claude-opus-4-6-thinking",       # 合规要严
+    "ministry_works_cell_planner": "claude-opus-4-6",
+    # ── 创意 / 内容相关阶段(v0.30.9 user 规定):一律 4.6 或 3.7 ──
+    # Opus 4.7 太"精致 / 端正",对短中文社交内容反而失真。4.6 内容感稍松,
+    # Sonnet 3.7 写作语感最强但缺反思深度。按"判断 vs 写作"分:
+    "ministry_personnel": "claude-opus-4-6",              # 画像创作(创意)
+    "narrative_director": "claude-opus-4-6",              # 跨 cell 一致性诊断(创意判断)
+    "vibe_critic": "claude-opus-4-6",                     # 网感复检(judge)
+    "structural_rewriter": "claude-opus-4-6",             # 身份/缺口手术(content 重写)
+    "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",  # 内容写作
+    "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",           # 内容重写
+    # ── 红蓝精炼真对抗(v0.30.9):异模型 Red vs Blue ──
+    # 之前 Red 和 Blue 都用 Sonnet 3.7,同模型同盲区不构成真对抗。现在拆:
+    # Red Team 用 Opus 4.6(异 distribution,善找 AI 腔指纹和结构问题)
+    # Blue Team 用 Sonnet 3.7(写作语感,做最小修复保留人味)
+    "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",  # legacy 兼容,实际不用
+    "red_blue_red": "claude-opus-4-6",                    # 攻方
+    "red_blue_blue": "claude-3-7-sonnet-20250219-thinking",  # 守方
+    # ── 画像模拟双 backend(v0.30.8) ──
+    "persona_simulator": "claude-3-7-sonnet-20250219-thinking",  # Claude 系
+    "persona_simulator_alt": "deepseek-v4-pro",           # DeepSeek 异厂家
+}
 
 _STAGE_ROLES = {
     # Strategy / review: needs reasoning depth
@@ -65,22 +252,62 @@ _STAGE_ROLES = {
     "narrative_director": "strategy",
     # Content generation + taste judgment: voice quality matters
     "ministry_works_builder": "content",
-    "red_blue_refiner": "content",     # needs natural language feel
-    "persona_simulator": "content",    # simulates real humans
+    "red_blue_refiner": "content",     # legacy(v0.30.9 拆分后基本不用)
+    "red_blue_red": "content",          # v0.30.9: 红蓝攻方
+    "red_blue_blue": "content",         # v0.30.9: 红蓝守方
+    "persona_simulator": "content",    # simulates real humans (Claude 系)
+    "persona_simulator_alt": "content",  # v0.30.8: DeepSeek 异厂家画像
     "vibe_critic": "content",
     "vibe_rewriter": "content",
+    # v0.29.0: 叙事结构重写者 — 和 vibe_rewriter 同角色(内容写作),
+    # 走 content 池(Sonnet 3.7 网感)。
+    "structural_rewriter": "content",
 }
 
 
 def _resolve_models(preset: str) -> dict[str, str]:
     """Assemble the MODELS dict from role tags + preset. Returning a dict
-    keeps consumers (logging, cost accounting, settings UI) unchanged."""
+    keeps consumers (logging, cost accounting, settings UI) unchanged.
+
+    角色 → 模型映射(按 preset):
+
+    content_sonnet(默认):
+      - content 角色(builder / vibe_critic / vibe_rewriter / red_blue /
+        persona_simulator) → SONNET_CONTENT_MODEL(默认 Sonnet 3.7,写作
+        人味最重)
+      - 其他所有角色(strategy + planning + cross-cell coherence) →
+        OPUS_MODEL(默认 Opus 4.7,深推理)
+
+    all_sonnet:
+      - content 角色 → SONNET_CONTENT_MODEL(Sonnet 3.7)
+      - 其他角色 → SONNET_MODEL(Sonnet 4.6,稳定 JSON 输出)
+
+    all_opus:
+      - 全部 → OPUS_MODEL
+
+    注:planning 角色(尚书省 / 六部 / 格子规划)在 content_sonnet 下用 Opus
+    (不是 Sonnet),因为 "Structured planning: Opus preferred for stability"
+    ——结构化派发需要稳定的指令理解,降到 Sonnet 会偶尔漏字段。如果要
+    planning 走 Sonnet 省钱,改用 all_sonnet preset。
+    """
     if preset == "all_sonnet":
-        return {k: SONNET_MODEL for k in _STAGE_ROLES}
+        # 全 Sonnet 模式:content 用 3.7 保网感,其他用 4.6 保结构
+        return {
+            k: (SONNET_CONTENT_MODEL if role == "content" else SONNET_MODEL)
+            for k, role in _STAGE_ROLES.items()
+        }
     if preset == "content_sonnet":
         return {
-            k: (SONNET_MODEL if role == "content" else OPUS_MODEL)
+            k: (SONNET_CONTENT_MODEL if role == "content" else OPUS_MODEL)
             for k, role in _STAGE_ROLES.items()
+        }
+    if preset == "premium_multi_vendor":
+        # v0.30.0:每个 stage 都从 PREMIUM_MULTI_VENDOR_MAP 直接拿模型名;
+        # 没在 map 里的 stage(罕见,通常是新增的 stage 还没补)fallback 到
+        # OPUS_MODEL,既保证能跑也提示要补。
+        return {
+            k: PREMIUM_MULTI_VENDOR_MAP.get(k, OPUS_MODEL)
+            for k in _STAGE_ROLES
         }
     # Default / fallback: all_opus
     return {k: OPUS_MODEL for k in _STAGE_ROLES}
@@ -157,8 +384,14 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "secretariat": MAX_TOKENS_STRATEGY,
     "chancellery": MAX_TOKENS_STRATEGY,
     "dispatcher": 20000,
-    "ministry_personnel": 20000,
+    # v0.29.12: 吏部经常超 20K(多画像 × authenticity_card 字段长),撞
+    # max_tokens 截断产出破损 JSON。修复 JSON 重建能救大多数,但直接
+    # 给足上限从源头减少截断。
+    "ministry_personnel": 32000,
     "ministry_revenue": 20000,
+    "persona_simulator_alt": 20000,  # v0.30.8: 和主 persona_simulator 同档
+    "red_blue_red": 16000,             # v0.30.9: 攻方输出 attacks 列表,不需要太大
+    "red_blue_blue": 24000,            # v0.30.9: 守方输出 fixes + refined demo + system_prompt
     "ministry_rites": 20000,
     "ministry_war": 20000,
     "ministry_justice": 20000,
@@ -167,6 +400,7 @@ STAGE_MAX_TOKENS: dict[str, int] = {
     "ministry_works_builder": 32000,
     "vibe_critic": 20000,
     "vibe_rewriter": 24000,
+    "structural_rewriter": 24000,  # v0.29.0: 和 vibe_rewriter 一致
     "chancellery_final": MAX_TOKENS_STRATEGY,
 }
 
@@ -251,12 +485,53 @@ ENABLE_GEMINI_ASSIST = True
 # gemini-3.1-pro-preview), not dashes. `gemini-3-1-...` is wrong.
 #
 # Common picks:
-#   - gemini-3.1-pro-preview        (latest Gemini 3.1 Pro preview)
+#   - gemini-3.5-flash              (released 2026-05; agentic/multimodal lead, cheaper)
+#   - gemini-3.1-pro-preview        (best on dense reasoning + long-context recall)
 #   - gemini-3.1-pro-preview-customtools  (same + tool-use features)
 #   - gemini-3-pro-preview          (earlier Gemini 3 Pro preview)
 #   - gemini-2.5-pro                (stable, widely available)
-#   - gemini-2.5-flash              (cheapest, fine for critic role)
+#   - gemini-2.5-flash              (cheap legacy)
+#
+# This is the GLOBAL DEFAULT — applies to any role not listed in
+# GEMINI_MODEL_OVERRIDES below.
 GEMINI_MODEL = "gemini-3.1-pro-preview"
+
+# Per-role model override. Each Gemini-driven agent looks itself up here
+# (via resolve_gemini_model() in gemini_client.py); if absent, falls back
+# to GEMINI_MODEL above.
+#
+# Why per-role:
+#   Gemini 3.5 Flash (2026-05) leads 3.1 Pro on agentic / coding / multi-
+#   modal benchmarks, AND is ~40% cheaper. But Flash gives up ground on
+#   academic reasoning and dense long-context recall. So the "best" model
+#   genuinely depends on the role:
+#
+#   - Vision (image_transcriber, screenshot_analyzer):
+#       Flash wins outright on multimodal understanding → Flash.
+#   - Structural checklist (structure_reviewer):
+#       Agentic-style task, Flash wins on agentic benchmarks → Flash.
+#   - Search-grounded scout (trend_scout):
+#       Quality dominated by Google Search grounding (billed separately
+#       at ~$35/1k queries); model cost is small fraction → Flash for
+#       speed + savings.
+#   - Long-content URL reading (reference_analyzer):
+#       Posts can be long, dense recall matters → keep Pro.
+#   - "网感" / "烟火气" critic (critic):
+#       Nuanced judgment on AI-tone. Flash may flag more aggressively or
+#       miss subtle borderline cases. Jury still out — kept on Pro for
+#       now. Flip to Flash to A/B test; the critic's verdict change rate
+#       is the signal you're looking for.
+#
+# To override globally for ALL roles, leave this empty {} and just edit
+# GEMINI_MODEL above. To pin one role to a specific model, add it here.
+GEMINI_MODEL_OVERRIDES: dict[str, str] = {
+    "image_transcriber":   "gemini-3.5-flash",
+    "screenshot_analyzer": "gemini-3.5-flash",
+    "structure_reviewer":  "gemini-3.5-flash",
+    "trend_scout":         "gemini-3.5-flash",
+    "reference_analyzer":  "gemini-3.1-pro-preview",
+    "critic":              "gemini-3.1-pro-preview",
+}
 
 # Trend scout — when True, Gemini runs a live Google Search
 # (site:xiaohongshu.com) in two places:
@@ -286,12 +561,31 @@ GEMINI_TREND_SCOUT_TARGET_COUNT = 10
 # typically 2-8K so the model will stop early anyway.
 GEMINI_MAX_OUTPUT_TOKENS = 16384
 
-# Rough per-1M-token prices (USD) for cost accounting. Update when
-# Google publishes final pricing for the chosen model. These values are
-# intentionally on the high side so reported cost errs toward "expensive"
-# rather than "surprise bill".
+# Rough per-1M-token prices (USD) for cost accounting. Fallback used by
+# _estimate_cost_usd when the running model isn't in GEMINI_PRICE_TABLE
+# below. Intentionally on the high side so reported cost errs toward
+# "expensive" rather than "surprise bill".
 GEMINI_COST_PER_1M_INPUT = 1.25
 GEMINI_COST_PER_1M_OUTPUT = 10.0
+
+# Per-model price table. Keys must match the model IDs used in
+# GEMINI_MODEL / GEMINI_MODEL_OVERRIDES. Add new entries when you switch
+# to a new model — otherwise the fallback rates above kick in and cost
+# accounting drifts.
+#
+# Sources (verify before billing-critical decisions):
+#   - gemini-3.5-flash:        $1.50 / $9.00 per 1M (Google I/O 2026)
+#   - gemini-3.1-pro-preview:  $2.50 / $15.00 per 1M
+#   - gemini-2.5-pro:          $1.25 / $10.00 per 1M
+#   - gemini-2.5-flash:        $0.075 / $0.30 per 1M
+GEMINI_PRICE_TABLE: dict[str, dict[str, float]] = {
+    "gemini-3.5-flash":             {"input": 1.50,  "output": 9.00},
+    "gemini-3.1-pro-preview":       {"input": 2.50,  "output": 15.00},
+    "gemini-3.1-pro-preview-customtools": {"input": 2.50, "output": 15.00},
+    "gemini-3-pro-preview":         {"input": 2.50,  "output": 15.00},
+    "gemini-2.5-pro":               {"input": 1.25,  "output": 10.00},
+    "gemini-2.5-flash":             {"input": 0.075, "output": 0.30},
+}
 
 
 # ── Prompt Caching ────────────────────────────────────────────────────────
@@ -310,15 +604,24 @@ ENABLE_PROMPT_CACHING = True
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    "claude-opus-4-7": 15.0,
     "claude-opus-4-6": 15.0,
     "claude-opus-4-1": 5.0,
     "claude-sonnet-4-6": 3.0,
+    "claude-sonnet-3-7": 3.0,  # Sonnet 3.7 价格与 Sonnet 4.x 同量级
+    # Anthropic 官方名兼容(如果 relay 要求用全名)
+    "claude-3-7-sonnet-20250219": 3.0,
+    "claude-3-7-sonnet-latest": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-7": 75.0,
     "claude-opus-4-6": 75.0,
     "claude-opus-4-1": 25.0,
     "claude-sonnet-4-6": 15.0,
+    "claude-sonnet-3-7": 15.0,
+    "claude-3-7-sonnet-20250219": 15.0,
+    "claude-3-7-sonnet-latest": 15.0,
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────
@@ -329,6 +632,31 @@ DEFAULT_PLATFORM = "小红书"
 VIBE_LOOP_HARD_CAP = 3       # absolute max iterations
 VIBE_LOOP_INITIAL_CAP = 2    # start with this many rounds
 VIBE_LOOP_ESCALATE_THRESHOLD = 0.30  # failure rate to unlock extra round
+
+# v0.29.0: critic-rewriter 责任分流 feature flag
+# 打开时:按 critic 输出的 root_cause_kind 把 fail 的 cell 分流到
+#   - structural_rewriter(身份错位 / 缺口方向错)
+#   - vibe_rewriter(表层钩子弱 / 模板性 fail)
+#   - strategic_warnings(策略层错配,rewriter 改不了)
+# 关闭时:全部塞给 vibe_rewriter(v0.28 及之前的行为),作为稳妥兜底。
+ENABLE_STRUCTURAL_REWRITER = True
+
+# v0.29.1: 策略层自动升级(C.2.1)— vibe_loop 结束后若仍有 strategic_warnings,
+# 自动回 secretariat 修订受影响的 direction(更新 stop_trigger / reward_type /
+# role_embodiment 等锚点),然后再跑一次 vibe_loop 让 critic + rewriter
+# 用新锚点重新判决。关闭时保持 v0.29.0 行为(只写 warnings 由用户人工介入)。
+ENABLE_STRATEGIC_ESCALATION = True
+# 硬上限:策略层循环的最大轮数。默认 1 — 只允许一次自动升级,避免 direction
+# 来回摆动陷入死循环。超过后 strategic_warnings 仍然会写到 final_system
+# 让用户人工处理。
+STRATEGIC_LOOP_MAX_ITERATIONS = 1
+
+# v0.29.1: 消费者模拟(C.2.2)— 在 vibe_loop 结束后、终审前,让
+# persona_simulator 以 stop_trigger 描述的具体目标用户身份对每个 cell
+# 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。结果存到
+# final_system._consumer_simulation,UI 显示;cell 若被目标用户 scroll,会
+# 追加进 strategic_warnings 走人工审查通道。
+ENABLE_CONSUMER_SIMULATION = True
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
 RED_BLUE_CONCURRENCY = 3
@@ -365,9 +693,16 @@ PIPELINE_STAGES = [
     ("ministry_works_cell_planner", "工部·格子规划", "📐"),
     ("ministry_works_builder", "工部·构建", "🔨"),
     ("narrative_director", "叙事导演", "🎬"),
-    ("red_blue_refiner", "红蓝精炼", "⚔️"),
-    ("persona_simulator", "画像模拟", "👥"),
+    ("red_blue_red", "红队·攻", "🔴"),
+    ("red_blue_blue", "蓝队·守", "🔵"),
+    ("persona_simulator", "画像模拟·Claude", "👥"),
+    ("persona_simulator_alt", "画像模拟·DeepSeek", "🔮"),
     ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
     ("vibe_critic", "网感复检", "🎯"),
+    # v0.29.3: 补展示 — 这两个阶段其实一直在跑也各自记 stage_log,
+    # 但 PIPELINE_STAGES 漏了,导致 Settings 页面"模型配置"看不到它们
+    # 用的是哪个模型(用户手动在 secrets 里配了 override 也找不到对应行)。
+    ("vibe_rewriter", "网感重写", "✏️"),
+    ("structural_rewriter", "叙事结构重写", "🧱"),
     ("chancellery_final", "终审", "✅"),
 ]

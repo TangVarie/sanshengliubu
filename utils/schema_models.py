@@ -45,6 +45,14 @@ class ProductBrief(BaseModel):
     raw_materials: str = ""
     reference_summary: str = ""
     existing_prompt_analysis: str = ""
+    # v0.29.0: 明广告决策点 — 决定整个内容矩阵的叙事姿态。
+    # 下游 vibe_critic 的 identity_consistency 判决依赖此字段:
+    #   stealth          — 软植入,身份必须和"素人/朋友/观察者"对齐
+    #   disclosed_kol    — 博主承认推广,身份必须和"接了广但真诚推"对齐
+    #   brand_direct     — 品牌明说,身份必须和"品牌自己在介绍产品"对齐
+    #   mixed            — 矩阵内多种共存(direction 各自声明自己走哪种)
+    # 未填时默认 stealth(保留 v0.28 及之前的隐含假设)。
+    advertising_stance: str = ""
 
 
 # ── 中书省 · Secretariat Output ───────────────────────────────────────────
@@ -58,6 +66,16 @@ class TacticalDirection(BaseModel):
     target_scenario: str = ""
     content_angle: str = ""
     expected_output_type: str = ""
+    # v0.27.0 "B 版思考顺序"三个必填字段 — secretariat 标注,下游 cell_planner
+    # + vibe_critic 消费。extra="allow" 保留兼容性,未填时下游按默认值走。
+    paradigm: str = ""  # "A_emotional_hook" | "B_meta_response"
+    reward_type: str = ""  # 6 选 1: 实用信息/社交信息/情绪共鸣/认知挑战/感官新奇/身份共谋
+    role_embodiment: str = ""  # 6 选 1: 旁观者/学习者/窥探者/受害者/共谋者/评审者
+    gap_direction: str = ""  # 2 选 1: 事件本身 | 复现方法
+    # v0.29.0: 用户心理驱动锚点 — 一句具体的因果陈述,给下游 vibe_critic 的
+    # interest_align 判决做硬对照锚点(替代含糊的 target_audience 散文)。
+    # 未填时下游退回到 target_audience 反推(兼容旧 run)。
+    stop_trigger: str = ""
 
 
 class ModulePlan(BaseModel):

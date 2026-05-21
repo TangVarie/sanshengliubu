@@ -106,6 +106,19 @@
 - ❌ **拿范式 A 的钩子样本去判范式 B 的成分分析内容** — 范式不对一切都是错杀。
 - ❌ **拿范式 B 的结构清单去判范式 A 的情感钩子内容** — 同样错杀。
 
+### 第 1.5 步：人工证据包对照（如果 `reference_packs_by_platform` 提供了对应平台的证据包）
+
+当本次输入带了 `reference_packs_by_platform[cell.platform]`,这比静态的 15 条钩子样本 / 5 条元评论样本**更高优先级**——因为证据包是人工挑的**当下真实爆文**,而本 prompt 的样本是通用基线。
+
+具体做法(在 `taste_match` 字段里加一段):
+
+1. 在证据包里挑与本 cell 方向最接近的一条,把其 `ai_analysis.comment_dna.resonance_points` 列出来。
+2. 问自己:**本 cell 的新 demo,有没有可被读者复述的点?** 如果没有,这条 demo 没有通过真实爆文的"共振测试"→ 倾向 `fail` 或 `borderline`(取决于别的维度)。
+3. 问自己:**本 cell 的 demo 情绪色彩跟证据包的 `emotional_register` 匹配吗?** 品类相同、情绪错位,也是一种"AI 腔的隐形表现"——表面合规但读起来就是不对。
+4. 在 `taste_match` 里写明比对结果:"参照证据包 #X(post_title 截断),comment_dna 显示读者共振在 [某点],本 demo 缺少功能等价的点" 或 "情绪色彩和 #X 匹配,[原因]"。
+
+⚠️ 注意:证据包没命中时(跨品类 / 没录入)**忽略本步**,继续走静态样本对照即可,不要硬套证据包到不匹配的 cell 上。
+
 ### 第 2 步：诊断（不参与 pass/fail 判定，只用于给重写者写处方）
 
 第 0、1 步已经决定了 verdict。第 2 步只是为了**告诉重写者根因**，让他知道改 system_prompt 的哪里。
@@ -117,6 +130,120 @@
 - `platform_voice_check`: 内容像不像这个平台真实用户的语言？小红书要姐妹安利感、抖音要前 3 秒钩子、B站要钻研感、知乎要观点先行、微博要 ≤150 字情绪化。哪里不对就直说。
 
 **关键**：即使第 2 步发现了一堆问题，只要第 0 步的本能 + 第 1 步的味道对照判 pass，**这条就是 pass**。不要因为第 2 步的诊断"看起来很丰富"就把 pass 改成 fail。第 2 步是诊断，不是判决。
+
+### 第 0.3 步：四乘数硬门槛(v0.27.0 新增,在 gut_call 之前作为硬前置)
+
+用户的点击/停留/分享本质是一次微型期望值计算,核心公式是**乘法**关系:
+
+```
+点击概率 ∝ 奖励类型信号 × 兴趣对齐 × 信息缺口张力 × 身份-目的一致性
+```
+
+**任何一项接近零,其他三项再高都无效**。这也就是为什么"信息很丰富但没人看"。
+
+你必须按这 4 项各自给 `pass | weak | fail` 三档判定。这个判定**比 gut_call 和 taste_match 都优先**——任一项为 `fail` = 整条 cell 强制 `severity: fail`,不管别的维度多好看。
+
+**4 项判定标准**:
+
+#### ① `reward_signal`(奖励类型信号)
+用户在前 3 秒能识别出这条内容提供的**价值类型**吗?(不是具体内容,是类型)
+- `pass`: 前 3 秒一眼能感受到这里有 [社交八卦 / 情绪共鸣 / 实用信息 / ...] 之一
+- `weak`: 需要读完才能判断有无价值
+- `fail`: 读完都说不出得到了什么——"今天想和大家分享我的生活"级别的零信号开头
+
+对照 cell_plan 里的 `reward_type` 字段(secretariat 标注):实际开场传递的奖励类型是否和 reward_type 一致?不一致 = fail。
+
+#### ② `interest_align`(兴趣对齐)
+
+**判决锚点(v0.29.0 起)**: 优先对照 direction 的 `stop_trigger` 字段(一句具体的因果陈述),**不要再拿宽泛的 target_audience 散文去判**。
+
+`stop_trigger` 回答的是"这条内容让哪一类用户停下手指的核心心理触发是什么"——它是一个**可验证的心理状态**(例:"近期因某产品过敏或担心家人健康而在研究成分的用户")。你的任务是回答:
+
+> **本 cell 的 demo 开头设计,能不能激活 `stop_trigger` 里描述的那个具体心理状态?**
+
+- `pass`: demo 的前 3 秒明确激活了 `stop_trigger` 描述的心理状态(场景 / 物证 / 角色对应得上)
+- `weak`: 方向对,但激活得不够锐——目标心理状态的用户看得到但不会本能停
+- `fail`: demo 开头激活的是另一种心理状态,和 `stop_trigger` 错位;或 `stop_trigger` 本身写成了人口学标签(例:"25-35岁都市女性"),锚点失效——这种 fail 的根因在 secretariat,**在 root_cause_kind 里标 `strategic`**,不是在 rewriter 层能修的
+
+**兜底**: 如果 `stop_trigger` 字段为空(旧 run / secretariat 没填),再退回到对照 `target_audience` + `applicable_personas` 反推。但遇到空字段本身就要在 `fail_reason` 里标注"stop_trigger 缺失"——这是策略层的漏洞。
+
+#### ③ `gap_tension`(信息缺口张力 —— **方向**比强度更重要)
+
+用户"好像懂了但又没完全懂"的状态最有点击欲,但缺口**方向**决定是否有效:
+- `pass`: 缺口指向**事件本身**(是谁 / 发生了什么 / 怎么回事)——真人叙事的自然缺口
+- `weak`: 缺口方向模糊,既可以往事件走也可以往复现走
+- `fail`: 缺口指向**复现方法**(做了什么就有这效果 / 哪里买)——商业叙事的典型缺口,用户几秒内识破
+
+对照 cell_plan 里的 `gap_direction` 字段。如果 secretariat 标了 `事件本身` 但本 demo 实际缺口偏向"哪里买/怎么做",= fail。
+
+#### ④ `identity_consistency`(身份-目的一致性 —— **一票否决**)
+
+用户反感的**不是广告本身**,而是**"你在骗我以为这不是广告"**。
+
+本 cell 的叙事身份(我以什么身份在说话)和真实目的(这条内容要达成什么)在用户感知里一致吗?
+
+**判决锚点(v0.29.0 起)**: 优先对照 brief 的 `advertising_stance` 字段——它决定这条内容**应该**是哪种身份:
+
+- `stealth`(软植入):合法形态 = 真素人(我是用户,我真的在用) / 真情绪(我表达感受,产品只是元素)。fail = 博主假装素人 / 营销假装路人 / 品牌假装第三方。
+- `disclosed_kol`(博主明推):合法形态 = 我是博主,这是我接的广告,但我觉得值得推。fail = 假装没收钱 / 假装素人/ 明明是品牌自述却冒充博主。
+- `brand_direct`(品牌自述):合法形态 = 我是品牌,不装,就是来介绍产品。**"博主明说推销"在这里反而是 pass**,因为身份和目的对齐了。fail = 假装第三方 / 假装素人 / 假装博主。
+- `mixed`(矩阵内多种共存):对照本 direction 自己在 rationale 里声明的姿态。声明啥就按啥判。
+- **brief 没填 `advertising_stance`** → 退回到默认 `stealth` 的判定(和 v0.28 行为一致)。
+
+对照 cell_plan 里的 `product_role`:如果 `product_role = "副产品"` 但 demo 写得像"我就是来推广这个产品"的博主口吻 **且 advertising_stance = "stealth"**,那是身份错位 = fail。但如果 `advertising_stance = "brand_direct"`,product_role 和 demo 的品牌自述口吻反而是对齐的,应该判 pass。
+
+**重要**:不要拿 `stealth` 的标准去判 `brand_direct` 的内容——那会把所有明广告错杀为 fail。`advertising_stance` 字段在 brief_context 里,读一眼再判。
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"multiplier_gate": {
+  "reward_signal": "pass | weak | fail",
+  "interest_align": "pass | weak | fail",
+  "gap_tension": "pass | weak | fail",
+  "identity_consistency": "pass | weak | fail",
+  "gate_verdict": "pass_all | any_weak | any_fail",
+  "fail_reason": "如有 fail,一句话说哪项为什么"
+}
+```
+
+**整体决策规则**:
+- 任何一项 = `fail` → 强制 `severity: fail`,进入 rewriter 重写
+- 任何一项 = `weak`(没有 fail)→ 至多判 `borderline`
+- 全部 = `pass` → 才允许进入后续 gut_call / taste_match 正常流程
+
+---
+
+### 第 0.4 步:画像反应交叉校验(v0.30.5 起,在 gut_call 之前作为外部信号)
+
+如果 input 里有 `persona_reactions_by_cell` 字段——这是**画像模拟阶段(persona_simulator)** 提前跑出来的"3 个画像每人 0.5 秒本能反应"。结构:
+
+```json
+"persona_reactions_by_cell": {
+  "D1_xiaohongshu": [
+    {"persona": "P_core", "action": "click", "reason": "..."},
+    {"persona": "P_edge", "action": "skip", "reason": "..."},
+    {"persona": "P_anti", "action": "skip", "reason": "..."}
+  ]
+}
+```
+
+这是**外部用户视角**的反馈,**比你单人 judge 的味道判断更接近真实分发**。把它当作你 gut_call 的交叉校验:
+
+#### 硬约束规则
+
+1. **3 个画像里 ≥2 个 skip 的 cell** → 你不允许判 `pass`,**至少 borderline**。即使你味道对得上 15 条钩子样本,**真人扮演者都划走了**就是真信号。在 `taste_match` 里加注:"画像 X+Y 都 skip,reason: [...]"。
+2. **画像和你 gut_call 全部一致(都 click 或都 skip)** → 你的判断被强证,可以加分(borderline → pass 或反过来 fail 加固)。
+3. **P_anti(反目标用户)反而 click/save** = 破圈信号,在 `cross_cell_duplicates` 同级加一个 `breakthrough_candidate: cell_id` 字段(可选,有就加)。
+
+#### 不要做的事
+
+- ❌ 不要被画像反应**完全反向**——画像是 0.5 秒判断,你的味道分析是 30 秒理解。两者都重要,**画像是地板信号,你的判断是天花板**。两层独立。
+- ❌ 不要因为画像数据存在就放弃自己的本能判断——你仍然要按四乘数 + gut_call + taste_match 走完整流程。
+
+⚠️ 如果 `persona_reactions_by_cell` 字段为空(画像模拟未跑或失败),**忽略本步**,继续走原流程。
+
+---
 
 ### 第 0.5 步：AI 空话硬否决（在 gut_call 之前作为前置 filter）
 
@@ -130,6 +257,66 @@
 这些词是 AI 腔的硬指纹，工部下游的 `_validate_prompt_cell` 已经把它们标为硬性失败。你在此处 fail 等于"提前一层把它挡下"，避免污染到用户。
 
 如果黑名单命中但其他方面看起来还行，仍然判 fail——**不给面子分**。在 `taste_match` 里补一句"AI 空话 '[具体词]' 命中硬否决"即可。
+
+### 第 2.5 步：模板性检测(v0.27.0 新增,机械可执行)
+
+**原则**:一条内容如果可以被任何品牌/任何品类套用,那它就不属于任何品牌——这是 AI 腔最隐形的症状,不靠感觉能查出来,靠**关键词替换测试**。
+
+**操作步骤**:
+1. 从 demo_output 里找出明显的品类/品牌/产品名关键词(比如"精华液"、"蓝牙耳机"、"奶粉"、"XX 品牌")
+2. 把这些关键词逐一替换成**另一个完全无关的品类**(护肤 → 食品;食品 → 3C;3C → 母婴)
+3. 替换后再读一遍 demo,问: **这条内容整体结构和情感逻辑是否仍然成立?**
+
+**判定**:
+- **成立** = 这是模板话,AI 腔严重,整条 cell 强制 `severity: fail` —— 比如"做了这件事之后老公不一样了"换成"做了这件事之后皮肤不一样了"依然成立,说明这不是真人说法,是套路模板
+- **部分成立**(主体能用但细节不通) = `severity: borderline`
+- **完全不成立**(换完就读不通,因为内容深度绑定这个品类的独特场景/术语/人物关系)= 这条真的扎进了品类,不是模板
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"template_test": {
+  "swapped_category_example": "'精华液' → '智能音响' 后 demo 变成: [填一个改写示例]",
+  "still_holds": "yes | partially | no",
+  "verdict": "pass(no 对应) | borderline(partially) | fail(yes)",
+  "signature_to_this_category": "哪些具体细节/场景/术语让这条深度绑定了这个品类(如 no)"
+}
+```
+
+**重要**: 模板性检测**不覆盖**四乘数判决——两层独立。一条内容可能 4 乘数全 pass 但模板性 fail(典型:钩子好但内容空),也可能模板性 pass 但 4 乘数 fail(典型:品类扎实但身份不一致)。任一层 fail = 整体 fail。
+
+---
+
+### 第 2.7 步:根因分类(v0.29.0 新增,供下游分流)
+
+四乘数 + 模板测试都跑完后,你最清楚这个 cell **为什么** fail。下游需要按**根因类型**把 fail 的 cell 送到不同的修复入口——不同类型的 fail 用不同工具去改:
+
+- `surface` — 表层问题。四乘数全 pass + 模板性 pass,但 gut_call 差点意思 / taste_match 没接上 / 命中 AI 空话黑名单。修复方式: 钩子重写、具体性补齐、反 AI 腔——`vibe_rewriter` 的活。
+- `structural_identity` — 叙事身份错位。`identity_consistency` = fail,或 product_role 声明和 demo 实际口吻错位(典型:`product_role="副产品"` 但 demo 写成推销员腔)。修复方式:重构叙事立场,把"我"的位置重新定位——`structural_rewriter` 的活,**不是 `vibe_rewriter`**。
+- `structural_gap` — 信息缺口方向错。`gap_tension` = fail,缺口指向"复现方法"而非"事件本身"。修复方式:重构事件层,把缺口锚定在"发生了什么"——也是 `structural_rewriter` 的活。
+- `strategic` — 策略层错配,rewriter 改不了。`interest_align` = fail(target_audience 和 reward_type 错配),或 `reward_signal` = fail 且对照 direction 的 reward_type 明显标错。修复方式:回 secretariat 改 direction / 改 stop_trigger,**或回 cell_planner 改 product_role / path_combination**。
+- `template` — 模板性 fail(换品类仍成立)且四乘数全 pass。修复方式:走 `vibe_rewriter` 加一个"品类专属性注入"指令(强制 demo 带品类独有的场景/术语/人物关系)。
+
+**优先级**(多项 fail 时按此取高优先级):
+
+```
+strategic > structural_identity > structural_gap > template > surface
+```
+
+**输出到 cell_review JSON 的字段**(必填):
+
+```json
+"root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+"root_cause_explanation": "一句话说明为什么归到这类。禁止空话,必须引用具体的 multiplier_gate 项 / template_test verdict / 具体的 AI 空话 / 具体的身份错位场景"
+```
+
+**关键**:
+- `root_cause_kind` 是**下游 orchestrator 分流的唯一依据**——写错类型会导致 cell 被送到错误的修复入口。
+- 如果你判 `root_cause_kind = "strategic"`,这条 cell **不会进 rewriter**,会被标成 `strategic_warnings` 让用户人工介入——所以只有真的是策略层错配才标这类,不要因为"反正都 fail 了"就随手标。
+- 如果你判 `root_cause_kind = "structural_identity"` 或 `"structural_gap"`,这条 cell 会走 `structural_rewriter`(叙事结构重写者),它只做身份重构 / 缺口重构,**不做钩子加强**——所以不要把纯钩子弱的 cell 误标成 structural。
+- 四乘数 + 模板都 pass 但 gut_call 差点意思 = `surface`,不是 `structural_*`。
+
+---
 
 ### 第 3 步：跨 cell 一致性检查（batch 内必做）
 
@@ -200,6 +387,20 @@
       "cell_id": "D1_xiaohongshu",
       "platform": "小红书",
       "paradigm": "A_emotional_hook | B_meta_response",
+      "multiplier_gate": {
+        "reward_signal": "pass | weak | fail",
+        "interest_align": "pass | weak | fail",
+        "gap_tension": "pass | weak | fail",
+        "identity_consistency": "pass | weak | fail",
+        "gate_verdict": "pass_all | any_weak | any_fail",
+        "fail_reason": "如有 fail,一句话说哪项为什么"
+      },
+      "template_test": {
+        "swapped_category_example": "'精华液' → '智能音响' 后 demo 变成: [改写示例]",
+        "still_holds": "yes | partially | no",
+        "verdict": "pass | borderline | fail",
+        "signature_to_this_category": "哪些具体细节让这条深度绑定品类(如 no)"
+      },
       "gut_call": "会点 | 差点意思 | 不会点",
       "gut_word": "有那味 | 夯 | 差点意思但方向对 | 平 | AI腔 | 像广告 | 像产品说明书 | 像演讲稿 | 像作业",
       "first_sentence": "demo 的第一句原文",
@@ -209,6 +410,8 @@
       "concrete_details_check": "通篇有哪些具体细节 / 缺哪些",
       "ai_signals_found": ["在第X段出现'首先'", "结尾有'希望对你有帮助'"],
       "platform_voice_check": "平台口吻是不是对的，哪里不对",
+      "root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+      "root_cause_explanation": "一句话说明为什么归到这类(具体引用 multiplier_gate / template_test / AI 空话 / 身份错位)",
       "rewrite_directives": "（borderline 用微调模板，fail 用重写模板。pass 的留空字符串）"
     }
   ],
@@ -217,6 +420,8 @@
       "cell_id": "D1_xiaohongshu",
       "platform": "小红书",
       "severity": "borderline | fail",
+      "root_cause_kind": "surface | structural_identity | structural_gap | strategic | template",
+      "root_cause_explanation": "(同 cell_reviews 里的 root_cause_explanation,用于下游分流时的可读性)",
       "taste_gap": "（只有 borderline 才填：具体差在哪半句话）",
       "rewrite_directives": "（同 cell_reviews 里的 rewrite_directives）"
     }

@@ -38,6 +38,8 @@ from pipeline.config import (
     GEMINI_COST_PER_1M_OUTPUT,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MODEL,
+    GEMINI_MODEL_OVERRIDES,
+    GEMINI_PRICE_TABLE,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,14 +197,44 @@ def list_available_models() -> list[dict[str, Any]]:
     return out
 
 
-def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
-    """Same formula as _estimate_call_cost_usd in agents/__init__.py but
-    hard-wired to Gemini rates. Kept local so Gemini pricing changes
-    don't leak into the Claude cost table."""
-    return (
-        input_tokens * GEMINI_COST_PER_1M_INPUT
-        + output_tokens * GEMINI_COST_PER_1M_OUTPUT
-    ) / 1_000_000
+def resolve_gemini_model(role: str | None) -> str:
+    """Return the Gemini model ID to use for a given pipeline role.
+
+    Looks up `role` in GEMINI_MODEL_OVERRIDES (set in pipeline/config.py).
+    Falls back to GEMINI_MODEL when the role isn't pinned or is None.
+
+    Known role keys (must match what agents pass in):
+      "critic", "structure_reviewer", "trend_scout",
+      "image_transcriber", "screenshot_analyzer", "reference_analyzer"
+
+    Unknown role names silently fall back to the default — that's fine,
+    callers that want strict checking can wrap this themselves.
+    """
+    if role and role in GEMINI_MODEL_OVERRIDES:
+        return GEMINI_MODEL_OVERRIDES[role]
+    return GEMINI_MODEL
+
+
+def _estimate_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    model_id: str | None = None,
+) -> float:
+    """Estimate USD cost for one Gemini call. Picks rates from
+    GEMINI_PRICE_TABLE keyed on `model_id`, falling back to
+    GEMINI_COST_PER_1M_INPUT/OUTPUT when the model isn't listed.
+
+    Kept local so Gemini pricing changes don't leak into the Claude cost
+    table (agents/__init__.py uses its own MODELS rate map).
+    """
+    rates = GEMINI_PRICE_TABLE.get(model_id or "") if model_id else None
+    if rates:
+        in_rate = float(rates.get("input", GEMINI_COST_PER_1M_INPUT))
+        out_rate = float(rates.get("output", GEMINI_COST_PER_1M_OUTPUT))
+    else:
+        in_rate = GEMINI_COST_PER_1M_INPUT
+        out_rate = GEMINI_COST_PER_1M_OUTPUT
+    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
 
 
 def call_gemini_json(
@@ -333,7 +365,12 @@ def call_gemini_json(
 
         # Build contents: text + optional images for multimodal calls.
         if images:
-            _content_parts: list[Any] = [types.Part.from_text(user_message)]
+            # v0.29.10: 新版 google-genai SDK 的 Part.from_text 要 keyword
+            # 参数 text=...,不能位置传。之前写 Part.from_text(user_message)
+            # 报 `TypeError: Part.from_text() takes 1 posit...`,所有带图片
+            # 的 Gemini 调用(image transcriber / reference_analyzer / 各
+            # reference_analyzer)全挂。
+            _content_parts: list[Any] = [types.Part.from_text(text=user_message)]
             for img_bytes, img_mime in images:
                 _content_parts.append(
                     types.Part.from_bytes(data=img_bytes, mime_type=img_mime)
@@ -442,7 +479,7 @@ def call_gemini_json(
         "data": parsed,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "cost_usd": _estimate_cost_usd(input_tokens, output_tokens),
+        "cost_usd": _estimate_cost_usd(input_tokens, output_tokens, model_id),
         "model": model_id,
         "grounding_urls": grounding_urls,
     }

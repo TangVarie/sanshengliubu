@@ -20,6 +20,10 @@ from pipeline.config import (
     DEFAULT_PLATFORM,
     ENABLE_GEMINI_TREND_SCOUT_POST,
     ENABLE_GEMINI_TREND_SCOUT_PRE,
+    ENABLE_STRUCTURAL_REWRITER,
+    ENABLE_STRATEGIC_ESCALATION,
+    ENABLE_CONSUMER_SIMULATION,
+    STRATEGIC_LOOP_MAX_ITERATIONS,
     GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
@@ -49,6 +53,7 @@ from pipeline.agents.gemini_structure_reviewer import (
     run_gemini_structure_review,
 )
 from pipeline.agents.gemini_reference_analyzer import run_reference_analyzer
+from pipeline.retrieve_samples import retrieve_reference_packs
 from pipeline.agents.gemini_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -68,10 +73,15 @@ from pipeline.agents.ministries.works import (
     WorksBuilder,
     VibeCritic,
     VibeRewriter,
+    StructuralRewriter,
 )
 from pipeline.agents.narrative_director import NarrativeDirector
-from pipeline.agents.red_blue_refiner import RedBlueRefiner
-from pipeline.agents.persona_simulator import PersonaSimulator
+from pipeline.agents.red_blue_refiner import (
+    RedBlueRefiner,  # legacy
+    RedBlueRed,
+    RedBlueBlue,
+)
+from pipeline.agents.persona_simulator import PersonaSimulator, PersonaSimulatorAlt
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +113,20 @@ class PipelineOrchestrator:
         self.works_builder = WorksBuilder()
         self.vibe_critic = VibeCritic()
         self.vibe_rewriter = VibeRewriter()
+        # v0.29.0: 叙事结构重写者 — 按 critic 的 root_cause_kind 分流。
+        # 未启用 flag 时对象还是创建(零成本),但 _run_vibe_loop 不会调它。
+        self.structural_rewriter = StructuralRewriter()
         self.narrative_director = NarrativeDirector()
-        self.red_blue_refiner = RedBlueRefiner()
+        self.red_blue_refiner = RedBlueRefiner()  # legacy(v0.30.9 起不再调用)
+        # v0.30.9: 真对抗 — 红队 / 蓝队 用不同模型独立跑
+        self.red_blue_red = RedBlueRed()
+        self.red_blue_blue = RedBlueBlue()
         self.persona_simulator = PersonaSimulator()
+        # v0.30.8: 异厂家画像副本(DeepSeek),和主 PersonaSimulator 并行跑,
+        # 提供不同 distribution 的画像反应。如果 DEEPSEEK_API_KEY 没配,
+        # 这个 agent 调用会报 RuntimeError,_run_persona_simulation 会软降级
+        # 只用 Claude 系结果。
+        self.persona_simulator_alt = PersonaSimulatorAlt()
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -277,17 +298,70 @@ class PipelineOrchestrator:
                 structured_brief = done["crown_prince"]
             else:
                 project = self.db.get_project(self.project_id)
+                _free_text = project.get("free_text", "") or ""
+                _brief_dict = project.get("brief") or {}
+
+                # v0.30.3 fix #1: 把截图分析文本拼进 free_text 的 [参考文件]
+                # 包装,让它受 crown_prince 的 60% 硬留存规则保护。之前
+                # _screenshot_analysis_text 只挂在 brief 字段上,crown_prince
+                # 把它当成普通 brief 字段自由概括,几百字的 Gemini 视觉转写
+                # 被压成一句话总结。
+                _shot_txt = (_brief_dict.get("_screenshot_analysis_text") or "").strip()
+                if _shot_txt and "[参考文件: gemini_screenshot_analysis]" not in _free_text:
+                    _free_text = (
+                        _free_text
+                        + "\n\n[参考文件: gemini_screenshot_analysis]\n"
+                        + _shot_txt
+                        + "\n[/参考文件]"
+                    )
+                    logger.info(
+                        "[crown_prince] 注入 _screenshot_analysis_text "
+                        "(%d 字)进 free_text 的 [参考文件] 包装",
+                        len(_shot_txt),
+                    )
+
+                # v0.30.3 fix #2: strip 流水线内部状态(如 _revision_context、
+                # strategic_warnings、_strategic_escalation_history)避免重跑时
+                # 这些上一轮的修订意见污染 crown_prince 的输入,让它误以为是
+                # 用户原始 brief 的一部分写进 raw_materials/reference_summary。
+                # 保留以下用户原始输入信号:_screenshot_analysis* /
+                # _reference_post_urls / _library_sample_analyses 等。
+                _internal_state_keys = (
+                    "_revision_context",
+                    "strategic_warnings",
+                    "_strategic_escalation_history",
+                    "_prior_strategic_warnings",
+                )
+                _clean_brief = {
+                    k: v for k, v in _brief_dict.items()
+                    if k not in _internal_state_keys
+                }
+                if len(_clean_brief) < len(_brief_dict):
+                    _stripped = sorted(
+                        set(_brief_dict.keys()) - set(_clean_brief.keys())
+                    )
+                    logger.info(
+                        "[crown_prince] stripped 内部 state 字段 %s 防止"
+                        "污染上游输入",
+                        _stripped,
+                    )
+
                 raw_input = {
-                    "free_text": project.get("free_text", ""),
-                    "brief": project.get("brief") or {},
+                    "free_text": _free_text,
+                    "brief": _clean_brief,
                 }
                 structured_brief = await self._run_with_clarification(self.crown_prince, raw_input)
-                # Preserve original free_text on the brief so downstream stages
-                # (especially 工部) can access rich raw materials directly,
-                # not just Crown Prince's summarized fields.
-                _raw_text = project.get("free_text", "")
-                if _raw_text:
-                    structured_brief["_raw_input_text"] = _raw_text
+                # v0.30.4 升级: 把用户原始 free_text(含 [参考文件:] 包装、
+                # 截图分析等)透传给所有下游 agent,作为太子整理结果的"原始档案"。
+                # foundation_common.md 的"用户原始输入访问协议"统一指引下游
+                # 何时翻原文。两个字段:
+                #   _user_raw_input  — 主字段(本版起)
+                #   _raw_input_text  — 老字段名,保留兼容(老 prompt 可能引用)
+                # 注意:_free_text 是已经包了 _screenshot_analysis_text 的版本,
+                # 比 project.free_text 更全。
+                if _free_text:
+                    structured_brief["_user_raw_input"] = _free_text
+                    structured_brief["_raw_input_text"] = _free_text  # 兼容
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             # 1a. User-pasted reference posts (B) — if page 2 recorded
@@ -306,6 +380,48 @@ class PipelineOrchestrator:
             await self._run_gemini_trend_scout_pre(structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
+            # v0.30.10: 修复"strategy_loop 每次 resume 都强制重跑"的老 bug。
+            # _strategy_loop 实际写的是 strategy_debate_N 那种 stage_log,
+            # 根本没有 "secretariat" 这个 key,所以 done["secretariat"] 永远
+            # 拿不到 → 每次 resume / 应用修订意见后都重跑整个策略辩论 →
+            # secretariat 看到 _revision_context 可能新增 direction(D6/D7),
+            # 下游 cell_planner 给新 D 生成新 cell,用户感觉"一直在跑新 D"。
+            #
+            # 修复:从 strategy_debate_* 反推最后一个完整 plan(取最后一个
+            # 偶数 turn = secretariat 发言的轮次,plan 在 current_plan 字段)。
+            if "secretariat" not in done:
+                _debate_turns = sorted(
+                    [
+                        (int(k.rsplit("_", 1)[-1]), k)
+                        for k in done.keys()
+                        if k.startswith("strategy_debate_")
+                        and k.rsplit("_", 1)[-1].isdigit()
+                    ],
+                    reverse=True,
+                )
+                for _turn_num, _turn_key in _debate_turns:
+                    if _turn_num % 2 != 0:
+                        continue  # 奇数轮是门下省,跳过
+                    _turn_out = done.get(_turn_key) or {}
+                    _candidate_plan = (
+                        _turn_out.get("current_plan") or _turn_out
+                    )
+                    if not isinstance(_candidate_plan, dict):
+                        continue
+                    if not _candidate_plan.get("tactical_directions"):
+                        continue
+                    done["secretariat"] = _candidate_plan
+                    logger.info(
+                        "[resume] strategy_loop reconstructed from %s "
+                        "(turn %d) — directions=%s",
+                        _turn_key, _turn_num,
+                        [
+                            d.get("direction_id")
+                            for d in _candidate_plan.get("tactical_directions", [])
+                        ],
+                    )
+                    break
+
             if "secretariat" in done:
                 logger.info("Resuming: skipping strategy loop (already completed)")
                 plan = done["secretariat"]
@@ -354,11 +470,24 @@ class PipelineOrchestrator:
                     f"target_platforms: {plan.get('target_platforms', [])}"
                 )
 
+            # v0.27.0: 把 cell_plan / tactical_direction 索引挂到 self,
+            # vibe_loop 需要把这些 ground-truth 字段(paradigm / reward_type /
+            # role_embodiment / gap_direction / path_combination / product_role)
+            # 注入到 critic_input,让 critic 做 4 乘数硬门槛对照判决。
+            self._cell_plan_index = {
+                cp.get("cell_id"): cp for cp in cell_plans if cp.get("cell_id")
+            }
+            self._direction_index = {
+                d.get("direction_id"): d
+                for d in plan.get("tactical_directions", [])
+                if d.get("direction_id")
+            }
+
             # Assemble full works_plan for builder
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
             # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
-            final_system = await self._run_works_builders(works_plan)
+            final_system = await self._run_works_builders(works_plan, structured_brief)
 
             if not final_system.get("prompt_matrix"):
                 raise RuntimeError(
@@ -369,7 +498,7 @@ class PipelineOrchestrator:
             # 5c+. 叙事导演（Claude, 跨 cell 一致性+差异化诊断）
             # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
             # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
-            await self._run_narrative_director(final_system, works_plan)
+            await self._run_narrative_director(final_system, works_plan, structured_brief)
 
             # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
             # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
@@ -393,7 +522,28 @@ class PipelineOrchestrator:
             await self._run_gemini_structure_review_stage(final_system)
 
             # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
-            final_system = await self._run_vibe_loop(final_system)
+            final_system = await self._run_vibe_loop(final_system, structured_brief)
+
+            # 5d+. 策略层自动升级(v0.29.1, C.2.1)— 如果 vibe_loop 留下了
+            # strategic_warnings(interest_align / reward_signal 级错配,
+            # rewriter 改不了),回 secretariat 修订受影响 direction 的策略
+            # 锚点(stop_trigger / reward_type / role_embodiment),然后再
+            # 跑一次 vibe_loop 让 critic + rewriter 用新锚点重新判决。
+            # 上限 STRATEGIC_LOOP_MAX_ITERATIONS(默认 1)防止死循环。
+            # Feature-flagged:ENABLE_STRATEGIC_ESCALATION=False 时跳过。
+            if ENABLE_STRATEGIC_ESCALATION:
+                final_system, plan = await self._run_strategic_escalation(
+                    final_system, structured_brief, plan,
+                )
+
+            # 5d++. 消费者模拟(v0.29.1, C.2.2)— 在终审前用 persona_simulator
+            # 以 direction.stop_trigger 描述的具体目标用户扮演者对每个 cell
+            # 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。
+            # 被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
+            if ENABLE_CONSUMER_SIMULATION:
+                await self._run_consumer_simulation(
+                    final_system, structured_brief, plan,
+                )
 
             # 5e. Cross-cell duplicate re-check after vibe. Builder's own
             # check (at end of _run_works_builders) catches builder-produced
@@ -539,6 +689,14 @@ class PipelineOrchestrator:
             if is_secretariat:
                 # Secretariat's turn: propose or respond to challenges
                 input_data = {"brief": brief}
+                # v0.30.5 fix H2: 把 Gemini 趋势取样的真实小红书帖子原文
+                # (_trend_intel.formatted_block)显式注入,之前是 dead drop。
+                # secretariat.md 的"趋势取样校准"段会读 trend_intel_block。
+                _trend_block = (
+                    (brief.get("_trend_intel") or {}).get("formatted_block") or ""
+                )
+                if _trend_block:
+                    input_data["trend_intel_block"] = _trend_block
                 if debate_history:
                     input_data["debate_history"] = debate_history
                     input_data["debate_mode"] = True
@@ -1032,20 +1190,45 @@ class PipelineOrchestrator:
 
         return all_cell_plans
 
-    async def _run_works_builders(self, works_plan: dict) -> dict:
+    async def _run_works_builders(
+        self, works_plan: dict, brief: dict | None = None
+    ) -> dict:
         """Run WorksBuilder in batches with concurrency control.
 
         Smart batching: same-platform cells are grouped together for context reuse.
-        Builder only receives shared_skeleton + cell_plans (with ministry_digest),
-        NOT the full ministry outputs.
+        Builder receives shared_skeleton + cell_plans (with ministry_digest) +
+        a slim brief context(v0.30.5 fix H1):核心字段 target_audience /
+        competitive_context / constraints / core_claim,以及关键的
+        `_user_raw_input` 让 builder 在写 demo 时能直接翻用户原文找具体
+        细节(数字 / 用户原话 / 截图分析等),不至于因为 cell_plan 里
+        ministry_digest 是三层总结(太子→部→cell_planner)就只能写"效果显著"。
         """
         cell_plans = works_plan.get("cell_plans", [])
         shared_skeleton = works_plan.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
 
+        # v0.30.5 fix H1: 给 builder 一个 slim brief 让它能写细节。
+        # 不传整个 brief(里面 trend_intel / reference_posts / 内部 state 一堆
+        # 无关字段),只传 builder 实际能用上的:核心策略 + 用户原文。
+        # _user_raw_input 是关键——builder 写 demo 时如果发现 cell_plan
+        # 里没有具体数字/原话/产品参数,可以直接 grep 原文。
+        _brief = brief or {}
+        _slim_brief_for_builder = {
+            "product_name": _brief.get("product_name", ""),
+            "product_category": _brief.get("product_category", ""),
+            "core_claim": _brief.get("core_claim", ""),
+            "target_audience": _brief.get("target_audience", ""),
+            "campaign_objective": _brief.get("campaign_objective", []),
+            "competitive_context": _brief.get("competitive_context", ""),
+            "constraints": _brief.get("constraints", ""),
+            "_user_raw_input": _brief.get("_user_raw_input", "")
+                or _brief.get("_raw_input_text", ""),
+        }
+
         logger.info(
             f"Works builder: {len(cell_plans)} cell_plans, "
-            f"shared_skeleton keys: {list(shared_skeleton.keys()) if shared_skeleton else 'EMPTY'}"
+            f"shared_skeleton keys: {list(shared_skeleton.keys()) if shared_skeleton else 'EMPTY'},"
+            f" slim_brief: raw_input={len(_slim_brief_for_builder['_user_raw_input']):,} 字"
         )
 
         if not cell_plans:
@@ -1146,6 +1329,7 @@ class PipelineOrchestrator:
                 single_input = {
                     "cell_plans": [cell_plan],
                     "shared_skeleton": shared_skeleton,
+                    "brief": _slim_brief_for_builder,  # v0.30.5 H1
                     "_batch_info": {
                         "label": f"单cell修复 {cid}",
                         "round": "cell-retry",
@@ -1197,6 +1381,7 @@ class PipelineOrchestrator:
                     builder_input = {
                         "cell_plans": batch,
                         "shared_skeleton": shared_skeleton,
+                        "brief": _slim_brief_for_builder,  # v0.30.5 H1
                         "_batch_info": {
                             "label": f"批次 {batch_idx + 1} · {round_label}",
                             "round": round_label,
@@ -1406,7 +1591,7 @@ class PipelineOrchestrator:
         }
 
     async def _run_narrative_director(
-        self, final_system: dict, works_plan: dict
+        self, final_system: dict, works_plan: dict, brief: dict | None = None
     ) -> None:
         """Narrative Director: cross-cell coherence + diversity audit.
 
@@ -1488,9 +1673,22 @@ class PipelineOrchestrator:
                 fix[:100],
             )
             try:
+                # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
+                # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
+                _brief_for_rebuild = {
+                    "product_name": (brief or {}).get("product_name", ""),
+                    "core_claim": (brief or {}).get("core_claim", ""),
+                    "target_audience": (brief or {}).get("target_audience", ""),
+                    "competitive_context": (brief or {}).get("competitive_context", ""),
+                    "_user_raw_input": (
+                        (brief or {}).get("_user_raw_input")
+                        or (brief or {}).get("_raw_input_text", "")
+                    ),
+                } if brief else {}
                 rebuild_input = {
                     "active_cells": [cell_plan],
                     "shared_skeleton": shared_skeleton,
+                    "brief": _brief_for_rebuild,
                     "_batch_info": {
                         "label": f"叙事导演修复 {cid}",
                         "round": "narrative_fix",
@@ -1535,58 +1733,179 @@ class PipelineOrchestrator:
 
         Runs cells in parallel (bounded by rate limiter). Refined
         demo_output replaces the original in prompt_matrix in place.
+
+        v0.29.2: 即使某个 cell 没改动/失败/跳过,也会在 cell 上写
+        `_red_blue_summary` + `_red_blue_status`,并在 final_system
+        上写 `_red_blue_stats` 总计,让 UI 能区分"没跑"/"跑了没改"/
+        "跑了失败"——此前这三种状态在前端完全一样(啥都没有)。
         """
         prompt_cells = final_system.get("prompt_matrix") or []
         if not prompt_cells:
+            final_system["_red_blue_stats"] = {
+                "attempted": 0, "refined": 0, "unchanged": 0, "failed": 0,
+                "note": "prompt_matrix 为空,跳过红蓝精炼",
+            }
             return
 
         semaphore = asyncio.Semaphore(RED_BLUE_CONCURRENCY)
 
-        async def refine_one(cell: dict) -> dict | None:
+        async def refine_one(cell: dict) -> tuple[dict | None, str | None]:
+            """v0.30.9: 真异模型对抗(Red=Opus 4.6 → Blue=Sonnet 3.7)。
+
+            Two-step:
+              1. 红队跑(找 attacks)
+              2. attacks 非空才调蓝队(给 fixes + 修复 demo);为空跳过省 token
+
+            Return (result_dict_or_None, error_str_or_None)。result 字段保持
+            和老版兼容: attacks / fixes / refined_demo_output /
+            refined_system_prompt / changes_summary。
+            """
             cid = cell.get("cell_id", "?")
             async with semaphore:
+                _common_input = {
+                    "cell_id": cid,
+                    "direction_name": cell.get("direction_name", ""),
+                    "platform": cell.get("platform", ""),
+                    "system_prompt": cell.get("system_prompt", ""),
+                    "demo_output": cell.get("demo_output", ""),
+                    "paradigm": cell.get("paradigm", "A_emotional_hook"),
+                }
+
+                # Step 1: 红队找 attacks
                 try:
-                    result = await self.red_blue_refiner.run(
-                        {
-                            "cell_id": cid,
-                            "direction_name": cell.get("direction_name", ""),
-                            "platform": cell.get("platform", ""),
-                            "system_prompt": (cell.get("system_prompt") or "")[:500],
-                            "demo_output": cell.get("demo_output", ""),
-                            "paradigm": cell.get("paradigm", "A_emotional_hook"),
-                        },
-                        self.run_id,
-                        self.db,
+                    red_result = await self.red_blue_red.run(
+                        _common_input, self.run_id, self.db,
                     )
-                    return result
                 except Exception as e:
-                    logger.warning(
-                        "[red_blue] cell %s failed: %r", cid, e
+                    logger.warning("[red_blue] cell %s 红队失败: %r", cid, e)
+                    return None, f"red:{type(e).__name__}: {e}"
+
+                attacks = red_result.get("attacks") or []
+                red_summary = red_result.get("_red_summary", "")
+
+                # Red Team 找不到问题 → 直接 unchanged 退出,省蓝队那次 API 调用
+                if not attacks:
+                    return ({
+                        "cell_id": cid,
+                        "attacks": [],
+                        "fixes": [],
+                        "refined_demo_output": "",
+                        "refined_system_prompt": "",
+                        "changes_summary": (
+                            f"Red Team 检查通过,无需精修。{red_summary}"
+                        ),
+                        "_red_summary": red_summary,
+                    }, None)
+
+                # Step 2: 蓝队接 attacks 给 fixes
+                try:
+                    blue_input = {
+                        **_common_input,
+                        "attacks": attacks,
+                        "_red_summary": red_summary,
+                    }
+                    blue_result = await self.red_blue_blue.run(
+                        blue_input, self.run_id, self.db,
                     )
-                    return None
+                except Exception as e:
+                    logger.warning("[red_blue] cell %s 蓝队失败: %r", cid, e)
+                    # Red 跑通了但 Blue 挂了。返回 Red 的 attacks 让 UI 能看到,
+                    # 但不修改 demo。
+                    return ({
+                        "cell_id": cid,
+                        "attacks": attacks,
+                        "fixes": [],
+                        "refined_demo_output": "",
+                        "refined_system_prompt": "",
+                        "changes_summary": (
+                            f"红队找到 {len(attacks)} 个问题但蓝队修复失败: "
+                            f"{type(e).__name__}: {e}"
+                        ),
+                        "_red_summary": red_summary,
+                    }, None)
+
+                # 合并红蓝输出,保持和老 RedBlueRefiner 同样的字段结构
+                merged = {
+                    "cell_id": cid,
+                    "attacks": attacks,
+                    "fixes": blue_result.get("fixes") or [],
+                    "refined_demo_output": blue_result.get("refined_demo_output", ""),
+                    "refined_system_prompt": blue_result.get("refined_system_prompt", ""),
+                    "changes_summary": blue_result.get("changes_summary", ""),
+                    "_red_summary": red_summary,
+                }
+                return merged, None
 
         results = await asyncio.gather(
             *[refine_one(c) for c in prompt_cells]
         )
 
-        refined_count = 0
-        for i, (cell, result) in enumerate(zip(prompt_cells, results)):
-            if not result:
+        stats = {"attempted": len(prompt_cells), "refined": 0,
+                 "unchanged": 0, "failed": 0}
+        details: list[dict] = []
+
+        for i, (cell, (result, err)) in enumerate(zip(prompt_cells, results)):
+            cid = cell.get("cell_id", "?")
+            if err is not None or result is None:
+                # Agent crashed. Leave a visible marker on the cell AND
+                # in stats so the UI can surface "ran but failed" instead
+                # of showing a blank.
+                prompt_cells[i]["_red_blue_status"] = "failed"
+                prompt_cells[i]["_red_blue_summary"] = f"(红蓝精炼失败) {err or '未知错误'}"
+                stats["failed"] += 1
+                details.append({
+                    "cell_id": cid, "status": "failed",
+                    "summary": err or "未知错误", "attacks": [], "fixes": [],
+                })
                 continue
-            new_demo = result.get("refined_demo_output")
-            if new_demo and new_demo.strip():
+
+            attacks = result.get("attacks") or []
+            fixes = result.get("fixes") or []
+            new_demo = (result.get("refined_demo_output") or "").strip()
+            new_sp = (result.get("refined_system_prompt") or "").strip()
+            changes_summary = (result.get("changes_summary") or "").strip()
+
+            if new_demo:
                 prompt_cells[i]["demo_output"] = new_demo
-                prompt_cells[i]["_red_blue_summary"] = result.get(
-                    "changes_summary", ""
+                stats["refined"] += 1
+                prompt_cells[i]["_red_blue_status"] = "refined"
+                prompt_cells[i]["_red_blue_summary"] = (
+                    changes_summary or f"精修了 {len(fixes)} 处"
                 )
-                refined_count += 1
-            # Also apply system_prompt refinement if provided
-            new_sp = result.get("refined_system_prompt")
-            if new_sp and new_sp.strip():
+            else:
+                # No refined_demo returned — either Red Team found nothing
+                # or model returned empty string. Previously this was
+                # silent; now we record it so the UI can show "检查过,
+                # 无需修改" instead of "没跑".
+                stats["unchanged"] += 1
+                prompt_cells[i]["_red_blue_status"] = "unchanged"
+                prompt_cells[i]["_red_blue_summary"] = (
+                    changes_summary
+                    or (f"Red Team 找到 {len(attacks)} 个点但未产出精修文本"
+                        if attacks else "Red Team 检查通过,无需修改")
+                )
+
+            if new_sp:
                 prompt_cells[i]["system_prompt"] = new_sp
 
+            # Snapshot per-cell detail for UI expansion.
+            details.append({
+                "cell_id": cid,
+                "status": prompt_cells[i].get("_red_blue_status", "?"),
+                "summary": prompt_cells[i].get("_red_blue_summary", ""),
+                "attacks": attacks,
+                "fixes": fixes,
+                "refined_demo_output": new_demo,
+                "refined_system_prompt_changed": bool(new_sp),
+            })
+
+        stats["details"] = details
+        final_system["_red_blue_stats"] = stats
+
         logger.info(
-            "[red_blue] refined %d/%d cells", refined_count, len(prompt_cells)
+            "[red_blue] attempted=%d refined=%d unchanged=%d failed=%d",
+            stats["attempted"], stats["refined"],
+            stats["unchanged"], stats["failed"],
         )
 
     async def _run_persona_simulation(
@@ -1595,42 +1914,123 @@ class PipelineOrchestrator:
         """Persona simulation: 3 target-audience personas react to each
         cell's demo. Results stored on final_system for UI display and
         as supplementary input to vibe_critic.
+
+        v0.29.2: 之前失败路径(prompt_matrix 空 / 调用抛异常)完全不写
+        `_persona_reactions`,UI 只能显示"没产出"。现在所有路径都写一个
+        `{"status": ..., "error"/"result": ...}` 结构,让 UI 区分
+        "没跑"/"跑了失败"/"跑了成功"。
         """
         prompt_cells = final_system.get("prompt_matrix") or []
         if not prompt_cells:
+            final_system["_persona_reactions"] = {
+                "status": "skipped",
+                "reason": "prompt_matrix 为空,未调用 persona_simulator",
+            }
             return
 
         target_audience = brief.get("target_audience", "")
         if isinstance(target_audience, list):
             target_audience = ", ".join(str(t) for t in target_audience)
 
+        # v0.30.6 fix M4: 每个 cell 自己带 platform,持出去给画像模拟,
+        # 避免多平台 brief 里 douyin cell 用 xhs 画像评判。
         slim_cells = [
             {
                 "cell_id": c.get("cell_id"),
                 "direction_name": c.get("direction_name"),
+                "platform": c.get("platform", ""),
                 "demo_output": (c.get("demo_output") or "")[:500],
             }
             for c in prompt_cells
         ]
 
-        try:
-            result = await self.persona_simulator.run(
-                {
-                    "target_audience": target_audience or "未指定（请根据 brief 推断）",
-                    "platform": brief.get("target_platforms", [DEFAULT_PLATFORM])[0]
-                    if brief.get("target_platforms")
-                    else DEFAULT_PLATFORM,
-                    "cells": slim_cells,
-                },
-                self.run_id,
-                self.db,
-            )
-        except Exception as e:
-            logger.warning("[persona_sim] failed: %r", e)
+        # 顶层 platform 仍传一个(向后兼容旧 prompt),但优先级:cell.platform。
+        _platforms = brief.get("target_platforms") or []
+        _top_platform = _platforms[0] if _platforms else DEFAULT_PLATFORM
+
+        # v0.30.8: 双模型并跑画像 — Claude 系(Sonnet 3.7)+ DeepSeek 系
+        # (v4-pro)。两个 agent 用同一份 persona_simulator.md prompt,但不同
+        # 模型 distribution → 产出的 6 个画像 cover 更广(Claude 偏目标用户
+        # 细腻反应,DeepSeek 偏草根/破圈视角)。任一失败不阻塞另一个,只
+        # 缺谁的标记缺失,不会 fail 整个流水线。
+        _common_input = {
+            "target_audience": target_audience or "未指定（请根据 brief 推断）",
+            "platform": _top_platform,
+            "all_platforms": list(_platforms) or [DEFAULT_PLATFORM],
+            "cells": slim_cells,
+        }
+
+        async def _run_one(agent, label: str):
+            try:
+                _res = await agent.run(_common_input, self.run_id, self.db)
+                logger.info("[persona_sim] %s 跑通", label)
+                return _res, None
+            except Exception as _e:
+                logger.exception("[persona_sim] %s 失败", label)
+                return None, f"{type(_e).__name__}: {_e}"
+
+        # 并行启动两个 agent。如果 DeepSeek 没配 secret,alt 那条会立刻
+        # RuntimeError,但 Claude 那条不受影响。
+        _claude_pair, _ds_pair = await asyncio.gather(
+            _run_one(self.persona_simulator, "Claude(Sonnet 3.7)"),
+            _run_one(self.persona_simulator_alt, "DeepSeek(v4-pro)"),
+        )
+        _claude_result, _claude_err = _claude_pair
+        _ds_result, _ds_err = _ds_pair
+
+        # 至少一个成功才能继续
+        if not _claude_result and not _ds_result:
+            final_system["_persona_reactions"] = {
+                "status": "failed",
+                "error": (
+                    f"Claude: {_claude_err or 'unknown'} | "
+                    f"DeepSeek: {_ds_err or 'unknown'}"
+                ),
+                "reason": (
+                    "双 backend 都失败。常见原因: 配置问题(secrets.toml)、"
+                    "rate limit / 5xx、模型返回为空。stage_log 里有完整 traceback。"
+                ),
+            }
             return
 
-        final_system["_persona_reactions"] = result
-        summary = result.get("summary") or {}
+        # 合并 personas[],按 _source 标注来源。同 id 不去重(Claude 的 P_core
+        # 和 DeepSeek 的 P_core 是不同 distribution 下的扮演,UI 都该看到)。
+        merged_personas: list[dict] = []
+        for _src_label, _res in [("claude", _claude_result), ("deepseek", _ds_result)]:
+            if not _res:
+                continue
+            for _p in (_res.get("personas") or []):
+                _p_tagged = {**_p, "_source": _src_label}
+                # 如果两边 id 相同(都是 P_core),给 DeepSeek 那个改成 P_core_ds
+                # 避免下游 cell_id 计数时混淆
+                if _src_label == "deepseek":
+                    _orig_pid = _p_tagged.get("id", "")
+                    _p_tagged["id"] = f"{_orig_pid}_ds" if _orig_pid else "P_unknown_ds"
+                merged_personas.append(_p_tagged)
+
+        # 用 Claude 的 summary 当主(它通常更结构化),DeepSeek 的留作 _ds_summary
+        # 给 UI 展示。如果 Claude 失败就 fallback DeepSeek。
+        _primary = _claude_result or _ds_result or {}
+        _summary = _primary.get("summary", {}) or {}
+        if _ds_result and _claude_result:
+            _summary = {**_summary, "_ds_summary": (_ds_result.get("summary") or {})}
+
+        result = {
+            "status": "ok",
+            "mode": _primary.get("mode", "persona_spectrum"),
+            "personas": merged_personas,
+            "summary": _summary,
+            "_dual_backend": {
+                "claude_ok": bool(_claude_result),
+                "claude_error": _claude_err,
+                "deepseek_ok": bool(_ds_result),
+                "deepseek_error": _ds_err,
+            },
+        }
+        tagged = result
+        final_system["_persona_reactions"] = tagged
+
+        summary = (result or {}).get("summary") or {}
         weak = summary.get("weak_cells") or []
         if weak:
             logger.warning(
@@ -1642,6 +2042,68 @@ class PipelineOrchestrator:
                 summary.get("strong_cells", []),
                 summary.get("narrow_cells", []),
                 summary.get("weak_cells", []),
+            )
+
+        # v0.29.11(方案 A):把"3 个画像全部 skip"的 cell 追加进
+        # strategic_warnings,和 consumer_simulation 对齐,走现有的
+        # UI 告警通道 + 可选的 strategic_escalation 自动升级链。
+        # 不信任 summary.weak_cells(模型有时给的是 direction_id 而非
+        # cell_id),直接从 personas[*].reactions 计算:每个 cell_id 统计
+        # 3 个画像的 action,全 skip = weak。
+        try:
+            _personas = (result or {}).get("personas") or []
+            _actions_per_cell: dict[str, list[str]] = {}
+            _reactions_per_cell: dict[str, list[str]] = {}
+            for _p in _personas:
+                _pid = _p.get("id", "?")
+                for _r in (_p.get("reactions") or []):
+                    _cid = _r.get("cell_id")
+                    if not _cid:
+                        continue
+                    _actions_per_cell.setdefault(_cid, []).append(
+                        (_r.get("action") or "").lower()
+                    )
+                    _reactions_per_cell.setdefault(_cid, []).append(
+                        f"{_pid}: {(_r.get('reaction') or '')[:60]}"
+                    )
+
+            _weak_cell_ids = [
+                _cid for _cid, _acts in _actions_per_cell.items()
+                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts)
+            ]
+
+            if _weak_cell_ids:
+                _matrix = final_system.get("prompt_matrix") or []
+                _cell_idx = {c.get("cell_id"): c for c in _matrix}
+
+                for _cid in _weak_cell_ids:
+                    _cell = _cell_idx.get(_cid, {})
+                    _sample = " | ".join(_reactions_per_cell.get(_cid, [])[:3])
+                    final_system.setdefault("strategic_warnings", []).append({
+                        "cell_id": _cid,
+                        "direction_id": _cell.get("direction_id", ""),
+                        "platform": _cell.get("platform", ""),
+                        "root_cause_explanation": (
+                            f"persona_simulator: 3 个画像全部 skip — {_sample}"
+                        ),
+                        # 和 consumer_simulation 对齐用 interest_align fail
+                        # 触发策略升级链(如果 ENABLE_STRATEGIC_ESCALATION)。
+                        "multiplier_gate": {"interest_align": "fail"},
+                        "iteration": "persona_sim",
+                        "source": "persona_simulator",
+                    })
+
+                logger.warning(
+                    "[persona_sim] %d weak cells flagged into "
+                    "strategic_warnings: %s",
+                    len(_weak_cell_ids),
+                    _weak_cell_ids,
+                )
+        except Exception:
+            # 反馈链失败不阻塞主流程,persona 结果仍然在 UI 上可见。
+            logger.exception(
+                "[persona_sim] weak-cell fan-out into strategic_warnings "
+                "failed (non-fatal)"
             )
 
     async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
@@ -2153,7 +2615,11 @@ class PipelineOrchestrator:
                 len(prompt_cells),
             )
 
-    async def _run_vibe_loop(self, final_system: dict) -> dict:
+    async def _run_vibe_loop(
+        self,
+        final_system: dict,
+        structured_brief: dict | None = None,
+    ) -> dict:
         """Critic → Rewriter loop with elastic iteration count.
 
         网感不行 = system_prompt 设计有缺陷 → 重写 system_prompt（不是改 demo）。
@@ -2174,6 +2640,38 @@ class PipelineOrchestrator:
             return final_system
 
         shared_skeleton = final_system.get("shared_skeleton", {})
+
+        # ── 人工证据包检索(v0.25.0)───────────────────────────────────────
+        # 为每个平台预取匹配的参考样本(用户在 pages/6_reference_library.py 录入),
+        # 注入到 critic/rewriter 的 input。评论区 DNA / hook / comment
+        # resonance_points 等来源于 reference_pack_analyzer 的结构化输出,
+        # rewriter 可以 per-cell 按 platform 挑自己关心的。
+        # 零样本情况下(用户还没录入)静默跳过,不阻塞也不警告。
+        _brief_category = (
+            (structured_brief or {}).get("product_category")
+            or (structured_brief or {}).get("category")
+        )
+        _unique_platforms = sorted({
+            (c.get("platform") or "").strip()
+            for c in prompt_cells
+            if c.get("platform")
+        })
+        reference_packs_by_platform: dict[str, list] = {}
+        for _plat in _unique_platforms:
+            _packs = retrieve_reference_packs(
+                self.db,
+                platform=_plat,
+                category=_brief_category,
+                limit=6,
+            )
+            if _packs:
+                reference_packs_by_platform[_plat] = _packs
+        if reference_packs_by_platform:
+            logger.info(
+                "[vibe_loop] injecting reference_packs: %s",
+                {k: len(v) for k, v in reference_packs_by_platform.items()},
+            )
+
         # Track which cell_ids were rewritten so round 2+ only re-evaluates those
         rewritten_ids: set[str] = set()
         # Total matrix size doesn't change across iterations (rewriter preserves
@@ -2204,19 +2702,78 @@ class PipelineOrchestrator:
                     f"(skipping {len(prompt_cells) - len(cells_to_critique)} unchanged)"
                 )
 
+            # v0.27.0: 注入 secretariat + cell_planner 标注的 ground-truth
+            # 字段(reward_type / role_embodiment / gap_direction / paradigm /
+            # path_combination / product_role),让 critic 做 4 乘数硬门槛
+            # 对照判决(见 vibe_critic.md 第 0.3 步)。
+            # cell_plans 和 direction 索引在 orchestrator.run() 5b 步挂到
+            # self 上;resume 路径若索引为空,critic 会自动退到启发式判断。
+            _cell_idx = getattr(self, "_cell_plan_index", {}) or {}
+            _dir_idx = getattr(self, "_direction_index", {}) or {}
+
+            def _enriched_cell(c: dict) -> dict:
+                cp = _cell_idx.get(c.get("cell_id"), {}) or {}
+                direction = _dir_idx.get(c.get("direction_id"), {}) or {}
+                return {
+                    "cell_id": c.get("cell_id"),
+                    "direction_id": c.get("direction_id"),
+                    "direction_name": c.get("direction_name"),
+                    "platform": c.get("platform"),
+                    "system_prompt": c.get("system_prompt", ""),
+                    "demo_output": c.get("demo_output", ""),
+                    # ground-truth intent from upstream stages
+                    "paradigm": cp.get("paradigm") or direction.get("paradigm"),
+                    "reward_type": direction.get("reward_type"),
+                    "role_embodiment": direction.get("role_embodiment"),
+                    "gap_direction": direction.get("gap_direction"),
+                    # v0.29.0: stop_trigger — critic 的 interest_align 判决硬
+                    # 锚点,替代宽泛的 target_audience 散文。secretariat 未填
+                    # 时为 None,critic 会自动退回到启发式判断。
+                    "stop_trigger": direction.get("stop_trigger"),
+                    "path_combination": cp.get("path_combination"),
+                    "product_role": cp.get("product_role"),
+                }
+
             critic_input = {
-                "prompt_cells": [
-                    {
-                        "cell_id": c.get("cell_id"),
-                        "direction_id": c.get("direction_id"),
-                        "direction_name": c.get("direction_name"),
-                        "platform": c.get("platform"),
-                        "system_prompt": c.get("system_prompt", ""),
-                        "demo_output": c.get("demo_output", ""),
-                    }
-                    for c in cells_to_critique
-                ]
+                "prompt_cells": [_enriched_cell(c) for c in cells_to_critique]
             }
+            # Pass brief-level context so critic can check interest_align
+            # against target_audience + campaign_objective.
+            if structured_brief:
+                critic_input["brief_context"] = {
+                    "target_audience": structured_brief.get("target_audience", ""),
+                    "campaign_objective": structured_brief.get("campaign_objective", []),
+                    "product_category": structured_brief.get("product_category", ""),
+                    # v0.29.0: 让 critic 的 identity_consistency 判决按
+                    # advertising_stance 分流,而不是硬假设 stealth。
+                    "advertising_stance": structured_brief.get(
+                        "advertising_stance", ""
+                    ),
+                }
+            if reference_packs_by_platform:
+                critic_input["reference_packs_by_platform"] = reference_packs_by_platform
+
+            # v0.30.5 fix H3: 把 persona_simulator 的 per-cell 反应注入 critic,
+            # 让"3 个画像里有 2 个划走"这种信号真的影响判决,而不是只在
+            # 全 skip 的 weak_cells 边缘场景才触发 strategic_warnings。
+            # 压缩成 {cell_id: [{persona, action, reason}, ...]} 紧凑形式。
+            _persona_pkg = final_system.get("_persona_reactions") or {}
+            if _persona_pkg.get("status") == "ok":
+                _per_cell_reactions: dict = {}
+                for _p in (_persona_pkg.get("personas") or []):
+                    _pid = _p.get("id", "?")
+                    for _r in (_p.get("reactions") or []):
+                        _cid_r = _r.get("cell_id")
+                        if not _cid_r:
+                            continue
+                        _per_cell_reactions.setdefault(_cid_r, []).append({
+                            "persona": _pid,
+                            "action": _r.get("action", "?"),
+                            "reason": (_r.get("reason") or "")[:80],
+                        })
+                if _per_cell_reactions:
+                    critic_input["persona_reactions_by_cell"] = _per_cell_reactions
+
             try:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
@@ -2301,6 +2858,45 @@ class PipelineOrchestrator:
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
 
+            # v0.30.6 fix M1: Gemini 结构审标了 _structure_hint(missing_items
+            # 非空)但 critic 让该 cell 过了 → 之前 hint 永远到不了 rewriter,
+            # 漂亮但结构不全的 cell 直接发货。这里把这些 cell 强制加进
+            # failed 列表(severity=borderline,带合成的 rewrite_directives)。
+            existing_failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+            structurally_incomplete_ids: set[str] = set()
+            for _c in cells_to_critique:
+                _hint = _c.get("_structure_hint") or {}
+                _missing = _hint.get("missing_items") or []
+                _hint_rev = _hint.get("revision_hint") or ""
+                if not _missing and not _hint_rev:
+                    continue
+                _cid = _c.get("cell_id")
+                if not _cid or _cid in existing_failed_ids:
+                    continue
+                # critic 让它过了,但结构审说缺。force fail 让 rewriter 补结构。
+                _synthesized = (
+                    f"【结构审强制补漏】critic 判 pass 但 Gemini 结构审检测到本 "
+                    f"cell 缺失关键模块: {', '.join(str(m) for m in _missing) or '(未列)'}。"
+                    f"建议: {_hint_rev or '补齐缺失模块,保持原 demo 网感和钩子不变'}。"
+                )
+                failed.append({
+                    "cell_id": _cid,
+                    "platform": _c.get("platform", ""),
+                    "severity": "borderline",
+                    "rewrite_directives": _synthesized,
+                    "root_cause_kind": "surface",
+                    "root_cause_explanation": "structure_review 强制补漏",
+                    "_flagged_by": "structure_review",
+                })
+                structurally_incomplete_ids.add(_cid)
+            if structurally_incomplete_ids:
+                logger.info(
+                    "[vibe_loop] structure_review 强制补漏 %d 个 critic-pass "
+                    "但缺结构的 cell: %s",
+                    len(structurally_incomplete_ids),
+                    sorted(structurally_incomplete_ids),
+                )
+
             if not failed:
                 logger.info(f"Vibe critic passed all {len(prompt_cells)} cells "
                             f"on iteration {iteration + 1} (Claude + Gemini both cleared)")
@@ -2345,30 +2941,142 @@ class PipelineOrchestrator:
                     ),
                     "severity": critic_map[c["cell_id"]].get("severity", "fail"),
                     "taste_gap": critic_map[c["cell_id"]].get("taste_gap", ""),
+                    # v0.29.0: 让下游 rewriter 能读到 critic 的诊断字段,structural_rewriter
+                    # 需要这些做身份/缺口手术。Gemini arbitration 过来的 cell 不一定有,
+                    # 自动 fallback 到 None。
+                    "root_cause_kind": critic_map[c["cell_id"]].get("root_cause_kind"),
+                    "root_cause_explanation": critic_map[c["cell_id"]].get(
+                        "root_cause_explanation", ""
+                    ),
+                    "multiplier_gate": critic_map[c["cell_id"]].get("multiplier_gate", {}),
                 }
                 for c in prompt_cells
                 if c.get("cell_id") in failed_ids
             ]
 
-            try:
-                rewritten = await self.vibe_rewriter.run(
-                    {
-                        "failed_cells": failed_full_cells,
-                        "shared_skeleton": shared_skeleton,
-                    },
-                    self.run_id,
-                    self.db,
+            # v0.29.0: 按 root_cause_kind 分流 — critic-rewriter 责任边界划分
+            # 的具体落地点。关闭 flag 时回到老行为(全部给 vibe_rewriter)。
+            if ENABLE_STRUCTURAL_REWRITER:
+                buckets = _classify_failed_cells(failed_full_cells)
+                logger.info(
+                    "[vibe_loop] fail routing: surface=%d template=%d "
+                    "structural_identity=%d structural_gap=%d strategic=%d",
+                    len(buckets["surface"]),
+                    len(buckets["template"]),
+                    len(buckets["structural_identity"]),
+                    len(buckets["structural_gap"]),
+                    len(buckets["strategic"]),
                 )
-            except Exception as e:
-                logger.warning(f"Vibe rewriter failed ({e}), keeping original cells")
-                break
 
-            new_cells_by_id = {
-                c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
-            }
+                # ① strategic 类 — rewriter 改不了,记录到 final_system 让
+                # 用户审查时决定是人工重跑策略层还是接受风险。硬 escalate 回
+                # secretariat 留给 v0.29.x 做。
+                if buckets["strategic"]:
+                    strat_entries = [
+                        {
+                            "cell_id": fc.get("cell_id"),
+                            "direction_id": fc.get("direction_id"),
+                            "platform": fc.get("platform"),
+                            "root_cause_explanation": fc.get("root_cause_explanation", ""),
+                            "multiplier_gate": fc.get("multiplier_gate", {}),
+                            "iteration": iteration + 1,
+                        }
+                        for fc in buckets["strategic"]
+                    ]
+                    final_system.setdefault("strategic_warnings", []).extend(
+                        strat_entries
+                    )
+                    logger.warning(
+                        "[vibe_loop] %d cells flagged strategic (not sending to "
+                        "rewriter — needs secretariat/cell_planner revision): %s",
+                        len(strat_entries),
+                        [e["cell_id"] for e in strat_entries],
+                    )
+
+                # ② structural 类 — 走 structural_rewriter(叙事身份/缺口手术)
+                structural_cells = (
+                    buckets["structural_identity"] + buckets["structural_gap"]
+                )
+                structural_new_by_id: dict = {}
+                if structural_cells:
+                    structural_input = {
+                        "failed_cells": structural_cells,
+                        "shared_skeleton": shared_skeleton,
+                    }
+                    if reference_packs_by_platform:
+                        structural_input["reference_packs_by_platform"] = (
+                            reference_packs_by_platform
+                        )
+                    try:
+                        structural_result = await self.structural_rewriter.run(
+                            structural_input, self.run_id, self.db,
+                        )
+                        structural_new_by_id = {
+                            c["cell_id"]: c
+                            for c in structural_result.get("prompt_cells", [])
+                        }
+                    except Exception:
+                        logger.exception(
+                            "Structural rewriter failed; falling back to "
+                            "vibe_rewriter for these cells"
+                        )
+                        # Fallback: merge back into surface bucket so they still
+                        # get some treatment instead of being silently dropped.
+                        buckets["surface"].extend(structural_cells)
+
+                # ③ surface + template — 走原 vibe_rewriter
+                vibe_cells = buckets["surface"] + buckets["template"]
+                vibe_new_by_id: dict = {}
+                if vibe_cells:
+                    rewriter_input = {
+                        "failed_cells": vibe_cells,
+                        "shared_skeleton": shared_skeleton,
+                    }
+                    if reference_packs_by_platform:
+                        rewriter_input["reference_packs_by_platform"] = (
+                            reference_packs_by_platform
+                        )
+                    try:
+                        rewritten = await self.vibe_rewriter.run(
+                            rewriter_input, self.run_id, self.db,
+                        )
+                        vibe_new_by_id = {
+                            c["cell_id"]: c
+                            for c in rewritten.get("prompt_cells", [])
+                        }
+                    except Exception:
+                        logger.exception(
+                            "Vibe rewriter failed, keeping original cells for this batch"
+                        )
+
+                # Merge both rewriter outputs. If both emitted the same cell_id
+                # (shouldn't happen — we bucket disjointly — but defend anyway),
+                # structural wins because it's the more targeted surgery.
+                new_cells_by_id = {**vibe_new_by_id, **structural_new_by_id}
+            else:
+                # Legacy path (flag off): everything through vibe_rewriter.
+                rewriter_input = {
+                    "failed_cells": failed_full_cells,
+                    "shared_skeleton": shared_skeleton,
+                }
+                if reference_packs_by_platform:
+                    rewriter_input["reference_packs_by_platform"] = (
+                        reference_packs_by_platform
+                    )
+                try:
+                    rewritten = await self.vibe_rewriter.run(
+                        rewriter_input, self.run_id, self.db,
+                    )
+                except Exception:
+                    logger.exception("Vibe rewriter failed, keeping original cells")
+                    break
+                new_cells_by_id = {
+                    c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
+                }
+
             rewritten_ids = set(new_cells_by_id.keys())
             logger.info(
-                f"Vibe rewriter rewrote {len(rewritten_ids)} cells: "
+                f"Rewriters produced {len(rewritten_ids)} updated cells: "
                 f"{sorted(rewritten_ids)}"
             )
             prompt_cells = [
@@ -2407,6 +3115,324 @@ class PipelineOrchestrator:
             f"(hard cap {hard_cap}), proceeding with remaining issues"
         )
         return final_system
+
+    async def _run_strategic_escalation(
+        self,
+        final_system: dict,
+        structured_brief: dict,
+        plan: dict,
+    ) -> tuple[dict, dict]:
+        """策略层自动升级(v0.29.1, C.2.1)。
+
+        vibe_loop 跑完后,若留下 strategic_warnings(rewriter 改不了的
+        策略层错配),就回 secretariat 修订受影响 direction 的策略锚点
+        (stop_trigger / reward_type / role_embodiment / ...),然后再
+        跑一次 vibe_loop 让 critic + rewriter 用新锚点重新判决。
+
+        返回 (final_system, plan) 二元组 — plan 可能被更新。
+
+        硬上限 STRATEGIC_LOOP_MAX_ITERATIONS(默认 1):只允许一次自动
+        升级,避免 direction 来回摆动。超过后 strategic_warnings 会继续
+        挂在 final_system 上,由 UI 提示用户人工处理。
+
+        失败模式:secretariat 抛异常 → 保留原 warnings + 原 plan,不阻塞
+        后续终审。critic/rewriter 重跑时的异常也同样非致命。
+        """
+        max_iter = STRATEGIC_LOOP_MAX_ITERATIONS
+        iteration = 0
+
+        while iteration < max_iter:
+            warnings = final_system.get("strategic_warnings") or []
+            if not warnings:
+                return final_system, plan
+
+            affected_direction_ids = sorted({
+                w.get("direction_id") for w in warnings
+                if w.get("direction_id")
+            })
+            if not affected_direction_ids:
+                # Warnings exist but have no direction_id (old critic output
+                # or Gemini-flagged). Nothing actionable at strategy layer —
+                # leave warnings for user.
+                return final_system, plan
+
+            logger.warning(
+                "[strategic_escalation] round %d: %d cells flagged strategic "
+                "across directions %s — requesting secretariat revision",
+                iteration + 1,
+                len(warnings),
+                affected_direction_ids,
+            )
+
+            revision_input = {
+                "brief": structured_brief,
+                "strategic_revision": {
+                    "current_plan": plan,
+                    "affected_direction_ids": affected_direction_ids,
+                    "strategic_warnings": warnings,
+                },
+            }
+
+            try:
+                revised_plan = await self.secretariat.run(
+                    revision_input, self.run_id, self.db,
+                )
+            except Exception:
+                logger.exception(
+                    "[strategic_escalation] secretariat revision failed; "
+                    "keeping original plan + warnings"
+                )
+                return final_system, plan
+
+            # Merge revised directions into plan + self._direction_index.
+            # Only the affected direction_ids are trusted to have been updated
+            # — if secretariat returned other direction_ids with changes,
+            # we explicitly ignore those changes to avoid scope creep.
+            revised_by_id = {
+                d.get("direction_id"): d
+                for d in revised_plan.get("tactical_directions", []) or []
+                if d.get("direction_id")
+            }
+            merged_directions = []
+            change_log: list[str] = []
+            for d in plan.get("tactical_directions", []) or []:
+                did = d.get("direction_id")
+                if did in affected_direction_ids and did in revised_by_id:
+                    new_d = revised_by_id[did]
+                    merged_directions.append(new_d)
+                    note = new_d.get("_revision_note", "")
+                    change_log.append(f"{did}: {note}" if note else did)
+                else:
+                    merged_directions.append(d)
+
+            plan = {**plan, "tactical_directions": merged_directions}
+            self._direction_index = {
+                d.get("direction_id"): d
+                for d in merged_directions
+                if d.get("direction_id")
+            }
+
+            # Snapshot pre-escalation warnings so they're not lost; clear
+            # the active list so the next vibe_loop can repopulate it fresh.
+            prior_warnings = final_system.pop("strategic_warnings", [])
+            final_system.setdefault("_strategic_escalation_history", []).append({
+                "iteration": iteration + 1,
+                "affected_direction_ids": affected_direction_ids,
+                "prior_warnings": prior_warnings,
+                "change_log": change_log,
+            })
+
+            # v0.30.6 fix H5: 失效掉受影响 direction 的 advisory 数据。
+            # secretariat 改了这些 direction 的 stop_trigger / reward_type 等
+            # 锚点,vibe_loop 会重写对应 cell 的 system_prompt + demo,所以
+            # _persona_reactions / _narrative_director_result / _red_blue_stats
+            # 里关于这些 cell 的旧记录已经过期。chancellery 和 UI 会读这些字段
+            # 当作 ground truth,留着会误导。这里只清"受影响 cell 的部分",
+            # 保留其他 cell 的有效数据。
+            _affected_cell_ids: set[str] = set()
+            for _c in (final_system.get("prompt_matrix") or []):
+                if _c.get("direction_id") in affected_direction_ids:
+                    _cid = _c.get("cell_id")
+                    if _cid:
+                        _affected_cell_ids.add(_cid)
+
+            # 1. _persona_reactions: 清掉受影响 cell 的反应
+            _pr = final_system.get("_persona_reactions") or {}
+            if _pr.get("status") == "ok" and _pr.get("personas"):
+                for _persona in _pr.get("personas", []):
+                    _persona["reactions"] = [
+                        r for r in (_persona.get("reactions") or [])
+                        if r.get("cell_id") not in _affected_cell_ids
+                    ]
+                _pr["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            # 2. _narrative_director_result: 清掉 cells_to_revise 里的受影响项
+            _nd = final_system.get("_narrative_director_result") or {}
+            if _nd:
+                _nd["cells_to_revise"] = [
+                    c for c in (_nd.get("cells_to_revise") or [])
+                    if c.get("cell_id") not in _affected_cell_ids
+                ]
+                _nd["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            # 3. _red_blue_stats.details: 清掉受影响 cell 的诊断
+            _rb = final_system.get("_red_blue_stats") or {}
+            if _rb.get("details"):
+                _rb["details"] = [
+                    d for d in _rb["details"]
+                    if d.get("cell_id") not in _affected_cell_ids
+                ]
+                # 总计也减一下(失效的部分不再计入"已修复"统计)
+                _rb["_stale_purged_count"] = len(_affected_cell_ids)
+
+            # 4. _consumer_simulation.judgments: 清掉受影响 cell 的判决
+            _cs = final_system.get("_consumer_simulation") or {}
+            if _cs.get("status") == "ok" and _cs.get("judgments"):
+                _cs["judgments"] = [
+                    j for j in _cs["judgments"]
+                    if j.get("cell_id") not in _affected_cell_ids
+                ]
+                _cs["_stale_cell_ids_purged"] = sorted(_affected_cell_ids)
+
+            if _affected_cell_ids:
+                logger.info(
+                    "[strategic_escalation] purged stale advisory data for "
+                    "%d cells across %d directions: persona / narrative_director / "
+                    "red_blue / consumer_simulation 里关于这些 cell 的旧记录全部清掉,"
+                    "下游 chancellery_final 不会读到过期诊断。",
+                    len(_affected_cell_ids),
+                    len(affected_direction_ids),
+                )
+
+            logger.info(
+                "[strategic_escalation] round %d applied — re-running vibe_loop "
+                "with updated direction anchors (%s)",
+                iteration + 1,
+                change_log or affected_direction_ids,
+            )
+
+            # Re-run vibe_loop. It reads prompt_matrix from final_system +
+            # self._direction_index for ground-truth anchors, so simply
+            # invoking it again picks up the new stop_trigger / reward_type.
+            # Cells outside affected directions will mostly pass on round 1
+            # (their anchors didn't change); affected cells will get a fresh
+            # classification and the right rewriter.
+            try:
+                final_system = await self._run_vibe_loop(
+                    final_system, structured_brief,
+                )
+            except Exception:
+                logger.exception(
+                    "[strategic_escalation] re-run vibe_loop failed; "
+                    "leaving current state in place"
+                )
+                return final_system, plan
+
+            iteration += 1
+
+        # Hit iteration cap. Any warnings still present stay on
+        # final_system for the UI to show to the user.
+        remaining = final_system.get("strategic_warnings") or []
+        if remaining:
+            logger.warning(
+                "[strategic_escalation] cap reached (%d iterations), "
+                "%d strategic warnings remain for user review",
+                max_iter,
+                len(remaining),
+            )
+        return final_system, plan
+
+    async def _run_consumer_simulation(
+        self,
+        final_system: dict,
+        structured_brief: dict,
+        plan: dict,
+    ) -> None:
+        """消费者模拟二级校验(v0.29.1, C.2.2)。
+
+        在 vibe_loop 收敛后、终审前,用 persona_simulator 的
+        `consumer_simulation` mode 针对每个 cell 以 direction.stop_trigger
+        描述的目标用户身份做 stop / scroll 二元判决。这是 interest_align
+        的第二层校验——critic 的 interest_align 是"专家判断",这一步是
+        "用户端判断"。
+
+        被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
+        (不自动回策略升级——此时 vibe + strategic 已经跑完,再递归会过复杂。)
+
+        Advisory-only:persona_simulator 失败时仅 log 警告,不阻塞终审。
+        结果存到 final_system._consumer_simulation,UI 层渲染。
+        """
+        prompt_cells = final_system.get("prompt_matrix") or []
+        if not prompt_cells:
+            final_system["_consumer_simulation"] = {
+                "status": "skipped",
+                "reason": "prompt_matrix 为空,未调用 consumer_simulation",
+            }
+            return
+
+        direction_index = getattr(self, "_direction_index", {}) or {}
+
+        # Build per-cell consumer context. Cells whose direction has no
+        # stop_trigger fall back to target_audience from brief.
+        # v0.30.6 fix M4: 每个 cell 带自己的 platform,避免多平台 brief
+        # 里 douyin cell 被用 xhs 标准评判。
+        fallback_audience = structured_brief.get("target_audience", "") or ""
+        slim_cells = []
+        for c in prompt_cells:
+            did = c.get("direction_id")
+            d = direction_index.get(did) or {}
+            stop_trigger = (d.get("stop_trigger") or "").strip()
+            slim_cells.append({
+                "cell_id": c.get("cell_id"),
+                "direction_id": did,
+                "direction_name": c.get("direction_name"),
+                "platform": c.get("platform", ""),
+                "stop_trigger": stop_trigger or fallback_audience,
+                "demo_output": (c.get("demo_output") or "")[:600],
+            })
+
+        _platforms_list = structured_brief.get("target_platforms") or []
+        _top_platform = _platforms_list[0] if _platforms_list else DEFAULT_PLATFORM
+
+        try:
+            result = await self.persona_simulator.run(
+                {
+                    "mode": "consumer_simulation",
+                    "target_audience": fallback_audience,
+                    "platform": _top_platform,
+                    "all_platforms": list(_platforms_list) or [DEFAULT_PLATFORM],
+                    "cells": slim_cells,
+                },
+                self.run_id,
+                self.db,
+            )
+        except Exception as e:
+            logger.exception(
+                "[consumer_sim] persona_simulator failed; skipping 2nd-level check"
+            )
+            final_system["_consumer_simulation"] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+                "reason": (
+                    "consumer_simulation 调用失败。常见原因: JSON 解析失败 / "
+                    "rate limit / 模型返回空。stage_log 里有完整 traceback。"
+                ),
+            }
+            return
+
+        final_system["_consumer_simulation"] = {"status": "ok", **(result or {})}
+
+        # Cells where the modeled consumer would scroll = interest_align
+        # second-layer fail. Append to strategic_warnings so UI surfaces them.
+        scrolled = [
+            j for j in (result.get("judgments") or [])
+            if (j.get("action") or "").lower() == "scroll"
+        ]
+        if scrolled:
+            logger.warning(
+                "[consumer_sim] %d cells would be scrolled past by modeled "
+                "target consumer: %s",
+                len(scrolled),
+                [j.get("cell_id") for j in scrolled],
+            )
+            for j in scrolled:
+                final_system.setdefault("strategic_warnings", []).append({
+                    "cell_id": j.get("cell_id"),
+                    "direction_id": j.get("direction_id"),
+                    "platform": j.get("platform", ""),
+                    "root_cause_explanation": (
+                        "consumer_simulation: 目标用户(stop_trigger 描述者)"
+                        f"判决 scroll — {j.get('reason', '')}"
+                    ),
+                    "multiplier_gate": {"interest_align": "fail"},
+                    "iteration": "consumer_sim",
+                    "source": "consumer_simulation",
+                })
+        else:
+            logger.info(
+                "[consumer_sim] all %d cells passed 2nd-level consumer check",
+                len(prompt_cells),
+            )
 
 
 class PipelineAlreadyRunningError(RuntimeError):
@@ -2595,6 +3621,51 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     thread = threading.Thread(target=_thread_target, daemon=True)
     thread.start()
     return thread
+
+
+_ROUTE_PRIORITY = (
+    "strategic",
+    "structural_identity",
+    "structural_gap",
+    "template",
+    "surface",
+)
+
+
+def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
+    """Split failed cells by root_cause_kind for critic-rewriter routing.
+
+    Priority (high→low): strategic > structural_identity > structural_gap
+    > template > surface. If a cell has no `root_cause_kind` (Gemini-flagged
+    cells or legacy critic output), default to "surface" so it still gets
+    treated by vibe_rewriter. Multiplier gate is inspected as a fallback
+    when root_cause_kind is missing — lets us route correctly even with an
+    older critic prompt that hasn't been updated yet.
+    """
+    buckets: dict[str, list[dict]] = {k: [] for k in _ROUTE_PRIORITY}
+
+    for fc in failed_cells:
+        kind = (fc.get("root_cause_kind") or "").strip()
+
+        if kind not in _ROUTE_PRIORITY:
+            # Fallback classification from multiplier_gate if critic didn't
+            # label root_cause_kind (e.g. Gemini arbitration entries).
+            gate = fc.get("multiplier_gate") or {}
+            if gate.get("interest_align") == "fail":
+                kind = "strategic"
+            elif gate.get("reward_signal") == "fail":
+                kind = "strategic"
+            elif gate.get("identity_consistency") == "fail":
+                kind = "structural_identity"
+            elif gate.get("gap_tension") == "fail":
+                kind = "structural_gap"
+            else:
+                # Unknown origin (pure Gemini flag) — treat as surface.
+                kind = "surface"
+
+        buckets[kind].append(fc)
+
+    return buckets
 
 
 def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
@@ -3001,8 +4072,25 @@ def revise_and_resume_pipeline_in_background(
     db.update_project(project_id, brief=brief)
 
     # 3. Selective deletion: only re-run what's actually needed.
-    # Always re-run: vibe loop + chancellery_final (they evaluate the full matrix)
-    stages_to_redo = ["vibe_critic", "vibe_rewriter", "chancellery_final"]
+    # Always re-run: 中间精炼层 + vibe loop + chancellery_final
+    # (这些都 evaluate full matrix,任何一个 cell 变了它们就得重跑)。
+    # v0.29.6: 补上 narrative_director / red_blue_refiner /
+    # persona_simulator / structural_rewriter / structure_review,之前
+    # 只删 vibe+final 会让这 5 个阶段的上轮 stage_log 残留 → UI 误染色
+    # + orchestrator cell 级 resume 时用到陈旧数据。
+    stages_to_redo = [
+        "narrative_director",
+        "red_blue_refiner",        # legacy,v0.30.9 起不再写新 log,留着清旧
+        "red_blue_red",            # v0.30.9 拆分,会写新 log,必须随重跑清掉
+        "red_blue_blue",           # v0.30.9 拆分,会写新 log,必须随重跑清掉
+        "persona_simulator",
+        "persona_simulator_alt",   # v0.30.8 双 backend 并跑,会写新 log
+        "ministry_works_structure_review",
+        "vibe_critic",
+        "vibe_rewriter",
+        "structural_rewriter",
+        "chancellery_final",
+    ]
 
     if is_global_revision:
         # Global concern (persona_library / title_rules etc.)
@@ -3013,7 +4101,7 @@ def revise_and_resume_pipeline_in_background(
             "ministry_works_builder",
         ]
         logger.info(
-            "[revise] global revision → deleting ALL works stages + vibe + final"
+            "[revise] global revision → deleting ALL works stages + 中间精炼 + vibe + final"
         )
     else:
         # Cell-specific revision → keep builder stage_logs intact.
@@ -3024,6 +4112,26 @@ def revise_and_resume_pipeline_in_background(
             f"[revise] cell-specific revision → keeping builder stage_logs, "
             f"only D{'/D'.join(affected_direction_ids)} will be re-built"
         )
+
+    # v0.29.7: gemini_trend_scout_post_{d_id} 跟 chancellery_final 挂钩
+    # (final 批准后才跑 per-direction post scan),chancellery_final 要
+    # 重跑意味着 post 也要清。用 exact-match delete,所以先扫一遍 log
+    # 名字把所有 post_* 找出来。
+    try:
+        _all_logs = db.get_stage_logs(run_id) or []
+        _post_names = [
+            l.get("stage_name", "")
+            for l in _all_logs
+            if (l.get("stage_name") or "").startswith(
+                "gemini_trend_scout_post_"
+            )
+        ]
+        if _post_names:
+            stages_to_redo += _post_names
+    except Exception:
+        # Non-fatal: can't read logs = post stays, UI shows stale but main
+        # pipeline proceeds correctly.
+        pass
 
     deleted = db.delete_stage_logs_by_names(run_id, stages_to_redo)
     logger.info(

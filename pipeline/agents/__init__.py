@@ -128,6 +128,45 @@ def init_api_config():
         picked by ACTIVE_CLAUDE_RELAY or session override. Falls back
         to legacy top-level ANTHROPIC_API_KEY when no presets defined.
     """
+    # DeepSeek / VectorEngine 是独立 backend,跟 Claude 走 Vertex 还是 relay
+    # 无关 — 任一模式下 stage 用 deepseek-*/gpt-* override 都应该能找到
+    # backend。所以这两个的初始化必须放在 mode 判定之前;以前(v0.30.0/0.30.7
+    # 引入时)关在 relay 分支里,Vertex 部署下永远拿不到 DS/VE 配置,GPT 阶段
+    # 在 _call_openai_chat 报"未配 VectorEngine",DeepSeek 阶段同理。
+    _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
+    if _ds_key:
+        _api_config["deepseek"] = {
+            "api_key": _ds_key,
+            "base_url": (
+                st.secrets.get("DEEPSEEK_BASE_URL")
+                or "https://api.deepseek.com/anthropic"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] DeepSeek anthropic-compat 端点已配置 "
+            "(base=%s)",
+            _api_config["deepseek"]["base_url"],
+        )
+    else:
+        _api_config.pop("deepseek", None)
+
+    _ve_key = (st.secrets.get("VECTORENGINE_API_KEY") or "").strip()
+    if _ve_key:
+        _api_config["vectorengine"] = {
+            "api_key": _ve_key,
+            "base_url": (
+                st.secrets.get("VECTORENGINE_BASE_URL")
+                or "https://api.vectorengine.ai/v1"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] VectorEngine OpenAI-compat 端点已配置 "
+            "(base=%s),GPT 系列将通过这里调用",
+            _api_config["vectorengine"]["base_url"],
+        )
+    else:
+        _api_config.pop("vectorengine", None)
+
     # Vertex AI mode
     if st.secrets.get("GCP_PROJECT_ID"):
         _api_config["mode"] = "vertex"
@@ -625,27 +664,74 @@ class BaseAgent:
                 )
 
     def _get_client(self) -> anthropic.Anthropic:
+        """Default client for the active relay/Vertex preset.
+        Backwards-compat shim — new code should call _get_client_for_model
+        which routes by model-name prefix (deepseek/gpt/claude → 不同
+        backend)。"""
+        return self._get_client_for_model(self.model)
+
+    def _get_client_for_model(self, model: str) -> anthropic.Anthropic:
+        """Select the right Anthropic-compatible client based on model name.
+
+        v0.30.0 引入多 vendor 路由:
+        - `deepseek-*` → DeepSeek 官方 anthropic-compat 端点(独立 base_url
+          和 api_key,从 _api_config["deepseek"] 读)
+        - `gpt-*` 或 `claude-*` → 走当前激活 preset 的 base_url(用户的
+          tdyun 中转同时支持 Claude 和 GPT,model 字符串决定 relay 内部
+          路由到哪家)
+        - Vertex 模式 → 仍然走 AnthropicVertex(只有 Claude 模型)
+
+        Vertex 不支持 deepseek/gpt:如果 vertex 模式下被要求 deepseek-*,
+        会 fallback 到独立的 DeepSeek 配置(如果配了);否则报错。
+        """
         if not _api_config:
             init_api_config()
 
+        _mlow = (model or "").lower()
+        _is_deepseek = _mlow.startswith("deepseek-")
+
+        if _is_deepseek:
+            ds_cfg = _api_config.get("deepseek")
+            if not ds_cfg or not ds_cfg.get("api_key"):
+                raise RuntimeError(
+                    f"模型 {model!r} 需要 DeepSeek backend,但 "
+                    "secrets.toml 里没配 DEEPSEEK_API_KEY。"
+                    "去 .streamlit/secrets.toml 加上 "
+                    "`DEEPSEEK_API_KEY = \"sk-...\"` 后重启。"
+                )
+            kwargs: dict[str, Any] = {
+                "api_key": ds_cfg["api_key"],
+                "base_url": ds_cfg["base_url"],
+                "timeout": 900.0,
+            }
+            return anthropic.Anthropic(**kwargs)
+
+        # Vertex 模式只能跑 Claude(GPT 也不行,Vertex AI Anthropic 是
+        # Anthropic-only endpoint)
         if _api_config.get("mode") == "vertex":
+            if _mlow.startswith("gpt-"):
+                raise RuntimeError(
+                    f"Vertex 模式不支持 GPT 模型 {model!r}。"
+                    "需要切换到 relay preset(支持多模型路由的中转)"
+                    "或在 GCP_PROJECT_ID 之外另配 ANTHROPIC_API_KEY。"
+                )
             from anthropic import AnthropicVertex
             vertex_kwargs: dict[str, Any] = {
                 "project_id": _api_config["project_id"],
                 "region": _api_config["region"],
                 "timeout": 900.0,
             }
-            # Pass explicit credentials if service account JSON was in secrets
             if "credentials" in _api_config:
                 vertex_kwargs["credentials"] = _api_config["credentials"]
             return AnthropicVertex(**vertex_kwargs)
-        else:
-            # Direct Anthropic / relay proxy
-            kwargs: dict[str, Any] = {"api_key": _api_config["api_key"]}
-            if _api_config.get("base_url"):
-                kwargs["base_url"] = _api_config["base_url"]
-            kwargs["timeout"] = 900.0  # 15 min
-            return anthropic.Anthropic(**kwargs)
+
+        # Direct relay/Anthropic 模式 — Claude 和 GPT 都走这里
+        # (用户的 tdyun 中转 model 字符串路由到 Anthropic 或 OpenAI)
+        kwargs = {"api_key": _api_config["api_key"]}
+        if _api_config.get("base_url"):
+            kwargs["base_url"] = _api_config["base_url"]
+        kwargs["timeout"] = 900.0
+        return anthropic.Anthropic(**kwargs)
 
     # Agents that need strategy-level methodology (差异化/真实感/平台感知)
     _STRATEGY_STAGES = frozenset({
@@ -736,6 +822,96 @@ class BaseAgent:
 
         return blocks if blocks else text
 
+    def _call_openai_chat(
+        self,
+        system_prompt: str,
+        user_message: str,
+        effective_model: str,
+        max_tokens: int,
+    ) -> tuple[str, int, int, int, int, bool]:
+        """OpenAI-compat chat/completions backend(v0.30.7 起走 vectorengine.ai)。
+
+        GPT 系列模型不能通过 anthropic SDK 调用——tdyun-style anthropic-compat
+        中转转发不过去。所以单独走 OpenAI SDK + vectorengine 端点。
+
+        返回和 _call_claude 同样的 6-tuple,让上层调度逻辑不用分支处理:
+        (text, input_tokens, output_tokens, cache_read, cache_creation,
+        thinking_fired)。GPT 没有 anthropic 风格的 thinking 块,
+        thinking_fired 永远是 False。OpenAI 的 prompt caching 走 usage.
+        prompt_tokens_details.cached_tokens,映射到 cache_read。
+
+        失败模式:
+        - vectorengine 没配 → RuntimeError 提示去 secrets.toml 加 key
+        - openai SDK 未安装 → ImportError 一样,但 requirements.txt 已经
+          固定了 openai>=1.40 所以正常环境不会触发
+        """
+        ve_cfg = _api_config.get("vectorengine") if _api_config else None
+        if not ve_cfg or not ve_cfg.get("api_key"):
+            raise RuntimeError(
+                f"模型 {effective_model!r} 需要 OpenAI-compat backend "
+                "(vectorengine.ai),但 secrets.toml 里没配 "
+                "VECTORENGINE_API_KEY。去 .streamlit/secrets.toml 加上 "
+                "`VECTORENGINE_API_KEY = \"sk-...\"` 后重启,或者把这个 "
+                "stage 的模型改回 Claude 系列。"
+            )
+
+        import openai as _openai_sdk  # 延迟 import,Streamlit 未配置时不触发
+
+        client = _openai_sdk.OpenAI(
+            api_key=ve_cfg["api_key"],
+            base_url=ve_cfg["base_url"],
+            timeout=900.0,
+        )
+
+        # 把 anthropic 风格的 system + messages 转成 OpenAI ChatCompletion
+        # messages 格式:第一条是 role=system,后面是 user/assistant。
+        oai_messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # 大多数 OpenAI-compat 中转支持 max_tokens(传统)和 max_completion_tokens
+        # (新版 reasoning 模型用)。先传 max_tokens,如 vectorengine 在
+        # gpt-5/gpt-5.5 时报 400 再切换 max_completion_tokens。
+        oai_kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": oai_messages,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        try:
+            response = client.chat.completions.create(**oai_kwargs)
+        except _openai_sdk.BadRequestError as e:
+            # gpt-5 / o1 / o3 / o4 系列不接受 max_tokens,要 max_completion_tokens
+            _err_msg = str(e).lower()
+            if "max_tokens" in _err_msg or "max_completion_tokens" in _err_msg:
+                oai_kwargs.pop("max_tokens", None)
+                oai_kwargs["max_completion_tokens"] = max_tokens
+                response = client.chat.completions.create(**oai_kwargs)
+            else:
+                raise
+
+        # 解析返回
+        text = ""
+        if response.choices:
+            _msg = response.choices[0].message
+            text = (_msg.content or "").strip()
+
+        # Token 统计 + cache 信息
+        usage = response.usage
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        cache_read = 0
+        try:
+            _ptd = getattr(usage, "prompt_tokens_details", None)
+            if _ptd is not None:
+                cache_read = int(getattr(_ptd, "cached_tokens", 0) or 0)
+        except Exception:
+            pass
+
+        return (text, input_tokens, output_tokens, cache_read, 0, False)
+
     def _call_claude(
         self, system_prompt: str, user_message: str
     ) -> tuple[str, int, int, int, int, bool]:
@@ -761,7 +937,6 @@ class BaseAgent:
         `{"type": "enabled", "budget_tokens": N}` which is the universal
         format.
         """
-        client = self._get_client()
         is_vertex = _api_config.get("mode") == "vertex"
 
         # Build content (may include image blocks)
@@ -797,6 +972,27 @@ class BaseAgent:
         # (which was set from MODELS at agent construction time).
         _model_overrides = _api_config.get("model_overrides") or {}
         effective_model = _model_overrides.get(self.stage_name) or self.model
+
+        # GPT 系列必须用 vectorengine 的 OpenAI-compat chat/completions 接口,
+        # 不能用 anthropic SDK。**提前** dispatch,在 _get_client_for_model
+        # 之前 — 否则 Vertex 模式下 _get_client_for_model 看到 gpt-* 会直接
+        # raise("Vertex 模式不支持 GPT"),GPT stage 在 Vertex 部署下永远跑
+        # 不起来。返回相同的 (text, in_tok, out_tok, cache_read,
+        # cache_creation, thinking_fired) 元组,上层 run() 不用分支处理。
+        _model_low = (effective_model or "").lower()
+        _is_gpt_family = _model_low.startswith("gpt-")
+        if _is_gpt_family:
+            return self._call_openai_chat(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                effective_model=effective_model,
+                max_tokens=self.max_tokens,
+            )
+
+        # v0.30.0: 按模型族选 backend(Claude 走 default relay 或 Vertex,
+        # DeepSeek 走独立官方 anthropic-compat 端点)。client 必须按
+        # effective_model 来挑,不能用全局 _get_client。
+        client = self._get_client_for_model(effective_model)
 
         kwargs: dict[str, Any] = {
             "model": effective_model,
@@ -834,17 +1030,24 @@ class BaseAgent:
         _preset_supports_adaptive = _api_config.get(
             "supports_adaptive_thinking", True
         )
-        # Adaptive thinking is an Opus-4.6-specific API feature. Match the
-        # canonical model family prefix instead of a bare "4-6" substring
-        # so future names like "claude-opus-5-0" don't accidentally match
-        # and we don't cross-match unrelated model names that happen to
-        # contain those digits.
-        _is_opus_4_6_family = (
+        # Adaptive thinking is an Opus-4.6+ API feature(自 Opus 4.6 起支持,
+        # Opus 4.7 继承)。Match canonical model family prefixes exactly, so
+        # future names like "claude-opus-5-0" don't accidentally match and
+        # we don't cross-match unrelated model names containing those digits.
+        # Sonnet 3.7 不支持 adaptive thinking,会走到 else 分支发 budget_tokens。
+        _is_adaptive_thinking_family = (
             "claude-opus-4-6" in effective_model
+            or "claude-opus-4-7" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
-        if self._use_thinking and not _preset_uses_suffix:
-            if _is_opus_4_6_family and _preset_supports_adaptive:
+        # v0.30.0: GPT 模型即使 stage 在 THINKING_STAGES 里也强制不发
+        # thinking 参数(relay 转给 OpenAI 接口会 400)。代码上层把
+        # _use_thinking 留着用于日志标签的"我们打算 think 但 GPT 不接",
+        # 但 kwargs 里啥都不加。
+        if self._use_thinking and _is_gpt_family:
+            pass  # 跳过 thinking 注入,后面 thinking_fired 会自然记录 ✗
+        elif self._use_thinking and not _preset_uses_suffix:
+            if _is_adaptive_thinking_family and _preset_supports_adaptive:
                 kwargs["thinking"] = {"type": "adaptive"}
             else:
                 kwargs["thinking"] = {
@@ -1037,9 +1240,17 @@ class BaseAgent:
                 )
                 return repaired
 
+        # v0.29.12: 老错误只报 last 200 chars,debug 时还得翻 stage_log
+        # 才能看全貌。把首 200 + 末 200 都塞进去,并报告中间遗漏了多少,
+        # 让运行时日志就能判断是"整段不是 JSON"还是"尾部截断"。
+        _preview_front = response_text[:200]
+        _preview_tail = response_text[-200:] if len(response_text) > 200 else ""
+        _gap = max(0, len(response_text) - 400)
         raise ValueError(
-            f"Could not extract JSON from response (len={len(response_text)}, "
-            f"last 200 chars: ...{response_text[-200:]!r})"
+            f"Could not extract JSON from response (len={len(response_text)}); "
+            f"first 200 chars: {_preview_front!r}; "
+            f"...[{_gap} chars omitted]... "
+            f"last 200 chars: {_preview_tail!r}"
         )
 
     @staticmethod
@@ -1077,8 +1288,13 @@ class BaseAgent:
             elif ch == ",":
                 cut_points.append(i)  # cut BEFORE comma is also valid
 
-        # Try cut points from most recent to earliest (keep as much data as possible)
-        for cp in reversed(cut_points[-300:]):
+        # Try cut points from most recent to earliest (keep as much data as possible).
+        # v0.29.12: 老版本 `cut_points[-300:]` 硬限在 13K+ 响应里常常不够
+        # ——最后 300 个 cut point 可能都深埋在一个没闭合的嵌套结构里,
+        # 每个 candidate 都不合法。放开限制,扫所有 cut point。即使 5000
+        # 个 candidate 每个 re-scan 也就 ~50ms,总共 <1s,比整条流水线
+        # 报错重跑强得多。
+        for cp in reversed(cut_points):
             candidate = fragment[:cp].rstrip().rstrip(",").rstrip()
             # Strip a dangling partial field. Order matters — more specific
             # patterns first. All regexes assume the candidate has no unclosed
@@ -1322,8 +1538,21 @@ class BaseAgent:
                     # from transient model weirdness.
                     _retryable = attempt < 1  # allow at most 1 retry for parse errors
 
+                # v0.28.2: 对上游 5xx(relay 或 Anthropic internal)用更长的
+                # 退避窗口 —— 抖动通常需要 10-30s 恢复,3s*2^attempt 太激进,
+                # 会把重试烧在还没恢复的上游。5xx 用 base=10s,其他错误仍用
+                # RETRY_BASE_DELAY_SECONDS(3s)。
+                # 注意:v0.28.1 的模型自动降级已移除——用户明确选择"全部用
+                # Opus 4.7,失败就重跑",避免降级在 multi-batch 场景下悄悄
+                # 污染后续 batch。
+                _is_5xx = isinstance(
+                    e,
+                    (anthropic.InternalServerError, anthropic.APIConnectionError),
+                )
+
                 if _retryable and attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+                    _base = 10 if _is_5xx else RETRY_BASE_DELAY_SECONDS
+                    delay = _base * (2 ** attempt)
                     await asyncio.sleep(delay)
                 elif not _retryable:
                     logger.warning(

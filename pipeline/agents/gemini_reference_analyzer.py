@@ -25,6 +25,7 @@ from pipeline.agents.gemini_client import (
     GeminiCallFailed,
     GeminiNotConfigured,
     call_gemini_json,
+    resolve_gemini_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ async def run_reference_analyzer(
             system_prompt,
             user_message,
             enable_url_context=True,
+            model=resolve_gemini_model("reference_analyzer"),
         )
     except GeminiNotConfigured as e:
         logger.debug("[ref_analyzer] not configured: %s", e)

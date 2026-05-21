@@ -29,6 +29,23 @@
 2. **完整性** — 是否所有战术方向都有对应 prompt，无遗漏
 3. **可用性** — prompt 是否能直接使用，无需人工补充
 4. **示例验证** — demo output 是否符合预期质量
+5. **跨 cell 一致性 — 必查叙事导演诊断**(v0.30.5 起):
+
+如果 input 里有 `narrative_director_summary` 字段,这是叙事导演阶段对**整个 prompt_matrix** 做的跨 cell 一致性诊断结果:
+
+```json
+"narrative_director_summary": {
+  "verdict": "approved | needs_adjustment",
+  "issues": [...],          // 当时诊断出的问题清单(钩子重复/人设串/正反比例失衡等)
+  "cells_rebuilt": ["D2_xiaohongshu", ...],  // 当时重建过的 cell
+  "cross_cell_summary": "..."
+}
+```
+
+你要做的:
+- 如果 `verdict = "needs_adjustment"` 但 `cells_rebuilt` 为空 → 叙事导演诊断了问题但没修,你要 fail 并把这些 issues 转写成 mandatory_revisions
+- 如果 `cells_rebuilt` 非空 → 这些 cell 经过重建,你要**优先抽查**它们的 demo,看看叙事导演当时指出的问题是否真的解决了(没解决 → fail)
+- 即使叙事导演 verdict=approved,你也要**自己再扫一遍 prompt_matrix 里的钩子类型**,看有没有它漏掉的重复(它判断的是当时,你看的是最终态,中间可能又被重写引入了新重复)
 
 ### 增量评审（round_number ≥ 2）
 

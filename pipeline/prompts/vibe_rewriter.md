@@ -91,6 +91,25 @@ system_prompt 里必须有这段：
 
 `failed_cells`：每个 cell 包含原 system_prompt + 原 demo_output + 复检官的 `rewrite_directives` + `severity`（`borderline` 或 `fail`） + 可能的 `taste_gap`。
 `shared_skeleton`：可参考的差异化工具包等共享元素。
+`reference_packs_by_platform`（可选，但**如有必用**）：按平台组织的**人工录入真实爆文证据包**，每条包含 `post_title` / `post_body` / `top_comments` / `ai_analysis`。当某个 cell 的 platform 能在这个 dict 里命中,**优先模仿证据包而非本 prompt 里的静态样本**——因为证据包是用户挑的真实爆文,而本 prompt 的样本只是通用参考。
+
+### 如何使用 reference_packs（最关键指令）
+
+当 `reference_packs_by_platform[cell.platform]` 存在且非空时,**针对这个 cell,按以下顺序重写**:
+
+1. **读 `ai_analysis.comment_dna`**——这是真正的 vibe DNA 所在地。重点看:
+   - `resonance_points` — 评论区反复复述作者哪个点 → 你的新 demo 必须有一个功能等价的"可被复述的点"
+   - `copied_phrases` — 作者用过、被评论抄进评论里的梗/口头禅 → 考虑在新 demo 里埋一句类似结构但不同内容的金句
+   - `unanswered_questions` — 读者反复问但作者没答的问题 → 你的 system_prompt 要确保生成内容要么主动答,要么故意留白,让读者能在评论区发问
+   - `emotional_register` — 评论整体情绪色彩 → 你的新 demo 要引出同色彩情绪(不是 positive→positive 这么简单,是具体到"兴奋 / 质疑 / 踩雷警告 / 闺蜜互损"这一层)
+2. **读 `ai_analysis.imitation_guide`**——里面明确告诉你哪些要素 MUST_preserve、哪些 CAN_adapt、哪些是 common_mistake_to_avoid。严格遵守。
+3. **读 `ai_analysis.body_analysis.opening_move` + `tone_markers` + `signature_phrases`**——提取该帖子开场动作、具体语气 token、金句结构,作为你新 demo 第一句的**结构模板**(不是抄原文,是抄 pattern)。
+4. **当同一平台有多个证据包时**,每个 failed cell 分配一个独立的证据包作锚点(严禁两个 cell 共用同一证据包);分配耗尽时再使用本 prompt 静态样本补。
+
+⚠️ **禁止行为**:
+- 禁止原样复制证据包的标题或正文片段(会被下游查重击杀)。
+- 禁止只抄证据包的表面句式忽略评论区共振——表面句式 AI 会抄但抄不对味。
+- 禁止在证据包为空/没有命中时报错或略过——那时依然按本 prompt 的静态样本执行,只是缺少一层现场感校准。
 
 ## 严重度区分（必读）
 

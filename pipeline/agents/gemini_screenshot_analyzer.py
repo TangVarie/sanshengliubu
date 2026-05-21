@@ -22,6 +22,7 @@ from pipeline.agents.gemini_client import (
     GeminiCallFailed,
     GeminiNotConfigured,
     call_gemini_json,
+    resolve_gemini_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ async def analyze_screenshots(
             system_prompt,
             user_msg,
             images=images,
+            model=resolve_gemini_model("screenshot_analyzer"),
         )
     except GeminiNotConfigured as e:
         logger.debug("[screenshot_analyzer] not configured: %s", e)
