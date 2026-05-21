@@ -4080,8 +4080,11 @@ def revise_and_resume_pipeline_in_background(
     # + orchestrator cell 级 resume 时用到陈旧数据。
     stages_to_redo = [
         "narrative_director",
-        "red_blue_refiner",
+        "red_blue_refiner",        # legacy,v0.30.9 起不再写新 log,留着清旧
+        "red_blue_red",            # v0.30.9 拆分,会写新 log,必须随重跑清掉
+        "red_blue_blue",           # v0.30.9 拆分,会写新 log,必须随重跑清掉
         "persona_simulator",
+        "persona_simulator_alt",   # v0.30.8 双 backend 并跑,会写新 log
         "ministry_works_structure_review",
         "vibe_critic",
         "vibe_rewriter",
