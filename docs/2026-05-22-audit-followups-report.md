@@ -14,14 +14,61 @@ audit 文档列了 8 项 followup,其中和 sanshengliubu 直接相关的是 5 �
 另 1 项 (R-028 stage-level resume) 工时 1-2 天且需要 schema 改动 + UI 集成
 测试,本轮未做,在「未实施 · 列入后续 sprint」一节解释。
 
-| ID | 主题 | 紧急度 | 本次状态 |
+PR 链:
+- **#27** 初始 4 项落地 (已合并到 main `7d005b6`)
+- **#28** review 反馈 round 1 + 2 + 3 (待合并;本文档反映 #28 最终状态)
+
+| ID | 主题 | 紧急度 | 当前状态 |
 |----|------|--------|----------|
-| **R-022** | vibe_rewriter 必须从 DB 注入 reference_samples | **P0 · 飞轮闭环** | ✅ 已实施 |
-| **R-019** | 单租户 / 多租户决策声明 | P1 | ✅ 已实施 (Option A 单租户声明) |
-| **R-023** | logger secret masking | P1 | ✅ 已实施 |
-| **R-026** | LLM retry framework | P2 | ✅ 已实施 (Gemini side) |
-| R-018 | daemon thread → 持久 job worker | Sprint 2+ | ⏸ 未实施 (1-2 周工时) |
-| R-028 | stage-level resume (cell 粒度) | P3 | ⏸ 未实施 (1-2 天 + schema 改动) |
+| **R-022** | vibe_rewriter 真正注入 DB samples + 运行时审计 + SQL 可查 | **P0 · 飞轮闭环** | ✅ 完成 (PR #27 实施 + #28 round 1/2/3 加固) |
+| **R-019** | 单租户假设显式声明 | P1 | ✅ 完成 (PR #27) |
+| **R-023** | logger secret masking (7 模式与 TV 对齐) | P1 | ✅ 完成 (PR #27 + #28 加对齐注释) |
+| **R-026** | Gemini bounded retry + 三套重试设计文档化 | P2 | ✅ 完成 (PR #27 + #28 抽到 architecture.md) |
+| R-018 | daemon thread → 持久 job worker | Sprint 2+ | ⏸ 未实施 (1-2 周工时;触发条件见 architecture.md backlog) |
+| R-028 | stage-level resume (cell 粒度) | P3 | ⏸ 未实施 (1-2 天 + schema;触发条件见 architecture.md backlog) |
+
+## 当前状态总账 (PR #28 合并后)
+
+每条 R-xxx 最终落地的样子,跨 PR/round 的累计结果:
+
+### R-022 (P0 飞轮闭环) —— 共 4 道关卡
+
+1. **Prompt 层重写**:`vibe_rewriter.md` 把"真人参照样本"分成 🥇 PRIMARY (DB)
+   和 🥈 FALLBACK (静态) 两层,加铁律和**三态决策表**;强制 LLM 在
+   `rewrite_summary` 写 `源:数据库样本 #<id>` 或 `源:静态兜底 #<编号>(原因:...)`
+2. **检索层观测**:`retrieve_samples.py` 加 `source_type` (truth_vault/manual)
+   + `summarize_packs_by_platform()`;0 packs 升 WARNING
+3. **注入层串通**:orchestrator vibe_loop 把 `reference_packs_summary` 推到
+   critic / structural_rewriter / vibe_rewriter 三处 input
+4. **运行时审计 + 持久化**:`_audit_rewrite_source_tags` (纯函数,只审 vibe 不审
+   structural) + `_persist_audit_findings` 每 iteration 写一行
+   `stage_logs` (`stage_name='r022_flywheel_audit'`,status 反映严重度)。
+   配额规则:`allowed_static = max(0, N_cells - K_packs)`,不会误报包用尽场景
+
+### R-019 (P1 单租户声明) —— 3 处显式提醒
+
+- `README.md` 顶部 ⚠️ 警告条 + 指向多租户改造的迁移
+- `db/schema.sql` 在 `DISABLE RLS` 块上方加 13 行 audit 注释
+- `app.py` sidebar caption `🔓 单租户模式`,每次打开页面提醒
+
+### R-023 (P1 secret masking) —— 7 模式 + 3 通道 + TV 对齐
+
+- `pipeline/logger_utils.py`:7 个模式 (Anthropic / Supabase service / Supabase
+  PAT / JWT / Google / OpenAI scoped / generic sk-*),与 truth-vault
+  `scripts/_common.py::_SECRET_PATTERNS` shadow-aligned
+- 应用到 3 个泄密通道:`pages/3_pipeline_detail.py` 错误展示 + 2 处 raw
+  preview、`gemini_client.py` raw_text logger
+- `app.py` 启动 `install_secret_masking_on_root_logger()`,根 logger 全自动 mask
+
+### R-026 (P2 Gemini retry + 三套设计文档化)
+
+- `pipeline/llm_retry.py`:`call_with_retry` + `_is_transient` (匹配
+  429/503/504/timeout/overloaded 等子串),`max_attempts=3 / max_wait=30s`
+- `gemini_client.call_gemini_json` 的 `generate_content` 包重试
+- Claude 路径**不动** (BaseAgent.run() 已有独立 retry + budget + limiter +
+  cache fallback 4 项耦合状态机),迁移留给未来 R-026.2 PR
+- 跨 backend 对照表 + 不统一理由 + 未来触发条件全部抽到
+  `docs/architecture.md §1`,docstring 改为指向单一真理来源
 
 ---
 
@@ -298,47 +345,61 @@ exhaust: 3 attempts, then re-raise last transient exception
 | `README.md` | 修改 | 顶部加单租户警告条 (R-019) |
 | `app.py` | 修改 | 启动时调用 `install_secret_masking_on_root_logger`、添加 sidebar 单租户提醒 (R-019/R-023) |
 | `db/schema.sql` | 修改 | DISABLE RLS 块上方加 13 行 audit 注释 (R-019) |
-| `pipeline/orchestrator.py` | 修改 | import + vibe_loop 串入 `reference_packs_summary` + telemetry 升级 (R-022) |
+| `pipeline/orchestrator.py` | 修改 | import + vibe_loop 串入 `reference_packs_summary` + telemetry 升级;新增 `_audit_rewrite_source_tags` 纯函数 (per-platform 配额规则) + `_persist_audit_findings` helper 落 stage_logs (R-022) |
 | `pipeline/retrieve_samples.py` | 修改 | 加 `source_type` 字段;新增 `summarize_packs_by_platform`;0-pack 升级为 WARNING (R-022) |
-| `pipeline/prompts/vibe_rewriter.md` | 修改 | 重写"真人参照样本"段:PRIMARY/FALLBACK 分层、强制 source 追溯 (R-022) |
+| `pipeline/prompts/vibe_rewriter.md` | 修改 | 重写"真人参照样本"段:PRIMARY/FALLBACK 分层 + **三态决策表** + 强制 source 追溯 (R-022) |
 | `pipeline/agents/gemini_client.py` | 修改 | `generate_content` 包 `call_with_retry`、raw_text log 走 `mask_secrets` (R-023/R-026) |
 | `pages/3_pipeline_detail.py` | 修改 | `render_stage_error` + 2 处 `st.code(_raw, ...)` 走 `mask_secrets` (R-023) |
-| `pipeline/logger_utils.py` | **新增** | `mask_secrets` + `SecretMaskingFormatter` + root logger installer (R-023) |
-| `pipeline/llm_retry.py` | **新增** | `call_with_retry` / `acall_with_retry` / `_is_transient` (R-026) |
-| `docs/2026-05-22-audit-followups-report.md` | **新增** | 本报告 |
+| `pipeline/logger_utils.py` | **新增** | `mask_secrets` (7 模式 shadow-aligned TV) + `SecretMaskingFormatter` + root logger installer (R-023) |
+| `pipeline/llm_retry.py` | **新增** | `call_with_retry` + `_is_transient` (R-026);跨 backend 对照表 docstring 改为指向 architecture.md |
+| `docs/2026-05-22-audit-followups-report.md` | **新增** | 本报告 (含 3 轮 review 演进记录) |
+| `docs/architecture.md` | **新增** | 跨模块设计选择文档:三套 retry / R-022 飞轮可观测 / 单租户 / Secret masking 对齐 + backlog |
 
 ---
 
-## 自检结果
+## 自检结果 (累计)
 
 | 检查 | 结果 |
 |------|------|
-| 所有改动文件 AST 解析 | ✅ 7/7 OK |
-| `mask_secrets` 5 种 token 模式 | ✅ 5/5 全被替换 |
+| 所有改动文件 AST 解析 | ✅ 全 OK (跨 3 轮提交) |
+| `mask_secrets` 7 种 token 模式 | ✅ 7/7 全 mask (Anthropic / Supabase service / Supabase PAT / JWT / Google / OpenAI scoped / generic sk-) |
 | `mask_secrets` 边界条件 (None / 空 / 非字符串 / 干净文本) | ✅ 4/4 OK |
 | `_is_transient` 分类 (429/503/timeout/auth/validation) | ✅ 6/6 OK |
-| `call_with_retry` fail-fast 路径 (非 transient) | ✅ 1 次调用, <1ms |
-| `call_with_retry` retry-then-succeed | ✅ 3 次调用,返回正确 |
-| `call_with_retry` 耗尽重试 | ✅ 3 次调用,re-raise |
+| `call_with_retry` fail-fast / retry-then-succeed / 耗尽 | ✅ 3/3 OK |
 | `_shape_for_rewriter` source_type 推导 | ✅ TV / manual 两种正确 |
 | `summarize_packs_by_platform` 输出形状 | ✅ 与文档约定一致 |
+| `_audit_rewrite_source_tags` 7 分支 (纯合规 / 包用尽合法 / 一偷懒一 legit / missing_tag / 全角冒号 / 空输入 / 0-pack 全静态) | ✅ 7/7 OK |
+| `_persist_audit_findings` 3 分支 (clean / warn / DB 故障静默) | ✅ 3/3 OK |
 
 ---
 
 ## 推荐运营动作
 
-1. **本周**:观察生产日志,关注:
-   - `[retrieve_samples] 0 packs for platform=...` (WARNING) — 哪些平台库存空
-   - `[vibe_loop] NO reference_packs for any platform` (WARNING) — 全部静态兜底
-   - `[R-022 audit] N/M vibe cells missing 源:* tag` (WARNING) — vibe_rewriter 漏写源标记
-   - `[R-022 audit] some platforms used 源:静态兜底 more than DB pack exhaustion would justify` (WARNING) — 飞轮被忽略,按 per-platform 配额规则识别
-2. **下次 brief 跑通后**:抽 1 个 cell 的 vibe_rewriter 输出,验证
-   `rewrite_summary` 是否真带了 `源:数据库样本 #<id>` 标签
-3. **多租户决策点**:接第二个客户之前,跑 truth-vault 仓的
+1. **本周**:观察生产信号,**优先看 SQL 而不是 stderr**(`docs/architecture.md §2`
+   有完整模板):
+   ```sql
+   -- 过去 24h 飞轮 audit 有 warn 的全部 run
+   SELECT * FROM stage_logs
+   WHERE stage_name = 'r022_flywheel_audit'
+     AND status = 'completed_warn'
+     AND created_at > NOW() - INTERVAL '24 hours';
+   ```
+   stderr 信号(`[R-022 audit] ...` WARNING、`[retrieve_samples] 0 packs ...`
+   WARNING、`[vibe_loop] NO reference_packs ...` WARNING) 仍可用,但有了 SQL
+   持久化层就**不需要靠盯日志找问题**。
+
+2. **下次 brief 跑通后**:跑命中率 SQL (架构文档里有模板),看
+   `db_hit_rate`,目标 > 0.5 表示飞轮在事实工作。
+
+3. **接日报 / 告警**:架构文档 §2 给了 3 种成本递增的方案
+   (TV 跨仓查最便宜 / cron 中等 / GitHub Actions 完整),按业务紧迫度选。
+
+4. **多租户决策点**:接第二个客户之前,跑 truth-vault 仓的
    `sanshengliubu-patches/005_multi_tenant_workspaces.sql` 到 staging,
-   按 README 警告条的指引推进
-4. **后续 sprint 排期**:R-018 (job worker) 和 R-028 (cell-level resume)
-   分别评估业务紧迫度
+   按 README 警告条的指引推进。
+
+5. **后续 sprint 排期**:R-018 / R-028 / R-026.2 三项的具体触发条件见
+   `docs/architecture.md` 末尾的 backlog 表。
 
 ---
 
@@ -472,3 +533,56 @@ LLM 可能输出 `源:` (U+003A ASCII 冒号) 或 `源：` (U+FF1A 全角冒号)
 | E 全角冒号 U+FF1A | 识别为 db | ✅ |
 | F 空输入 | no-op | ✅ |
 | G 0-pack 平台全静态 | 无 WARNING (allowed=N) | ✅ |
+
+---
+
+## 2026-05-22 third-round review · 可观测性 + 设计文档化
+
+第三轮 review 指出两个仍然没解决的痛点:
+
+### Q3.1 · "WARNING 谁去看?" → audit findings 落库 SQL 可查
+
+**review**: "代码里写 WARNING 没问题,但谁去看?sanshengliubu 的日志默认是
+Streamlit stderr / Streamlit Cloud 后台。如果没人盯,飞轮失效信号会被淹没。"
+
+**实施**:
+- 重构 `_audit_rewrite_source_tags` 为**纯函数 + 返回 findings dict** (仍然
+  保留 stderr WARNING 作为 dev 调试通道)
+- 新增 `_persist_audit_findings(db, run_id, iteration, findings,
+  reference_packs_summary)` helper:
+  - 每次 vibe_loop iteration 写一行 `stage_logs`,
+    `stage_name='r022_flywheel_audit'`
+  - `status` 反映严重度:`completed` (干净) / `completed_warn` (有 missing
+    或 excess)
+  - `output_data` 是结构化 JSON,含 `total_vibe_cells / db_sourced /
+    static_sourced / missing_tag_cell_ids / excess_static_by_platform /
+    per_platform_total / reference_packs_summary / has_warnings`
+  - DB 写失败 try/except,只 logger.exception,不阻断 vibe_loop(audit 是
+    观测层,绝不允许把流水线弄挂)
+
+**接日报 / 告警的 3 种方式** (架构文档里给了 SQL 模板):
+1. cron 每小时跑 SQL 检查 `status='completed_warn'` 行数
+2. TV 仓的日报 SQL 多读一张 ssll 表
+3. 新加 `scripts/check_audit_warnings.py` + GitHub Actions schedule (P3,
+   工时 ~2h)
+
+完整字段 schema + 3 个 SQL 自检模板 (单次审计 / warn-only / 7 天命中率) 写在
+`docs/architecture.md §2`。
+
+### Q3.2 · 跨 backend 重试对照表埋在 docstring → 抽到 architecture.md
+
+**review**: "pipeline/llm_retry.py 顶部 docstring 写了 4 backend 对照表,
+但这是 Python 文件 — 新人 onboarding 时不容易看到。"
+
+**实施**:
+- 新建 `docs/architecture.md`,目录有 4 节:
+  1. 为什么有三套 LLM 重试 (R-026) — 完整对照表 + 不统一的理由 + 未来
+     统一的触发条件
+  2. 飞轮可观测:R-022 audit 信号去哪里查 — 3 个落点 + SQL 模板 + 字段
+     schema
+  3. 单租户假设 (R-019)
+  4. Secret masking 与 truth-vault 对齐 (R-023)
+- 文档末尾追加 backlog 表 (R-018 / R-028 / R-026.2 + 触发条件)
+- `pipeline/llm_retry.py` docstring 删掉重复表格,改为指向 architecture.md
+  (single source of truth)
+- README 在简介后加一段"📐 新人入职 → 看 docs/architecture.md"导引

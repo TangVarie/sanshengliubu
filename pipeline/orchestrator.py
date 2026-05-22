@@ -3125,9 +3125,19 @@ class PipelineOrchestrator:
             # 漏写 ≠ 重写失败),只把异常 cell_id 显式 surface 出来。
             # 只审 vibe_rewriter 输出 — structural_rewriter 的 prompt
             # 不要求"源:..."标记,把它们混进来会出现系统性 false positive。
-            _audit_rewrite_source_tags(
+            # findings 同时持久化到 stage_logs(stage_name='r022_flywheel_audit')
+            # 一行,这样运营/TV 不必盯 stderr,直接 SQL 就能日报和告警。
+            _audit_findings = _audit_rewrite_source_tags(
                 vibe_only_cells_by_id, reference_packs_by_platform
             )
+            if _audit_findings.get("total_vibe_cells", 0) > 0:
+                _persist_audit_findings(
+                    self.db,
+                    self.run_id,
+                    iteration=iteration,
+                    findings=_audit_findings,
+                    reference_packs_summary=reference_packs_summary,
+                )
 
             prompt_cells = [
                 new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
@@ -3685,7 +3695,7 @@ _ROUTE_PRIORITY = (
 def _audit_rewrite_source_tags(
     vibe_rewritten_cells_by_id: dict,
     reference_packs_by_platform: dict[str, list],
-) -> None:
+) -> dict:
     """R-022 follow-up: 扫 vibe_rewriter 输出的 `rewrite_summary` 字段,
     确认它带了 `源:数据库样本 #<id>` 或 `源:静态兜底 #<编号>` 标记。
 
@@ -3695,7 +3705,19 @@ def _audit_rewrite_source_tags(
 
     为什么不抛错: LLM 偶尔不严格遵守 prompt 是已知问题,这里抛错会让单
     cell 漏写一个标记就拆掉整条 vibe_loop。我们只 WARNING 把异常 cell 拎
-    出来,让运营能在日志里 grep 出"飞轮信号缺失"的实际比例。
+    出来,让运营能在日志里 grep 出"飞轮信号缺失"的实际比例。**调用方**
+    会把返回的 findings 写到 stage_logs 一行(stage_name='r022_flywheel_audit'),
+    让"谁去看"的问题靠 SQL/dashboard 解决,而不是靠盯 stderr。
+
+    返回 findings dict 形状:
+        {
+          "total_vibe_cells": int,
+          "db_sourced": int,
+          "static_sourced": int,
+          "missing_tag_cell_ids": list[str],
+          "excess_static_by_platform": dict[platform → quota detail],
+          "per_platform_total": dict[platform → int],
+        }
 
     分类:
       - missing_tag        — rewrite_summary 完全没有"源:" 这两个字
@@ -3706,7 +3728,14 @@ def _audit_rewrite_source_tags(
                              视为 LLM 忽略 PRIMARY 的真实漏洞。
     """
     if not vibe_rewritten_cells_by_id:
-        return
+        return {
+            "total_vibe_cells": 0,
+            "db_sourced": 0,
+            "static_sourced": 0,
+            "missing_tag_cell_ids": [],
+            "excess_static_by_platform": {},
+            "per_platform_total": {},
+        }
 
     # ── 阶段 1:逐 cell 检查 missing_tag + 累计 per-platform tally ──
     missing_tag: list[str] = []
@@ -3781,6 +3810,75 @@ def _audit_rewrite_source_tags(
         total_db, total_static, len(missing_tag),
         len(vibe_rewritten_cells_by_id),
     )
+
+    return {
+        "total_vibe_cells": len(vibe_rewritten_cells_by_id),
+        "db_sourced": total_db,
+        "static_sourced": total_static,
+        "missing_tag_cell_ids": missing_tag,
+        "excess_static_by_platform": excess_static,
+        "per_platform_total": per_plat_total,
+    }
+
+
+def _persist_audit_findings(
+    db,
+    run_id: str,
+    *,
+    iteration: int,
+    findings: dict,
+    reference_packs_summary: dict | None,
+) -> None:
+    """Persist `_audit_rewrite_source_tags` findings as one stage_log row,
+    stage_name='r022_flywheel_audit'. Status reflects severity:
+      - 'completed'        — no missing_tag AND no excess_static_use
+      - 'completed_warn'   — at least one of the two non-empty
+                             (custom status string, picked up by future
+                             dashboard / dailyTV self-check SQL)
+
+    Why a row per iteration: vibe_loop can run 2-3 rounds; persisting per
+    iteration gives a per-round audit trail for debugging "did round 1
+    have a bug that round 2 fixed?".
+
+    DB write is best-effort: a failed insert MUST NOT break vibe_loop —
+    audit signal is observability, not a hard invariant.
+    """
+    has_missing = bool(findings.get("missing_tag_cell_ids"))
+    has_excess = bool(findings.get("excess_static_by_platform"))
+    output_data = {
+        "iteration": iteration + 1,    # 1-indexed for human readability
+        "total_vibe_cells": findings.get("total_vibe_cells", 0),
+        "db_sourced": findings.get("db_sourced", 0),
+        "static_sourced": findings.get("static_sourced", 0),
+        "missing_tag_cell_ids": findings.get("missing_tag_cell_ids", []),
+        "excess_static_by_platform": findings.get(
+            "excess_static_by_platform", {}
+        ),
+        "per_platform_total": findings.get("per_platform_total", {}),
+        "reference_packs_summary": reference_packs_summary or {},
+        "has_warnings": has_missing or has_excess,
+    }
+    try:
+        log = db.create_stage_log(
+            run_id,
+            "r022_flywheel_audit",
+            input_data={"iteration": iteration + 1},
+        )
+        db.update_stage_log(
+            log["id"],
+            status="completed_warn" if (has_missing or has_excess) else "completed",
+            output_data=output_data,
+        )
+    except Exception:
+        # Observability layer SHOULD NOT crash the pipeline. Surface the
+        # write failure in logs so the operator knows the audit row is
+        # missing, but don't propagate.
+        logger.exception(
+            "[r022_flywheel_audit] failed to persist findings to stage_logs "
+            "(iteration=%d, run_id=%s); findings still in stderr",
+            iteration + 1,
+            run_id,
+        )
 
 
 def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
