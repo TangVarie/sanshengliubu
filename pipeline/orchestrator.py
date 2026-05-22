@@ -3113,6 +3113,15 @@ class PipelineOrchestrator:
                 f"Rewriters produced {len(rewritten_ids)} updated cells: "
                 f"{sorted(rewritten_ids)}"
             )
+
+            # R-022 follow-up: 运行时审计 rewrite_summary 的"源:..."标记。
+            # 这是飞轮 ROI 唯一的可观测信号 — LLM 没按 prompt 写标记时,
+            # 运营会以为飞轮没在工作。logger.warning 不阻断流水线(LLM
+            # 漏写 ≠ 重写失败),只把异常 cell_id 显式 surface 出来。
+            _audit_rewrite_source_tags(
+                new_cells_by_id, reference_packs_by_platform
+            )
+
             prompt_cells = [
                 new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
             ]
@@ -3664,6 +3673,67 @@ _ROUTE_PRIORITY = (
     "template",
     "surface",
 )
+
+
+def _audit_rewrite_source_tags(
+    new_cells_by_id: dict,
+    reference_packs_by_platform: dict[str, list],
+) -> None:
+    """R-022 follow-up: 扫 vibe_rewriter / structural_rewriter 输出的
+    `rewrite_summary` 字段,确认它带了 `源:数据库样本 #<id>` 或
+    `源:静态兜底 #<编号>` 标记。
+
+    为什么不抛错: LLM 偶尔不严格遵守 prompt 是已知问题,这里抛错会让单
+    cell 漏写一个标记就拆掉整条 vibe_loop。我们只 WARNING 把异常 cell 拎
+    出来,让运营能在日志里 grep 出"飞轮信号缺失"的实际比例。如果比例长
+    期 >0,后续在 prompt 里加强或换 LLM。
+
+    分类:
+      - missing_tag   — rewrite_summary 完全没有"源:" 这两个字
+      - wrong_source  — 该 cell 的 platform 在 reference_packs 里有命中,
+                        但 LLM 写了"源:静态兜底"(应该用数据库样本)
+    """
+    if not new_cells_by_id:
+        return
+    missing_tag: list[str] = []
+    wrong_source: list[tuple[str, str]] = []  # (cell_id, platform)
+    db_used: int = 0
+    static_used: int = 0
+    for cid, cell in new_cells_by_id.items():
+        summary = str(cell.get("rewrite_summary", "") or "")
+        if "源:" not in summary and "源：" not in summary:
+            missing_tag.append(str(cid))
+            continue
+        used_db = "源:数据库样本" in summary or "源：数据库样本" in summary
+        used_static = "源:静态兜底" in summary or "源：静态兜底" in summary
+        if used_db:
+            db_used += 1
+        if used_static:
+            static_used += 1
+            plat = (cell.get("platform") or "").strip()
+            if plat and reference_packs_by_platform.get(plat):
+                wrong_source.append((str(cid), plat))
+    if missing_tag:
+        logger.warning(
+            "[R-022 audit] %d/%d rewritten cells missing 源:* tag in "
+            "rewrite_summary: %s. Flywheel ROI signal is invisible for "
+            "these cells — investigate vibe_rewriter prompt compliance.",
+            len(missing_tag),
+            len(new_cells_by_id),
+            missing_tag,
+        )
+    if wrong_source:
+        logger.warning(
+            "[R-022 audit] %d cells used 源:静态兜底 even though their "
+            "platform HAD packs in DB: %s. This is the exact failure mode "
+            "R-022 was meant to fix — investigate why LLM ignored PRIMARY.",
+            len(wrong_source),
+            wrong_source,
+        )
+    logger.info(
+        "[R-022 audit] source tags: db=%d, static=%d, missing=%d (of %d)",
+        db_used, static_used, len(missing_tag), len(new_cells_by_id),
+    )
 
 
 def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
