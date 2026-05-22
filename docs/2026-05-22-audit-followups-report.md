@@ -330,8 +330,8 @@ exhaust: 3 attempts, then re-raise last transient exception
 1. **本周**:观察生产日志,关注:
    - `[retrieve_samples] 0 packs for platform=...` (WARNING) — 哪些平台库存空
    - `[vibe_loop] NO reference_packs for any platform` (WARNING) — 全部静态兜底
-   - `[R-022 audit] N/M cells missing 源:* tag` (WARNING) — LLM 漏写源标记
-   - `[R-022 audit] N cells used static even though DB had packs` (WARNING) — 飞轮被忽略
+   - `[R-022 audit] N/M vibe cells missing 源:* tag` (WARNING) — vibe_rewriter 漏写源标记
+   - `[R-022 audit] some platforms used 源:静态兜底 more than DB pack exhaustion would justify` (WARNING) — 飞轮被忽略,按 per-platform 配额规则识别
 2. **下次 brief 跑通后**:抽 1 个 cell 的 vibe_rewriter 输出,验证
    `rewrite_summary` 是否真带了 `源:数据库样本 #<id>` 标签
 3. **多租户决策点**:接第二个客户之前,跑 truth-vault 仓的
@@ -417,3 +417,58 @@ Gemini 的 max_wait=30s 也写明是**有意**比 TV 的 14s 宽 — Vertex grou
 
 这样"静态兜底必须写编号 + 原因"和"证据包为空不报错"在同一张表里说清楚,
 LLM 不会在边界条件上摇摆。
+
+---
+
+## 2026-05-22 second-round review · `_audit_rewrite_source_tags` 误报修复
+
+第二轮 review (PR #28) 在 `_audit_rewrite_source_tags` 上发现 2 个 false-positive
+路径:
+
+### P1 · structural_rewriter 输出被混入审计
+
+**review**: "audit 跑在 `new_cells_by_id` 上,后者合并了 vibe + structural
+两路输出,但 structural_rewriter 的 rewrite_summary format 不要求 `源:*`
+标记。带 structural cells 的运行会系统性地拉高 missing_tag false positive,
+运营无法分辨真漏洞和预期行为。"
+
+**实施**:
+- orchestrator vibe_loop 维护一个 `vibe_only_cells_by_id` 变量
+  (modern 路径 = `vibe_new_by_id`、legacy 路径 = `new_cells_by_id`)
+- audit 调用从 `new_cells_by_id` 改成 `vibe_only_cells_by_id`,
+  structural 输出彻底不参与审计
+- 函数 docstring 显式声明范围只限 vibe_rewriter
+
+### P2 · 包用尽时的静态兜底被误报
+
+**review**: "wrong_source 把任何 `源:静态兜底` 都标错,只要该平台 DB 里有
+≥1 个包。但更新过的 vibe_rewriter prompt 明确允许包用尽时走静态。在多 cell
+同平台批次里,合法 fallback 会被误报。"
+
+**实施**: 重写检查规则为 **per-platform 配额比对**:
+- 平台 P 有 `K` 个可用 DB 包、本批进 vibe_rewriter 的 P 平台 cell 有 `N` 个
+- prompt 允许的最多静态使用 = `max(0, N - K)` (包用尽时合法)
+- 实际静态使用 > 该上限 → 超出部分为真漏洞
+- 不再做单 cell 级 wrong_source 判断 (因为不知道具体哪个 cell 拿到 pack)
+
+新分类名 `excess_static_use`,日志带 per-platform 详细数字
+(`vibe_cells_in_batch / available_packs / allowed_static_at_most /
+actual_static / excess`)便于运营直接看为何报警。
+
+### 顺手修的 unicode 冒号 bug
+
+LLM 可能输出 `源:` (U+003A ASCII 冒号) 或 `源：` (U+FF1A 全角冒号)。原实现的
+分支因为 Edit 折叠 unicode 退化成同一字符,只识别 ASCII。改写为模块顶部定义
+两个显式常量 + `_has(text, suffix)` helper,两种冒号都被识别。
+
+### 自检 (7 个分支)
+
+| 场景 | 期望 | 结果 |
+|------|------|------|
+| A 纯 vibe cells, 全合规 | 无 WARNING | ✅ |
+| B 包用尽 (3 cells / 2 packs / 1 static) | 无 WARNING | ✅ allowed=1, actual=1 |
+| C 一偷懒 + 一 legit (1 db / 2 static, 2 packs) | WARNING excess=1 | ✅ |
+| D missing_tag | WARNING missing | ✅ |
+| E 全角冒号 U+FF1A | 识别为 db | ✅ |
+| F 空输入 | no-op | ✅ |
+| G 0-pack 平台全静态 | 无 WARNING (allowed=N) | ✅ |
