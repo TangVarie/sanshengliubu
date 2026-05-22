@@ -23,6 +23,10 @@
 **输入**：产品 brief / 场景需求 / 现有 prompt 迭代诉求
 **输出**：一套完整的、可直接投入内容生产线使用的 Prompt 系统
 
+> 📐 新人入职 / 想理解跨模块设计选择 → 看 [`docs/architecture.md`](docs/architecture.md):
+> 三套 LLM 重试为什么不统一、R-022 飞轮 audit 怎么落库、单租户 vs 多租户的
+> 边界、Secret masking 与 truth-vault 的对齐策略。
+
 ## 架构
 
 系统模拟中国古代"三省六部"政府运作：
