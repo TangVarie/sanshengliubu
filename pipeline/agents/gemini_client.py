@@ -41,6 +41,7 @@ from pipeline.config import (
     GEMINI_MODEL_OVERRIDES,
     GEMINI_PRICE_TABLE,
 )
+from pipeline.logger_utils import mask_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -379,10 +380,26 @@ def call_gemini_json(
         else:
             _contents = user_message
 
-        response = client.models.generate_content(
-            model=model_id,
-            contents=_contents,
-            config=types.GenerateContentConfig(**config_kwargs),
+        # R-026: bounded retry on transient errors (429/503/504/timeout).
+        # Auth / validation errors fall through immediately via fail-fast
+        # in call_with_retry. max_attempts=3 + 2s initial wait keeps the
+        # worst-case wall clock under ~12s, far cheaper than failing the
+        # whole pipeline run that may have already burned $1+ upstream.
+        from pipeline.llm_retry import call_with_retry
+
+        def _do_generate():
+            return client.models.generate_content(
+                model=model_id,
+                contents=_contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+
+        response = call_with_retry(
+            _do_generate,
+            max_attempts=3,
+            initial_wait=2.0,
+            max_wait=30.0,
+            operation=f"gemini.{model_id}",
         )
     except Exception as e:
         raise GeminiCallFailed(
@@ -437,12 +454,14 @@ def call_gemini_json(
     # Always log the first 1KB of raw text to server stderr. Useful when
     # the UI preview capture chain breaks — this gives us a fallback
     # diagnostic path in Streamlit Cloud logs.
+    # R-023: raw_text may carry user-pasted secrets / URLs with bearer
+    # tokens; mask before writing to stderr.
     logger.info(
         "[gemini] raw text first 1KB (model=%s, in=%d, out=%d): %s",
         model_id,
         input_tokens,
         output_tokens,
-        raw_text[:1024].replace("\n", " | "),
+        mask_secrets(raw_text[:1024]).replace("\n", " | "),
     )
 
     parsed = _extract_json(raw_text)
