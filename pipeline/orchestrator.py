@@ -3084,6 +3084,9 @@ class PipelineOrchestrator:
                 # (shouldn't happen — we bucket disjointly — but defend anyway),
                 # structural wins because it's the more targeted surgery.
                 new_cells_by_id = {**vibe_new_by_id, **structural_new_by_id}
+                # Audit-scope: only vibe_rewriter cells should carry "源:*"
+                # tags. structural_rewriter.md doesn't require them.
+                vibe_only_cells_by_id = dict(vibe_new_by_id)
             else:
                 # Legacy path (flag off): everything through vibe_rewriter.
                 rewriter_input = {
@@ -3107,12 +3110,25 @@ class PipelineOrchestrator:
                 new_cells_by_id = {
                     c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
                 }
+                # Legacy path: every rewritten cell came from vibe_rewriter.
+                vibe_only_cells_by_id = dict(new_cells_by_id)
 
             rewritten_ids = set(new_cells_by_id.keys())
             logger.info(
                 f"Rewriters produced {len(rewritten_ids)} updated cells: "
                 f"{sorted(rewritten_ids)}"
             )
+
+            # R-022 follow-up: 运行时审计 rewrite_summary 的"源:..."标记。
+            # 这是飞轮 ROI 唯一的可观测信号 — LLM 没按 prompt 写标记时,
+            # 运营会以为飞轮没在工作。logger.warning 不阻断流水线(LLM
+            # 漏写 ≠ 重写失败),只把异常 cell_id 显式 surface 出来。
+            # 只审 vibe_rewriter 输出 — structural_rewriter 的 prompt
+            # 不要求"源:..."标记,把它们混进来会出现系统性 false positive。
+            _audit_rewrite_source_tags(
+                vibe_only_cells_by_id, reference_packs_by_platform
+            )
+
             prompt_cells = [
                 new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
             ]
@@ -3664,6 +3680,107 @@ _ROUTE_PRIORITY = (
     "template",
     "surface",
 )
+
+
+def _audit_rewrite_source_tags(
+    vibe_rewritten_cells_by_id: dict,
+    reference_packs_by_platform: dict[str, list],
+) -> None:
+    """R-022 follow-up: 扫 vibe_rewriter 输出的 `rewrite_summary` 字段,
+    确认它带了 `源:数据库样本 #<id>` 或 `源:静态兜底 #<编号>` 标记。
+
+    审计范围只限 vibe_rewriter 输出。structural_rewriter.md 的 output
+    format 不要求 "源:*" 标记,把 structural cells 混进来会出现系统性
+    false positive(P1 review issue, 2026-05-22)。
+
+    为什么不抛错: LLM 偶尔不严格遵守 prompt 是已知问题,这里抛错会让单
+    cell 漏写一个标记就拆掉整条 vibe_loop。我们只 WARNING 把异常 cell 拎
+    出来,让运营能在日志里 grep 出"飞轮信号缺失"的实际比例。
+
+    分类:
+      - missing_tag        — rewrite_summary 完全没有"源:" 这两个字
+      - excess_static_use  — 平台 P 在 DB 里有 K 个包、本批进 vibe_rewriter
+                             的 P 平台 cell 有 N 个,vibe_rewriter prompt
+                             允许 max(0, N - K) 个 cell 走静态兜底(包用
+                             尽场景)。实际静态使用 > 该上限时,超出部分
+                             视为 LLM 忽略 PRIMARY 的真实漏洞。
+    """
+    if not vibe_rewritten_cells_by_id:
+        return
+
+    # ── 阶段 1:逐 cell 检查 missing_tag + 累计 per-platform tally ──
+    missing_tag: list[str] = []
+    per_plat_total: dict[str, int] = {}
+    per_plat_db: dict[str, int] = {}
+    per_plat_static: dict[str, int] = {}
+
+    # LLM may emit U+003A ASCII colon ":" or U+FF1A full-width Chinese
+    # colon ":" after 源. Both spellings are explicitly allowed by the
+    # vibe_rewriter prompt; use explicit ： escape so editors/diff
+    # tools that fold unicode don't silently break this audit.
+    _ASCII = "源:"  # 源:
+    _FW    = "源："  # 源:
+    def _has(text: str, suffix: str) -> bool:
+        return (_ASCII + suffix) in text or (_FW + suffix) in text
+
+    for cid, cell in vibe_rewritten_cells_by_id.items():
+        summary = str(cell.get("rewrite_summary", "") or "")
+        if not _has(summary, ""):
+            missing_tag.append(str(cid))
+            continue
+        plat = (cell.get("platform") or "").strip()
+        per_plat_total[plat] = per_plat_total.get(plat, 0) + 1
+        if _has(summary, "数据库样本"):  # 数据库样本
+            per_plat_db[plat] = per_plat_db.get(plat, 0) + 1
+        if _has(summary, "静态兜底"):  # 静态兜底
+            per_plat_static[plat] = per_plat_static.get(plat, 0) + 1
+
+    # ── 阶段 2:per-platform 配额检查 (excess_static_use) ──
+    # 规则:平台 P 有 K 个 DB 包、本批有 N 个 vibe cell。vibe_rewriter.md
+    # "三态决策表" 允许的静态使用 = max(0, N - K)(包用尽时合法)。
+    # 实际静态使用 > 该上限,超出部分是真漏洞。
+    excess_static: dict[str, dict] = {}
+    for plat, total in per_plat_total.items():
+        if not plat:
+            continue
+        available_packs = len(reference_packs_by_platform.get(plat) or [])
+        allowed_static = max(0, total - available_packs)
+        actual_static = per_plat_static.get(plat, 0)
+        if actual_static > allowed_static:
+            excess_static[plat] = {
+                "vibe_cells_in_batch": total,
+                "available_packs": available_packs,
+                "allowed_static_at_most": allowed_static,
+                "actual_static": actual_static,
+                "excess": actual_static - allowed_static,
+            }
+
+    if missing_tag:
+        logger.warning(
+            "[R-022 audit] %d/%d vibe cells missing 源:* tag in "
+            "rewrite_summary: %s. Flywheel ROI signal invisible for "
+            "these — check vibe_rewriter prompt compliance.",
+            len(missing_tag),
+            len(vibe_rewritten_cells_by_id),
+            missing_tag,
+        )
+    if excess_static:
+        logger.warning(
+            "[R-022 audit] some platforms used 源:静态兜底 more than DB "
+            "pack exhaustion would justify: %s. Allocation rule: a platform "
+            "with K available packs allows at most max(0, N-K) static "
+            "fallbacks where N = # vibe cells on that platform. Excess = "
+            "LLM ignored PRIMARY — investigate.",
+            excess_static,
+        )
+    total_db = sum(per_plat_db.values())
+    total_static = sum(per_plat_static.values())
+    logger.info(
+        "[R-022 audit] vibe source tags: db=%d, static=%d, missing=%d "
+        "(of %d vibe cells)",
+        total_db, total_static, len(missing_tag),
+        len(vibe_rewritten_cells_by_id),
+    )
 
 
 def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:

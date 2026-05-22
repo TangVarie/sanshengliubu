@@ -330,7 +330,8 @@ exhaust: 3 attempts, then re-raise last transient exception
 1. **本周**:观察生产日志,关注:
    - `[retrieve_samples] 0 packs for platform=...` (WARNING) — 哪些平台库存空
    - `[vibe_loop] NO reference_packs for any platform` (WARNING) — 全部静态兜底
-   - 在 stage_logs 里 grep `rewrite_summary` 字段,看 `源:数据库样本` 出现率
+   - `[R-022 audit] N/M vibe cells missing 源:* tag` (WARNING) — vibe_rewriter 漏写源标记
+   - `[R-022 audit] some platforms used 源:静态兜底 more than DB pack exhaustion would justify` (WARNING) — 飞轮被忽略,按 per-platform 配额规则识别
 2. **下次 brief 跑通后**:抽 1 个 cell 的 vibe_rewriter 输出,验证
    `rewrite_summary` 是否真带了 `源:数据库样本 #<id>` 标签
 3. **多租户决策点**:接第二个客户之前,跑 truth-vault 仓的
@@ -338,3 +339,136 @@ exhaust: 3 attempts, then re-raise last transient exception
    按 README 警告条的指引推进
 4. **后续 sprint 排期**:R-018 (job worker) 和 R-028 (cell-level resume)
    分别评估业务紧迫度
+
+---
+
+## 2026-05-22 follow-up · review 反馈处理
+
+PR 第一轮 review 标了 5 个问题。下面是每条的现状+实施:
+
+### 1. R-022 没有 E2E 飞轮验证 ⭐
+
+**review**: unit test 只覆盖形状/推导,没有"DB → vibe_loop → rewrite_summary
+带源标记"的真实端到端验证。LLM 可能不按 prompt 老实写"源:..."标记。
+
+**实施**: 在 `pipeline/orchestrator.py` 新增 `_audit_rewrite_source_tags`
+函数,vibe_loop 每轮 rewriter 输出后跑一遍。它做 3 件事:
+- **missing_tag**: `rewrite_summary` 没有"源:"标记 → WARNING + cell_id 列表
+- **wrong_source**: LLM 写了"源:静态兜底"但该 platform 在 DB 里有命中 →
+  WARNING(这是 R-022 想堵的具体漏洞)
+- **INFO 汇总**: `db=N, static=N, missing=N (of 总数)` 让运营 grep 出实际比例
+
+不抛错的理由: LLM 漏写一个标记 ≠ 重写失败,抛错会让飞轮信号缺失变成可用性
+故障。运营只需在日志里持续监控 missing/wrong 比例,降到 0 之前继续在 prompt
+里加强。
+
+**自检**: 4 个分支(全好/缺标记/错源/空)全跑过,输出符合预期。
+
+### 2. mask_secrets 与 TV 模式数对齐
+
+**review**: 报告里"5 patterns",TV 是 7 个。
+
+**澄清**: 代码实际有 **7 个模式**(含 `sbp_*` 和 generic
+`sk-[A-Za-z0-9]{40,}`);报告之前的 unit-test 列表只展示了 5 个例子,造成歧义。
+
+**实施**:
+- `pipeline/logger_utils.py` 顶部加 `Shadow-aligned with truth-vault's
+  scripts/_common.py::_SECRET_PATTERNS` 显式注释,提醒未来 TV 加新 vendor
+  时同步过来
+- 重跑自检:7/7 patterns 全部 mask 成功 (Anthropic / Supabase service /
+  Supabase PAT / JWT / Google / OpenAI scoped / generic sk-)
+
+### 3. R-026 跨 backend retry 不一致
+
+**review**: TV `annotate_essence_pass` 14s 上限、Gemini 30s、Claude 走
+BaseAgent.run() 完全另一套——未来诊断难。
+
+**实施**: 在 `pipeline/llm_retry.py` 顶部 docstring 加跨 backend 重试对照表
+(Claude / Gemini / DeepSeek / OpenAI 4 条路径各自走哪个 retry 源、参数是什么),
+并解释为何**不**强行统一:BaseAgent._call_claude 已包含 retry + budget +
+rate limiter + cache fallback 4 项耦合状态机,migrating 到 llm_retry 是
+另一个 PR 的工作量,而不是 R-026 的承诺。
+
+Gemini 的 max_wait=30s 也写明是**有意**比 TV 的 14s 宽 — Vertex grounding
+429 恢复周期通常 10-20s,14s 会"还没等到就放弃"。
+
+### 4. acall_with_retry 是否真用 → 删除
+
+**review**: 异步版本是 dead code,YAGNI。
+
+**实施**: 已删除 `acall_with_retry`,只留同步版。在删除处加注释说明"所有
+当前 LLM 调用站点都是 sync,BaseAgent 的 async run() 是用 asyncio.to_thread
+跨边界的,不是 await async LLM 调用。哪天真有 `async def call_xxx_async`
+再加回来"。`asyncio` import 也一并去掉。
+
+### 5. vibe_rewriter.md 内部一致性
+
+**review**: 旧 prompt L126 "证据包为空时...依然按静态样本执行" vs 新铁律
+"必须写 #id" 在 0 命中情况下可能让 LLM 困惑(没 id 怎么写)。
+
+**实施**: 在新铁律段下方加**三态决策表**,逐行列出 PRIMARY 状态 / 锚点来源 /
+`rewrite_summary` 必写内容 / 备注:
+
+| PRIMARY 状态 | 锚点 | rewrite_summary | 备注 |
+|--------------|------|-----------------|------|
+| 非空且匹配 | DB 证据包 | `源:数据库样本 #<id>` | id 用证据包 id |
+| 非空但已被本批占用 | 次优证据包 / FALLBACK | 各自源标记 | 不能共用 id |
+| 空 (0 命中) | 静态兜底 | `源:静态兜底 #<编号>(原因:该平台 0 命中)` | **不报错、不略过** |
+
+这样"静态兜底必须写编号 + 原因"和"证据包为空不报错"在同一张表里说清楚,
+LLM 不会在边界条件上摇摆。
+
+---
+
+## 2026-05-22 second-round review · `_audit_rewrite_source_tags` 误报修复
+
+第二轮 review (PR #28) 在 `_audit_rewrite_source_tags` 上发现 2 个 false-positive
+路径:
+
+### P1 · structural_rewriter 输出被混入审计
+
+**review**: "audit 跑在 `new_cells_by_id` 上,后者合并了 vibe + structural
+两路输出,但 structural_rewriter 的 rewrite_summary format 不要求 `源:*`
+标记。带 structural cells 的运行会系统性地拉高 missing_tag false positive,
+运营无法分辨真漏洞和预期行为。"
+
+**实施**:
+- orchestrator vibe_loop 维护一个 `vibe_only_cells_by_id` 变量
+  (modern 路径 = `vibe_new_by_id`、legacy 路径 = `new_cells_by_id`)
+- audit 调用从 `new_cells_by_id` 改成 `vibe_only_cells_by_id`,
+  structural 输出彻底不参与审计
+- 函数 docstring 显式声明范围只限 vibe_rewriter
+
+### P2 · 包用尽时的静态兜底被误报
+
+**review**: "wrong_source 把任何 `源:静态兜底` 都标错,只要该平台 DB 里有
+≥1 个包。但更新过的 vibe_rewriter prompt 明确允许包用尽时走静态。在多 cell
+同平台批次里,合法 fallback 会被误报。"
+
+**实施**: 重写检查规则为 **per-platform 配额比对**:
+- 平台 P 有 `K` 个可用 DB 包、本批进 vibe_rewriter 的 P 平台 cell 有 `N` 个
+- prompt 允许的最多静态使用 = `max(0, N - K)` (包用尽时合法)
+- 实际静态使用 > 该上限 → 超出部分为真漏洞
+- 不再做单 cell 级 wrong_source 判断 (因为不知道具体哪个 cell 拿到 pack)
+
+新分类名 `excess_static_use`,日志带 per-platform 详细数字
+(`vibe_cells_in_batch / available_packs / allowed_static_at_most /
+actual_static / excess`)便于运营直接看为何报警。
+
+### 顺手修的 unicode 冒号 bug
+
+LLM 可能输出 `源:` (U+003A ASCII 冒号) 或 `源：` (U+FF1A 全角冒号)。原实现的
+分支因为 Edit 折叠 unicode 退化成同一字符,只识别 ASCII。改写为模块顶部定义
+两个显式常量 + `_has(text, suffix)` helper,两种冒号都被识别。
+
+### 自检 (7 个分支)
+
+| 场景 | 期望 | 结果 |
+|------|------|------|
+| A 纯 vibe cells, 全合规 | 无 WARNING | ✅ |
+| B 包用尽 (3 cells / 2 packs / 1 static) | 无 WARNING | ✅ allowed=1, actual=1 |
+| C 一偷懒 + 一 legit (1 db / 2 static, 2 packs) | WARNING excess=1 | ✅ |
+| D missing_tag | WARNING missing | ✅ |
+| E 全角冒号 U+FF1A | 识别为 db | ✅ |
+| F 空输入 | no-op | ✅ |
+| G 0-pack 平台全静态 | 无 WARNING (allowed=N) | ✅ |

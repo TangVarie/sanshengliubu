@@ -25,6 +25,12 @@ from typing import Any
 # tooling. Order doesn't matter for correctness; we run all of them.
 # Each pattern matches a credential-like token; the entire match becomes
 # "***REDACTED***" so we don't leak even a prefix.
+#
+# Shadow-aligned with truth-vault's `scripts/_common.py::_SECRET_PATTERNS`
+# (2026-05-22 audit). When TV adds a new credential vendor, mirror the
+# pattern here within the next sync. Drift is a real risk — a token shape
+# this module doesn't know about will leak silently. Order of patterns
+# below intentionally matches TV's list for diff-friendliness.
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"),          # Anthropic
     re.compile(r"sb_secret_[A-Za-z0-9]{20,}"),          # Supabase 2024+ service_role
@@ -32,7 +38,7 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}"),  # JWT (anon/service)
     re.compile(r"AIza[A-Za-z0-9_\-]{20,}"),             # Google / Vertex Express
     re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"),         # OpenAI scoped
-    re.compile(r"sk-[A-Za-z0-9]{40,}"),                 # Generic OpenAI/Anthropic
+    re.compile(r"sk-[A-Za-z0-9]{40,}"),                 # Generic OpenAI / legacy sk-* tokens
 )
 
 

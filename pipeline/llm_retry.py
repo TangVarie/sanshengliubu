@@ -2,9 +2,9 @@
 
 Problem (2026-05-22 audit R-026): sanshengliubu's Gemini calls had no retry
 on transient failures. Under load (rate limits, brief 5xx blips), a single
-transient error fails the whole pipeline run that's already burned 5-10 of
-tokens upstream. Claude calls already had retry in BaseAgent.run() — this
-module brings Gemini and any other future LLM backend to parity.
+transient error fails the whole pipeline run that's already burned 5-10×
+the cost upstream. This module brings Gemini and any other future
+non-Anthropic LLM backend to parity.
 
 Usage:
     from pipeline.llm_retry import call_with_retry
@@ -19,16 +19,39 @@ Design:
   connection). Auth / validation errors fail-fast — retrying won't help.
 - Exponential backoff capped at `max_wait` so a flapping upstream doesn't
   blow up the total runtime.
-- Synchronous (uses time.sleep). For async callers, wrap the call with
-  asyncio.to_thread or use the async variant `acall_with_retry`.
+- Synchronous (uses time.sleep). All current LLM call sites are sync;
+  see the bottom of this file for the rationale on NOT shipping an async
+  sibling.
+
+Why this module exists alongside BaseAgent.run() retry, and not as a
+unified retry layer (2026-05-22 review follow-up to R-026):
+
+  | path        | retry source                             | base   | max attempts |
+  |-------------|------------------------------------------|--------|--------------|
+  | Claude      | BaseAgent.run() (agents/__init__.py)     | 3s / 10s for 5xx | MAX_RETRIES |
+  | Gemini      | this module (gemini_client.py wraps)     | 2s     | 3            |
+  | DeepSeek    | BaseAgent.run() (anthropic-compat path)  | 3s     | MAX_RETRIES |
+  | OpenAI/GPT  | BaseAgent.run() (gpt branch in _call_claude) | 3s | MAX_RETRIES |
+
+  The Claude/DeepSeek/GPT paths all flow through BaseAgent._call_claude
+  which has its own retry+budget+limiter+cache-fallback state machine
+  (see agents/__init__.py:1379-). Migrating that to this helper would be
+  a much larger refactor than R-026 promised — it'd merge 4 concerns into
+  one frame. Instead we keep two retry layers but **document the
+  difference here** so debugging "why did Gemini wait 30s and Claude wait
+  10s?" doesn't require reading both files.
+
+  Gemini's max_wait=30s is deliberately wider than Claude's 10s: empirically
+  Vertex grounding 429s have 10-20s recovery (longer than Anthropic's
+  rate-limit cycle). TV's `annotate_essence_pass.py` uses 2+4+8=14s
+  total — that fits Anthropic's profile but undersleeps Gemini.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
-from typing import Awaitable, Callable, TypeVar
+from typing import Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -121,39 +144,9 @@ def call_with_retry(
     raise RuntimeError(f"[{operation}] call_with_retry exited unreachable branch")
 
 
-async def acall_with_retry(
-    fn: Callable[..., Awaitable[T]],
-    *args,
-    max_attempts: int = 3,
-    initial_wait: float = 2.0,
-    max_wait: float = 60.0,
-    operation: str = "llm_call",
-    **kwargs,
-) -> T:
-    """Async sibling of `call_with_retry`. Use when the wrapped function
-    is itself an async coroutine. Uses asyncio.sleep so it doesn't block
-    the event loop during backoff."""
-    if max_attempts < 1:
-        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
-    last_exc: BaseException | None = None
-    for attempt in range(max_attempts):
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as exc:
-            last_exc = exc
-            if not _is_transient(exc) or attempt == max_attempts - 1:
-                raise
-            wait = min(initial_wait * (2 ** attempt), max_wait)
-            logger.warning(
-                "[%s] attempt %d/%d failed (%s: %s); retry in %.1fs",
-                operation,
-                attempt + 1,
-                max_attempts,
-                type(exc).__name__,
-                str(exc)[:200],
-                wait,
-            )
-            await asyncio.sleep(wait)
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"[{operation}] acall_with_retry exited unreachable branch")
+# Note: an async sibling `acall_with_retry` was deliberately NOT added.
+# All current LLM callers are synchronous (gemini_client.generate_content,
+# BaseAgent._call_claude); the BaseAgent's async run() crosses the boundary
+# via asyncio.to_thread, not by awaiting an async LLM call. Adding an unused
+# async wrapper invites misuse + maintenance burden — add it back the day
+# we actually have an `async def call_xxx_async` to wrap.
