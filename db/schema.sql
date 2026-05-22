@@ -113,7 +113,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_samples_tv_note_id_unique
     ON reference_samples(source_truth_vault_note_id)
     WHERE source_truth_vault_note_id IS NOT NULL;
 
--- 禁用 RLS（开发环境；生产环境请改用适当的 policy）
+-- ════════════════════════════════════════════════════════════════════
+-- 2026-05-22 audit R-019: 本块代码假设【单租户运营】——所有登录到同一
+-- 个 Supabase project 的用户共享同一份数据,没有 workspace 级隔离。
+--
+-- 适合: 个人 / 单工作室自用, 数据互见不是问题。
+-- 不适合: 多客户/品牌共用、合规审计、需要 workspace 边界的场景。
+--
+-- 如果你需要多租户隔离, 请改跑姐妹仓 truth-vault 提供的迁移:
+--     sanshengliubu-patches/005_multi_tenant_workspaces.sql
+-- 它会把 workspace_id 列加到所有主表 + 开启 RLS + 加 policy + 同步
+-- auth.users 到默认 workspace。**先在 staging 验证, 再上生产。**
+--
+-- 如果你不确定走哪条路线, 默认就停在单租户。改这块代码前请先看 README。
+-- ════════════════════════════════════════════════════════════════════
+-- 禁用 RLS（单租户假设；多租户场景见上方注释）
 ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
 ALTER TABLE pipeline_runs DISABLE ROW LEVEL SECURITY;
 ALTER TABLE stage_logs DISABLE ROW LEVEL SECURITY;

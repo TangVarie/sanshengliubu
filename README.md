@@ -1,5 +1,23 @@
 # 🏛️ 三省六部 · Prompt Engineering System
 
+> ⚠️ **单租户假设**(2026-05-22 audit R-019 确认)
+>
+> 本项目当前 schema (`db/schema.sql`) 对 5 张主表
+> (`projects` / `pipeline_runs` / `stage_logs` / `outputs` / `reference_samples`)
+> 显式 `DISABLE ROW LEVEL SECURITY`。这是 **单租户 MVP 假设** —
+> 所有登录到同一个 Supabase project 的用户共享同一份数据。
+>
+> 适合:个人 / 单工作室自用,数据互见不是问题。
+>
+> 不适合以下场景,如果你要上,请先打开 RLS 并加 `workspace_id` 列后再部署:
+> - 多个客户 / 品牌共用一个 Supabase 实例
+> - 需要 workspace 级别的数据边界
+> - 监管 / 内审要求数据访问审计
+>
+> 多租户改造的迁移脚本可见姐妹仓 truth-vault
+> `sanshengliubu-patches/005_multi_tenant_workspaces.sql`,
+> 上线之前请在 staging 跑 + 把现有 `auth.users` 加进默认 workspace。
+
 一套基于多 Agent 协作的 Prompt 工程生产系统。
 
 **输入**：产品 brief / 场景需求 / 现有 prompt 迭代诉求

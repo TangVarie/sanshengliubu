@@ -53,7 +53,10 @@ from pipeline.agents.gemini_structure_reviewer import (
     run_gemini_structure_review,
 )
 from pipeline.agents.gemini_reference_analyzer import run_reference_analyzer
-from pipeline.retrieve_samples import retrieve_reference_packs
+from pipeline.retrieve_samples import (
+    retrieve_reference_packs,
+    summarize_packs_by_platform,
+)
 from pipeline.agents.gemini_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -2666,10 +2669,31 @@ class PipelineOrchestrator:
             )
             if _packs:
                 reference_packs_by_platform[_plat] = _packs
+        # R-022: 不管命中与否都算 summary,送给 rewriter/critic 让它们知道
+        # 哪些平台是 PRIMARY(DB hit)、哪些必须 FALLBACK(静态兜底)。
+        # 同时 telemetry: 把 hit/miss + TV-synced 占比写日志,运营才能看出
+        # "飞轮飞起来了吗,还是 0 packs 在悄悄地用静态兜底"。
+        reference_packs_summary = summarize_packs_by_platform(
+            reference_packs_by_platform, _unique_platforms
+        )
         if reference_packs_by_platform:
             logger.info(
-                "[vibe_loop] injecting reference_packs: %s",
+                "[vibe_loop] injecting reference_packs: %s "
+                "(tv_synced=%d, manual=%d, platforms_missed=%s)",
                 {k: len(v) for k, v in reference_packs_by_platform.items()},
+                reference_packs_summary["tv_synced_total"],
+                reference_packs_summary["manual_total"],
+                reference_packs_summary["platforms_missed"],
+            )
+        else:
+            # 全部 miss — vibe_rewriter 会全部走静态兜底。这是飞轮失效信号。
+            logger.warning(
+                "[vibe_loop] NO reference_packs for any platform %s "
+                "(category=%r); vibe_rewriter will fall back to static "
+                "samples only. Flywheel value is not flowing back — check "
+                "reference_samples table or truth-vault sync.",
+                _unique_platforms,
+                _brief_category,
             )
 
         # Track which cell_ids were rewritten so round 2+ only re-evaluates those
@@ -2752,6 +2776,7 @@ class PipelineOrchestrator:
                 }
             if reference_packs_by_platform:
                 critic_input["reference_packs_by_platform"] = reference_packs_by_platform
+                critic_input["reference_packs_summary"] = reference_packs_summary
 
             # v0.30.5 fix H3: 把 persona_simulator 的 per-cell 反应注入 critic,
             # 让"3 个画像里有 2 个划走"这种信号真的影响判决,而不是只在
@@ -3007,6 +3032,9 @@ class PipelineOrchestrator:
                         structural_input["reference_packs_by_platform"] = (
                             reference_packs_by_platform
                         )
+                        structural_input["reference_packs_summary"] = (
+                            reference_packs_summary
+                        )
                     try:
                         structural_result = await self.structural_rewriter.run(
                             structural_input, self.run_id, self.db,
@@ -3036,6 +3064,9 @@ class PipelineOrchestrator:
                         rewriter_input["reference_packs_by_platform"] = (
                             reference_packs_by_platform
                         )
+                        rewriter_input["reference_packs_summary"] = (
+                            reference_packs_summary
+                        )
                     try:
                         rewritten = await self.vibe_rewriter.run(
                             rewriter_input, self.run_id, self.db,
@@ -3062,6 +3093,9 @@ class PipelineOrchestrator:
                 if reference_packs_by_platform:
                     rewriter_input["reference_packs_by_platform"] = (
                         reference_packs_by_platform
+                    )
+                    rewriter_input["reference_packs_summary"] = (
+                        reference_packs_summary
                     )
                 try:
                     rewritten = await self.vibe_rewriter.run(

@@ -14,6 +14,7 @@ from pipeline.config import (
     PIPELINE_STAGES,
     POLL_INTERVAL_SECONDS,
 )
+from pipeline.logger_utils import mask_secrets
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
@@ -25,6 +26,9 @@ def render_stage_error(log: dict) -> None:
     even if error_message is empty/missing — silent failures are the worst.
     Accepts non-string error_message (e.g. legacy rows that stored a dict)
     and pretty-prints it as JSON instead of rendering a raw repr.
+
+    R-023: error_message 可能含 API key/JWT (来自 traceback),所以渲染前
+    跑 mask_secrets。截图发群、运维登录看日志都不会再泄漏凭据。
     """
     msg = (log or {}).get("error_message")
     if msg:
@@ -36,7 +40,7 @@ def render_stage_error(log: dict) -> None:
             except Exception:
                 text = repr(msg)
         if text:
-            st.error(text)
+            st.error(mask_secrets(text))
             return
     st.error(
         f"⚠️ 该阶段标记为 failed，但 error_message 为空。\n\n"
@@ -1007,7 +1011,7 @@ with tabs[0]:
                     "下面是它实际返回的前 500 字："
                 )
                 if _raw:
-                    st.code(_raw, language="text")
+                    st.code(mask_secrets(_raw), language="text")
                 else:
                     st.caption("（没抓到原文预览，试试 Reboot 或换 GEMINI_MODEL。）")
             else:
@@ -1263,7 +1267,7 @@ with tabs[4]:
                                 "下面是它实际返回的前 500 字，看看它到底说了什么："
                             )
                             if _raw:
-                                st.code(_raw, language="text")
+                                st.code(mask_secrets(_raw), language="text")
                             else:
                                 st.caption(
                                     "（没抓到原文预览——可能响应完全空，"

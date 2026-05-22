@@ -34,7 +34,13 @@
 - "大家好" / "Hi 姐妹们今天..."
 - 任何寒暄式、产品介绍式、列表式开场
 
-【真人参照样本】（你的第一句必须是这种"味道"，不是这种"句式"）
+【真人参照样本 · 来源优先级】
+
+🥇 **PRIMARY 来源(数据库爆款样本库)**:本次输入 `reference_packs_by_platform[cell.platform]`
+如果非空,**必须优先用它做锚点**——这些是用户/飞轮真实采集的当下爆款。
+按本文档下方"如何使用 reference_packs"那一节执行。
+
+🥈 **FALLBACK 来源(本 prompt 内置兜底样本,仅在 PRIMARY 空时使用)**:
 - 「结婚三年没有孩子，年夜饭婆婆让我坐在这张椅子吃饭」
 - 「迟到发现公司破产，只抢到了这个」
 - 「老公年近40，大小便失禁，他欲盖弥彰倒了一碗方便面」
@@ -44,6 +50,12 @@
 - 「INFP 会懂」
 - 「不会有天蝎座打我吧」
 （按平台再补 3-5 个对应平台的真人样本）
+
+⚠️ **铁律**:`reference_packs_by_platform[cell.platform]` 有内容时,**禁止主要锚点用 FALLBACK 样本**;
+那会让飞轮失效——数据库里的爆款数据白存。
+你必须在 `rewrite_summary` 里写明本次锚点来源:
+- `源:数据库样本 #<id>` —— 用了 PRIMARY
+- `源:静态兜底 #<编号>` —— 用了 FALLBACK(必须同时写明 PRIMARY 为何不可用,例如"该平台 0 命中")
 ```
 
 ### 2. 把"具体性硬指标"写死
@@ -91,7 +103,9 @@ system_prompt 里必须有这段：
 
 `failed_cells`：每个 cell 包含原 system_prompt + 原 demo_output + 复检官的 `rewrite_directives` + `severity`（`borderline` 或 `fail`） + 可能的 `taste_gap`。
 `shared_skeleton`：可参考的差异化工具包等共享元素。
-`reference_packs_by_platform`（可选，但**如有必用**）：按平台组织的**人工录入真实爆文证据包**，每条包含 `post_title` / `post_body` / `top_comments` / `ai_analysis`。当某个 cell 的 platform 能在这个 dict 里命中,**优先模仿证据包而非本 prompt 里的静态样本**——因为证据包是用户挑的真实爆文,而本 prompt 的样本只是通用参考。
+`reference_packs_by_platform`（**飞轮主源,必用**）：按平台组织的**真实爆文证据包**(来源:用户在 reference_library 页面录入 + truth-vault 飞轮自动 sync 的爆款),每条包含 `post_title` / `post_body` / `top_comments` / `ai_analysis` / `source_type`(标识来自数据库还是 TV-synced)。**当某个 cell 的 platform 在 dict 里有命中,锚点必须从证据包里挑,不能用本 prompt 静态兜底样本**——证据包是当下真实爆款,静态样本是 6 个月前定型的通用基线,继续用会让飞轮失效。
+
+`reference_packs_summary`(可选元数据)：包含 `total_packs` / `platforms_hit` / `platforms_missed`,告诉你哪些平台有 DB 锚点、哪些是空的。空的平台允许走静态兜底。
 
 ### 如何使用 reference_packs（最关键指令）
 
