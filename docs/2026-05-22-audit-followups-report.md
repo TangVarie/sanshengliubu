@@ -472,3 +472,56 @@ LLM 可能输出 `源:` (U+003A ASCII 冒号) 或 `源：` (U+FF1A 全角冒号)
 | E 全角冒号 U+FF1A | 识别为 db | ✅ |
 | F 空输入 | no-op | ✅ |
 | G 0-pack 平台全静态 | 无 WARNING (allowed=N) | ✅ |
+
+---
+
+## 2026-05-22 third-round review · 可观测性 + 设计文档化
+
+第三轮 review 指出两个仍然没解决的痛点:
+
+### Q3.1 · "WARNING 谁去看?" → audit findings 落库 SQL 可查
+
+**review**: "代码里写 WARNING 没问题,但谁去看?sanshengliubu 的日志默认是
+Streamlit stderr / Streamlit Cloud 后台。如果没人盯,飞轮失效信号会被淹没。"
+
+**实施**:
+- 重构 `_audit_rewrite_source_tags` 为**纯函数 + 返回 findings dict** (仍然
+  保留 stderr WARNING 作为 dev 调试通道)
+- 新增 `_persist_audit_findings(db, run_id, iteration, findings,
+  reference_packs_summary)` helper:
+  - 每次 vibe_loop iteration 写一行 `stage_logs`,
+    `stage_name='r022_flywheel_audit'`
+  - `status` 反映严重度:`completed` (干净) / `completed_warn` (有 missing
+    或 excess)
+  - `output_data` 是结构化 JSON,含 `total_vibe_cells / db_sourced /
+    static_sourced / missing_tag_cell_ids / excess_static_by_platform /
+    per_platform_total / reference_packs_summary / has_warnings`
+  - DB 写失败 try/except,只 logger.exception,不阻断 vibe_loop(audit 是
+    观测层,绝不允许把流水线弄挂)
+
+**接日报 / 告警的 3 种方式** (架构文档里给了 SQL 模板):
+1. cron 每小时跑 SQL 检查 `status='completed_warn'` 行数
+2. TV 仓的日报 SQL 多读一张 ssll 表
+3. 新加 `scripts/check_audit_warnings.py` + GitHub Actions schedule (P3,
+   工时 ~2h)
+
+完整字段 schema + 3 个 SQL 自检模板 (单次审计 / warn-only / 7 天命中率) 写在
+`docs/architecture.md §2`。
+
+### Q3.2 · 跨 backend 重试对照表埋在 docstring → 抽到 architecture.md
+
+**review**: "pipeline/llm_retry.py 顶部 docstring 写了 4 backend 对照表,
+但这是 Python 文件 — 新人 onboarding 时不容易看到。"
+
+**实施**:
+- 新建 `docs/architecture.md`,目录有 4 节:
+  1. 为什么有三套 LLM 重试 (R-026) — 完整对照表 + 不统一的理由 + 未来
+     统一的触发条件
+  2. 飞轮可观测:R-022 audit 信号去哪里查 — 3 个落点 + SQL 模板 + 字段
+     schema
+  3. 单租户假设 (R-019)
+  4. Secret masking 与 truth-vault 对齐 (R-023)
+- 文档末尾追加 backlog 表 (R-018 / R-028 / R-026.2 + 触发条件)
+- `pipeline/llm_retry.py` docstring 删掉重复表格,改为指向 architecture.md
+  (single source of truth)
+- README 在简介后加一段"📐 新人入职 → 看 docs/architecture.md"导引

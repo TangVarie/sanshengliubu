@@ -24,27 +24,19 @@ Design:
   sibling.
 
 Why this module exists alongside BaseAgent.run() retry, and not as a
-unified retry layer (2026-05-22 review follow-up to R-026):
+unified retry layer:
+   → see docs/architecture.md §1 "为什么有三套 LLM 重试" for the cross-
+     backend table, the design rationale, and the triggers for a future
+     R-026.2 unification PR. Don't duplicate the table here — single
+     source of truth.
 
-  | path        | retry source                             | base   | max attempts |
-  |-------------|------------------------------------------|--------|--------------|
-  | Claude      | BaseAgent.run() (agents/__init__.py)     | 3s / 10s for 5xx | MAX_RETRIES |
-  | Gemini      | this module (gemini_client.py wraps)     | 2s     | 3            |
-  | DeepSeek    | BaseAgent.run() (anthropic-compat path)  | 3s     | MAX_RETRIES |
-  | OpenAI/GPT  | BaseAgent.run() (gpt branch in _call_claude) | 3s | MAX_RETRIES |
-
-  The Claude/DeepSeek/GPT paths all flow through BaseAgent._call_claude
-  which has its own retry+budget+limiter+cache-fallback state machine
-  (see agents/__init__.py:1379-). Migrating that to this helper would be
-  a much larger refactor than R-026 promised — it'd merge 4 concerns into
-  one frame. Instead we keep two retry layers but **document the
-  difference here** so debugging "why did Gemini wait 30s and Claude wait
-  10s?" doesn't require reading both files.
-
-  Gemini's max_wait=30s is deliberately wider than Claude's 10s: empirically
-  Vertex grounding 429s have 10-20s recovery (longer than Anthropic's
-  rate-limit cycle). TV's `annotate_essence_pass.py` uses 2+4+8=14s
-  total — that fits Anthropic's profile but undersleeps Gemini.
+   Quick recap so this file is still understandable in isolation:
+   - Claude / DeepSeek / OpenAI 路径 → BaseAgent._call_claude (has
+     retry + budget + limiter + cache-fallback all entangled). Don't
+     migrate without a dedicated PR.
+   - Gemini 路径 (this module) → 薄重试,因为 Vertex 走自家配额,
+     不需要 limiter/budget/cache-fallback。max_wait=30s 比 TV 的 14s
+     宽是有意的(Vertex grounding 429 恢复 10-20s)。
 """
 
 from __future__ import annotations
