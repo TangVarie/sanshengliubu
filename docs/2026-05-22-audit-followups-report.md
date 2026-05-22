@@ -330,7 +330,8 @@ exhaust: 3 attempts, then re-raise last transient exception
 1. **本周**:观察生产日志,关注:
    - `[retrieve_samples] 0 packs for platform=...` (WARNING) — 哪些平台库存空
    - `[vibe_loop] NO reference_packs for any platform` (WARNING) — 全部静态兜底
-   - 在 stage_logs 里 grep `rewrite_summary` 字段,看 `源:数据库样本` 出现率
+   - `[R-022 audit] N/M cells missing 源:* tag` (WARNING) — LLM 漏写源标记
+   - `[R-022 audit] N cells used static even though DB had packs` (WARNING) — 飞轮被忽略
 2. **下次 brief 跑通后**:抽 1 个 cell 的 vibe_rewriter 输出,验证
    `rewrite_summary` 是否真带了 `源:数据库样本 #<id>` 标签
 3. **多租户决策点**:接第二个客户之前,跑 truth-vault 仓的
@@ -338,3 +339,81 @@ exhaust: 3 attempts, then re-raise last transient exception
    按 README 警告条的指引推进
 4. **后续 sprint 排期**:R-018 (job worker) 和 R-028 (cell-level resume)
    分别评估业务紧迫度
+
+---
+
+## 2026-05-22 follow-up · review 反馈处理
+
+PR 第一轮 review 标了 5 个问题。下面是每条的现状+实施:
+
+### 1. R-022 没有 E2E 飞轮验证 ⭐
+
+**review**: unit test 只覆盖形状/推导,没有"DB → vibe_loop → rewrite_summary
+带源标记"的真实端到端验证。LLM 可能不按 prompt 老实写"源:..."标记。
+
+**实施**: 在 `pipeline/orchestrator.py` 新增 `_audit_rewrite_source_tags`
+函数,vibe_loop 每轮 rewriter 输出后跑一遍。它做 3 件事:
+- **missing_tag**: `rewrite_summary` 没有"源:"标记 → WARNING + cell_id 列表
+- **wrong_source**: LLM 写了"源:静态兜底"但该 platform 在 DB 里有命中 →
+  WARNING(这是 R-022 想堵的具体漏洞)
+- **INFO 汇总**: `db=N, static=N, missing=N (of 总数)` 让运营 grep 出实际比例
+
+不抛错的理由: LLM 漏写一个标记 ≠ 重写失败,抛错会让飞轮信号缺失变成可用性
+故障。运营只需在日志里持续监控 missing/wrong 比例,降到 0 之前继续在 prompt
+里加强。
+
+**自检**: 4 个分支(全好/缺标记/错源/空)全跑过,输出符合预期。
+
+### 2. mask_secrets 与 TV 模式数对齐
+
+**review**: 报告里"5 patterns",TV 是 7 个。
+
+**澄清**: 代码实际有 **7 个模式**(含 `sbp_*` 和 generic
+`sk-[A-Za-z0-9]{40,}`);报告之前的 unit-test 列表只展示了 5 个例子,造成歧义。
+
+**实施**:
+- `pipeline/logger_utils.py` 顶部加 `Shadow-aligned with truth-vault's
+  scripts/_common.py::_SECRET_PATTERNS` 显式注释,提醒未来 TV 加新 vendor
+  时同步过来
+- 重跑自检:7/7 patterns 全部 mask 成功 (Anthropic / Supabase service /
+  Supabase PAT / JWT / Google / OpenAI scoped / generic sk-)
+
+### 3. R-026 跨 backend retry 不一致
+
+**review**: TV `annotate_essence_pass` 14s 上限、Gemini 30s、Claude 走
+BaseAgent.run() 完全另一套——未来诊断难。
+
+**实施**: 在 `pipeline/llm_retry.py` 顶部 docstring 加跨 backend 重试对照表
+(Claude / Gemini / DeepSeek / OpenAI 4 条路径各自走哪个 retry 源、参数是什么),
+并解释为何**不**强行统一:BaseAgent._call_claude 已包含 retry + budget +
+rate limiter + cache fallback 4 项耦合状态机,migrating 到 llm_retry 是
+另一个 PR 的工作量,而不是 R-026 的承诺。
+
+Gemini 的 max_wait=30s 也写明是**有意**比 TV 的 14s 宽 — Vertex grounding
+429 恢复周期通常 10-20s,14s 会"还没等到就放弃"。
+
+### 4. acall_with_retry 是否真用 → 删除
+
+**review**: 异步版本是 dead code,YAGNI。
+
+**实施**: 已删除 `acall_with_retry`,只留同步版。在删除处加注释说明"所有
+当前 LLM 调用站点都是 sync,BaseAgent 的 async run() 是用 asyncio.to_thread
+跨边界的,不是 await async LLM 调用。哪天真有 `async def call_xxx_async`
+再加回来"。`asyncio` import 也一并去掉。
+
+### 5. vibe_rewriter.md 内部一致性
+
+**review**: 旧 prompt L126 "证据包为空时...依然按静态样本执行" vs 新铁律
+"必须写 #id" 在 0 命中情况下可能让 LLM 困惑(没 id 怎么写)。
+
+**实施**: 在新铁律段下方加**三态决策表**,逐行列出 PRIMARY 状态 / 锚点来源 /
+`rewrite_summary` 必写内容 / 备注:
+
+| PRIMARY 状态 | 锚点 | rewrite_summary | 备注 |
+|--------------|------|-----------------|------|
+| 非空且匹配 | DB 证据包 | `源:数据库样本 #<id>` | id 用证据包 id |
+| 非空但已被本批占用 | 次优证据包 / FALLBACK | 各自源标记 | 不能共用 id |
+| 空 (0 命中) | 静态兜底 | `源:静态兜底 #<编号>(原因:该平台 0 命中)` | **不报错、不略过** |
+
+这样"静态兜底必须写编号 + 原因"和"证据包为空不报错"在同一张表里说清楚,
+LLM 不会在边界条件上摇摆。
