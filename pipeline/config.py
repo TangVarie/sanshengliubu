@@ -5,9 +5,18 @@
 VERSION = "v0.30.12"
 VERSION_DATE = "2026-06-10"
 VERSION_NOTES = (
-    "v0.30.12 chore: Claude 模型表收敛到 4 款可用模型。Claude 侧只剩 "
-    "claude-opus-4-6 / 4-7 / 4-8 + claude-sonnet-4-6;非 Claude backend "
-    "(GPT via vectorengine / DeepSeek / Gemini) 保留原配置不动。"
+    "v0.30.12 chore: Claude 模型表收敛到 4 款可用模型 + no-channel 保底 + "
+    "thinking 修复。Claude 侧只剩 claude-opus-4-6 / 4-7 / 4-8 + "
+    "claude-sonnet-4-6;非 Claude backend (GPT via vectorengine / DeepSeek "
+    "/ Gemini) 保留原配置不动。"
+    "(7) no-channel 保底:中转站对某 Claude 模型返回 'No available channel "
+    "for model xxx' 时,_call_claude 按 CLAUDE_FALLBACK_CHAIN 依次降级到下一"
+    "个 Claude 模型重试,而不是整个 stage 失败。实际跑通的模型经 7-tuple "
+    "返回,run() 在 model_used 标 [fallback←原模型],UI/stage_log 如实反映。"
+    "GPT/DeepSeek 不走这条链。"
+    "(8) thinking 修复:ministry_justice 加进 THINKING_STAGES(原靠 "
+    "-thinking 后缀,收敛后丢了深推理);_use_thinking 识别 strategy_debate_N "
+    "前缀,让 secretariat/chancellery 在策略辩论期间不丢 thinking。"
     "(1) Claude 侧:所有 Sonnet 3.7 (claude-3-7-sonnet-*-thinking) 切到 "
     "claude-sonnet-4-6 (works_builder / vibe_rewriter / red_blue_blue / "
     "red_blue_refiner / persona_simulator);ministry_justice 的 "
@@ -327,6 +336,23 @@ def _resolve_models(preset: str) -> dict[str, str]:
 
 
 MODELS: dict[str, str] = _resolve_models(MODEL_PRESET)
+
+# ── Claude model fallback chain (无可用渠道时的保底) ───────────────────────
+# 中转站偶尔对某个模型返回 "No available channel for model xxx"(该模型当前
+# 没有可用上游渠道)。这不是模型本身的问题,换一个 Claude 模型通常就能跑。
+# _call_claude 检测到这类错误时,按下面顺序降级到下一个 Claude 模型继续,
+# 避免整个 stage 直接失败。
+#
+# 顺序是经验值(质量 + 渠道可用概率):主力 4-7 → 次新 4-8 → 稳态 4-6 →
+# 轻量保底 sonnet-4-6。stage 实际配的 primary 模型会自动排在第一位,这里
+# 只定义"它失败后依次尝试谁"。只对 Claude 生效;GPT / DeepSeek 不走这条链
+# (它们各自后端没有"渠道"概念,也没有等价的备选池)。
+CLAUDE_FALLBACK_CHAIN: list[str] = [
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+]
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
 
