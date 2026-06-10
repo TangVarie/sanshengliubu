@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    CLAUDE_FALLBACK_CHAIN,
     CLAUDE_MAX_CONCURRENT,
     CLAUDE_RPM_LIMIT,
     COST_PER_1M_INPUT,
@@ -38,6 +39,21 @@ from pipeline.config import (
 )
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+
+def _is_no_channel_error(exc: BaseException) -> bool:
+    """True if the error looks like a relay "no upstream channel for this
+    model" rejection, e.g. "No available channel for model claude-opus-4-7".
+
+    Match is intentionally loose (covers "no available channel" and
+    "no channel for model" phrasings across relay vendors) so a model that
+    a relay can't currently route triggers the Claude fallback chain in
+    _call_claude instead of failing the whole stage. Kept narrow enough to
+    NOT swallow generic auth/quota/validation errors.
+    """
+    msg = str(exc).lower()
+    return "no available channel" in msg or "no channel for model" in msg
+
 
 # ── API config cache (populated in main thread, used by background threads) ──
 _api_config: dict[str, str] = {}
@@ -736,6 +752,29 @@ class BaseAgent:
         kwargs["timeout"] = 900.0
         return anthropic.Anthropic(**kwargs)
 
+    @staticmethod
+    def _claude_fallback_candidates(primary_model: str) -> list[str]:
+        """Build [primary, ...fallbacks] for the no-channel保底 path.
+
+        Fallbacks = the other Claude models from CLAUDE_FALLBACK_CHAIN,
+        in chain order, excluding the primary. Non-Claude models
+        (gpt-* / deepseek-*) return just [primary] — they route through
+        their own backends and have no equivalent fallback pool, so they
+        never enter the fallback loop.
+
+        Note: a primary that's a relay suffix variant (e.g.
+        "claude-opus-4-6-high") still counts as Claude and gets the base
+        chain appended — losing the suffix on fallback is an acceptable
+        degradation when the suffixed model has no channel at all.
+        """
+        if not (primary_model or "").lower().startswith("claude-"):
+            return [primary_model]
+        out = [primary_model]
+        for m in CLAUDE_FALLBACK_CHAIN:
+            if m != primary_model and m not in out:
+                out.append(m)
+        return out
+
     # Agents that need strategy-level methodology (差异化/真实感/平台感知)
     _STRATEGY_STAGES = frozenset({
         "secretariat", "chancellery", "chancellery_final",
@@ -842,17 +881,18 @@ class BaseAgent:
         user_message: str,
         effective_model: str,
         max_tokens: int,
-    ) -> tuple[str, int, int, int, int, bool]:
+    ) -> tuple[str, int, int, int, int, bool, str]:
         """OpenAI-compat chat/completions backend(v0.30.7 起走 vectorengine.ai)。
 
         GPT 系列模型不能通过 anthropic SDK 调用——tdyun-style anthropic-compat
         中转转发不过去。所以单独走 OpenAI SDK + vectorengine 端点。
 
-        返回和 _call_claude 同样的 6-tuple,让上层调度逻辑不用分支处理:
+        返回和 _call_claude 同样的 7-tuple,让上层调度逻辑不用分支处理:
         (text, input_tokens, output_tokens, cache_read, cache_creation,
-        thinking_fired)。GPT 没有 anthropic 风格的 thinking 块,
-        thinking_fired 永远是 False。OpenAI 的 prompt caching 走 usage.
-        prompt_tokens_details.cached_tokens,映射到 cache_read。
+        thinking_fired, actual_model)。GPT 没有 anthropic 风格的 thinking 块,
+        thinking_fired 永远是 False;GPT 不走 Claude 的 no-channel fallback,
+        actual_model 恒等于传入的 effective_model。OpenAI 的 prompt caching
+        走 usage.prompt_tokens_details.cached_tokens,映射到 cache_read。
 
         失败模式:
         - vectorengine 没配 → RuntimeError 提示去 secrets.toml 加 key
@@ -924,20 +964,26 @@ class BaseAgent:
         except Exception:
             pass
 
-        return (text, input_tokens, output_tokens, cache_read, 0, False)
+        return (text, input_tokens, output_tokens, cache_read, 0, False, effective_model)
 
     def _call_claude(
         self, system_prompt: str, user_message: str
-    ) -> tuple[str, int, int, int, int, bool]:
+    ) -> tuple[str, int, int, int, int, bool, str]:
         """Synchronous Claude API call.
 
         Returns (response_text, input_tokens, output_tokens,
         cache_read_input_tokens, cache_creation_input_tokens,
-        thinking_fired). thinking_fired is True iff the model's response
-        actually contained a `thinking` content block. Compare against
-        self._use_thinking: if we asked for thinking but didn't get it,
-        the relay silently dropped the `thinking` JSON param — visible
-        as "thinking ✗" in the UI's model_used field.
+        thinking_fired, actual_model). thinking_fired is True iff the
+        model's response actually contained a `thinking` content block.
+        Compare against self._use_thinking: if we asked for thinking but
+        didn't get it, the relay silently dropped the `thinking` JSON
+        param — visible as "thinking ✗" in the UI's model_used field.
+
+        actual_model is the model that actually produced the response —
+        normally the stage's configured model, but if the relay returned
+        "No available channel" it's whichever Claude fallback succeeded
+        (see CLAUDE_FALLBACK_CHAIN). run() surfaces it in model_used so
+        the UI reflects the真实 model, not the planned one.
 
         Three execution paths share the SAME kwargs construction (model,
         max_tokens, system, messages, thinking) — the historical "relay
@@ -1113,18 +1159,25 @@ class BaseAgent:
             with client.messages.stream(**call_kwargs) as stream:
                 return stream.get_final_message()
 
-        try:
-            response = _do_stream(kwargs)
-        except anthropic.BadRequestError as e:
-            err_text = str(e)
-            # Only treat as cache fault if we actually sent cache_control
-            # AND the error message specifically mentions it. Avoid false
-            # positives from unrelated 400s that happen to contain the word.
-            is_cache_fault = (
-                _preset_supports_cache
-                and "cache_control" in err_text.lower()
-            )
-            if is_cache_fault:
+        def _stream_with_cache_fallback():
+            """Single-model call. Handles the cache_control 400 →
+            disable-cache-and-retry path internally. Any other error
+            (including the relay "no available channel" rejection) is
+            raised so the outer model-fallback loop can decide whether to
+            try the next Claude model."""
+            try:
+                return _do_stream(kwargs)
+            except anthropic.BadRequestError as e:
+                err_text = str(e)
+                # Only treat as cache fault if we actually sent cache_control
+                # AND the error message specifically mentions it. Avoid false
+                # positives from unrelated 400s that happen to contain the word.
+                is_cache_fault = (
+                    _preset_supports_cache
+                    and "cache_control" in err_text.lower()
+                )
+                if not is_cache_fault:
+                    raise
                 _active_preset = get_active_claude_relay_name() or "_global"
                 _cache_key = f"_cache_disabled_{_active_preset}"
                 # Check-and-set under a lock so concurrent agents all see the
@@ -1145,9 +1198,42 @@ class BaseAgent:
                         err_text[:300],
                     )
                 kwargs["system"] = system_prompt  # plain string, no cache
-                response = _do_stream(kwargs)
-            else:
+                return _do_stream(kwargs)
+
+        # ── Model fallback 保底 ────────────────────────────────────────
+        # 中转站对某个 Claude 模型返回"无可用渠道"(No available channel
+        # for model xxx)时,按 CLAUDE_FALLBACK_CHAIN 依次降级到下一个 Claude
+        # 模型重试,避免整个 stage 失败。非 Claude(gpt/deepseek)只有自己
+        # 一个候选,行为不变。每次换模型都重绑 client(闭包变量)+ kwargs
+        # ["model"]。其它错误(rate limit / 5xx / auth)照常上抛,交给
+        # run() 的重试 / 分类逻辑。
+        _candidates = self._claude_fallback_candidates(effective_model)
+        response = None
+        for _ci, _try_model in enumerate(_candidates):
+            client = self._get_client_for_model(_try_model)
+            kwargs["model"] = _try_model
+            try:
+                response = _stream_with_cache_fallback()
+            except Exception as e:
+                if _is_no_channel_error(e) and _ci < len(_candidates) - 1:
+                    logger.warning(
+                        "[model-fallback] 模型 '%s' 无可用渠道,降级尝试备选 "
+                        "'%s';原因: %s",
+                        _try_model,
+                        _candidates[_ci + 1],
+                        str(e)[:160],
+                    )
+                    continue
                 raise
+            # 成功 —— effective_model 更新为实际跑通的模型,供日志 / UI label。
+            effective_model = _try_model
+            if _ci > 0:
+                logger.warning(
+                    "[model-fallback] 已降级到 '%s' 成功(原计划 '%s' 无可用渠道)",
+                    _try_model,
+                    _candidates[0],
+                )
+            break
 
         # Extract text from response — thinking responses have multiple content blocks
         text = ""
@@ -1183,6 +1269,7 @@ class BaseAgent:
             cache_read,
             cache_creation,
             has_thinking,
+            effective_model,   # v0.30.12: 实际跑通的模型(可能因 no-channel fallback ≠ 计划)
         )
 
     @staticmethod
@@ -1413,6 +1500,7 @@ class BaseAgent:
                     cache_read,
                     cache_creation,
                     thinking_fired,
+                    actual_model,
                 ) = await asyncio.to_thread(
                     self._call_claude, system_prompt, user_message
                 )
@@ -1435,10 +1523,18 @@ class BaseAgent:
                 # override like "claude-opus-4-6-high") so the UI shows
                 # what the relay actually saw, not the global default.
                 _model_overrides_for_label = _api_config.get("model_overrides") or {}
-                _effective_model_for_label = (
+                _planned_model = (
                     _model_overrides_for_label.get(self.stage_name) or self.model
                 )
-                model_label = f"{_effective_model_for_label}{_thinking_tag}"
+                # v0.30.12: actual_model comes back from _call_claude. If the
+                # relay had no channel for the planned model and we fell back
+                # to another Claude model, actual_model ≠ planned — surface
+                # that with a [fallback←planned] tag so model_used in the UI /
+                # stage_log reflects what really ran, not a misleading plan.
+                _fallback_tag = ""
+                if actual_model and actual_model != _planned_model:
+                    _fallback_tag = f" [fallback←{_planned_model}]"
+                model_label = f"{actual_model or _planned_model}{_thinking_tag}{_fallback_tag}"
 
                 # Feed the per-run budget tracker. Raises RunBudgetExceededError
                 # if we've blown through MAX_TOKENS_PER_RUN — caught at the
