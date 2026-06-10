@@ -426,8 +426,14 @@ CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
 CELL_PLANNER_CONCURRENCY = 3    # parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
-# 5 strategy/review stages use extended thinking (budget_tokens on relay,
-# adaptive on Vertex 4.6). Execution stages skip thinking for speed.
+# 6 strategy/review/compliance stages use extended thinking (budget_tokens
+# on relay, adaptive on Vertex/4.6+). Execution stages skip thinking for speed.
+#
+# v0.30.12: ministry_justice 加入。历史上它靠模型名后缀
+# claude-opus-4-6-thinking 拿 extended thinking;当可用模型表收敛到 base
+# 模型(无 -thinking 变体)后,后缀路径失效。改为走 THINKING_STAGES +
+# adaptive thinking JSON 参数,保证合规审查仍有深推理(安全/法务把关不能
+# 悄悄变弱)。
 
 THINKING_STAGES: frozenset[str] = frozenset({
     "crown_prince",
@@ -435,6 +441,7 @@ THINKING_STAGES: frozenset[str] = frozenset({
     "chancellery",
     "ministry_works",
     "chancellery_final",
+    "ministry_justice",   # v0.30.12: 合规审查,接替原 -thinking 后缀
 })
 
 THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)

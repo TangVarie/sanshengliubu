@@ -784,6 +784,17 @@ class BaseAgent:
         # Thinking is enabled for specific strategic stages, not tied to model name.
         # On Vertex: uses adaptive thinking (model decides depth).
         # On relay: uses budget_tokens=10000 as fallback.
+        #
+        # v0.30.12: strategy debate (orchestrator._run_strategy_debate) 临时把
+        # agent.stage_name 改成 "strategy_debate_N" 以区分每轮的 stage_log。
+        # 这副作用让精确匹配的 THINKING_STAGES 检查失效 —— secretariat /
+        # chancellery 在 debate 期间拿不到 thinking。debate 只由这两个逻辑
+        # stage 参与(偶数轮 secretariat、奇数轮 chancellery),两者都在
+        # THINKING_STAGES 里,所以识别这个前缀直接放行 thinking。
+        # (若该轮实际跑 GPT,_call_claude 里会因 _is_gpt_family 跳过 thinking
+        # 注入,这里返回 True 无副作用。)
+        if self.stage_name.startswith("strategy_debate_"):
+            return True
         return self.stage_name in THINKING_STAGES
 
     @staticmethod
