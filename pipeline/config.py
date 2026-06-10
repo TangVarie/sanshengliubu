@@ -2,9 +2,21 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.12"
+VERSION = "v0.30.13"
 VERSION_DATE = "2026-06-10"
 VERSION_NOTES = (
+    "v0.30.13 fix: 回退 strategy-debate thinking(修 v0.30.12 引入的崩溃)+ "
+    "cell 重建加 brief 平台兜底。"
+    "(1) 根因:v0.30.12 让 secretariat 在 strategy_debate_* 期间开 adaptive "
+    "thinking,但 secretariat 每轮输出完整大 plan(多 directions + matrix_"
+    "skeleton),32K max_tokens 被 thinking 挤占导致 plan JSON 截断,"
+    "target_platforms/matrix_skeleton 丢失,cell 重建得 0 → "
+    "'工部·格子规划产出为空' RuntimeError。回退:_use_thinking 不再为 "
+    "strategy_debate_* 放行 thinking(回到 v0.30.11 行为)。ministry_justice "
+    "的 thinking(v0.30.12 P2-2)保留,无副作用。"
+    "(2) 防御:_reconstruct_active_cells 在 plan.target_platforms 为空时退回 "
+    "brief.target_platforms(crown_prince 提取的原始平台)兜底 + warning,"
+    "未来任何原因的 plan 截断不再直接崩。"
     "v0.30.12 chore: Claude 模型表收敛到 4 款可用模型 + no-channel 保底 + "
     "thinking 修复。Claude 侧只剩 claude-opus-4-6 / 4-7 / 4-8 + "
     "claude-sonnet-4-6;非 Claude backend (GPT via vectorengine / DeepSeek "
