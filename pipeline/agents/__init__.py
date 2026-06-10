@@ -651,7 +651,10 @@ class BaseAgent:
     prompt_file: str = ""  # relative to pipeline/prompts/
 
     def __init__(self):
-        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-20250514")
+        # v0.30.12: fallback 用当前可用模型表里最便宜的 (Sonnet 4-6)。
+        # 老 fallback 是带日期后缀的 claude-sonnet-4-20250514,中转 / Vertex
+        # 用户表上不一定能解析。
+        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-6")
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
         # Validate prompt file exists at construction time so we fail fast
         # instead of crashing mid-pipeline after burning tokens on prior stages.
@@ -1031,13 +1034,15 @@ class BaseAgent:
             "supports_adaptive_thinking", True
         )
         # Adaptive thinking is an Opus-4.6+ API feature(自 Opus 4.6 起支持,
-        # Opus 4.7 继承)。Match canonical model family prefixes exactly, so
-        # future names like "claude-opus-5-0" don't accidentally match and
-        # we don't cross-match unrelated model names containing those digits.
-        # Sonnet 3.7 不支持 adaptive thinking,会走到 else 分支发 budget_tokens。
+        # Opus 4.7 / 4.8 继承,Sonnet 4.6 同代际)。Match canonical model
+        # family prefixes exactly, so future names like "claude-opus-5-0"
+        # don't accidentally match and we don't cross-match unrelated model
+        # names containing those digits. Sonnet 3.7 不支持 adaptive
+        # thinking,会走到 else 分支发 budget_tokens。
         _is_adaptive_thinking_family = (
             "claude-opus-4-6" in effective_model
             or "claude-opus-4-7" in effective_model
+            or "claude-opus-4-8" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
         # v0.30.0: GPT 模型即使 stage 在 THINKING_STAGES 里也强制不发

@@ -2,10 +2,26 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.11"
-VERSION_DATE = "2026-05-21"
+VERSION = "v0.30.12"
+VERSION_DATE = "2026-06-10"
 VERSION_NOTES = (
-    "v0.30.11 feat: Gemini 按岗位 model override + 按模型计价表。"
+    "v0.30.12 chore: Claude 模型表收敛到 4 款可用模型。Claude 侧只剩 "
+    "claude-opus-4-6 / 4-7 / 4-8 + claude-sonnet-4-6;非 Claude backend "
+    "(GPT via vectorengine / DeepSeek / Gemini) 保留原配置不动。"
+    "(1) Claude 侧:所有 Sonnet 3.7 (claude-3-7-sonnet-*-thinking) 切到 "
+    "claude-sonnet-4-6 (works_builder / vibe_rewriter / red_blue_blue / "
+    "red_blue_refiner / persona_simulator);ministry_justice 的 "
+    "claude-opus-4-6-thinking 去掉 -thinking 后缀。thinking 行为改由 "
+    "agents/__init__.py 里 adaptive thinking JSON 参数控制 (Opus 4.6+ 自带)。"
+    "(2) 非 Claude 不变:chancellery / ministry_war 仍走 gpt-5.5,"
+    "persona_simulator_alt 仍走 deepseek-v4-pro (跨厂家异色彩对抗保留)。"
+    "(3) SONNET_CONTENT_MODEL 从 claude-sonnet-3-7 切到 claude-sonnet-4-6。"
+    "(4) COST_PER_1M_INPUT/OUTPUT 加 claude-opus-4-8 ($15/$75 同 Opus tier),"
+    "删除已退役的 opus-4-1 / sonnet-3-7 / 3-7-sonnet-* 条目。"
+    "(5) BaseAgent.__init__ fallback model 从 claude-sonnet-4-20250514 "
+    "切到 claude-sonnet-4-6 (前者带日期后缀,中转表上不一定解析)。"
+    "(6) _is_adaptive_thinking_family 检查加 claude-opus-4-8 分支。"
+    "v0.30.11 历史: Gemini 按岗位 model override + 按模型计价表。"
     "(1) 新加 GEMINI_MODEL_OVERRIDES dict(pipeline/config.py),6 个 "
     "Gemini-driven agent (critic / structure_reviewer / trend_scout / "
     "image_transcriber / screenshot_analyzer / reference_analyzer)各自岗位"
@@ -165,36 +181,34 @@ OPUS_MODEL = "claude-opus-4-7"
 # 用于 all_sonnet preset 以及 planning / 结构化任务(planning 阶段需要
 # Sonnet 4-6 的稳定 JSON 输出能力)。
 SONNET_MODEL = "claude-sonnet-4-6"
-# v0.28.0: 内容写作专用模型。老版本 Sonnet(3.7)在纯写作任务上对齐
-# 痕迹更少,常被反馈"网感更强 / 更像真人",所以把 content 角色单独
-# 绑到 3.7 而不是跟 planning 共用 Sonnet 4.6。
-# 注意:实际模型名可能因 relay / Vertex 不同而需要调整——比如
-# Anthropic 官方是 "claude-3-7-sonnet-20250219"。如果你的接入点不
-# 认识 "claude-sonnet-3-7",可在 secrets.toml 的
-# [claude_relay_presets.X.model_overrides] 里覆盖:
-#   ministry_works_builder = "claude-3-7-sonnet-latest"
-#   vibe_rewriter = "claude-3-7-sonnet-latest"
-#   ...
-SONNET_CONTENT_MODEL = "claude-sonnet-3-7"
+# v0.30.12: Claude content 写作模型。老版本 Sonnet 3.7 已退出可用模型表
+# (当前 Claude 只剩 opus 4-6/4-7/4-8 + sonnet 4-6),所以 content 角色从
+# Sonnet 3.7 切到 Sonnet 4-6。继续保留独立常量,语义上"内容写作用更轻
+# 的模型",但当前指向和 SONNET_MODEL 等价。哪天 Sonnet 4-7 上线,只需要
+# 改这一行就能把所有 content stage 切过去。
+SONNET_CONTENT_MODEL = "claude-sonnet-4-6"
 
 # v0.30.0: 在代码层面直接锁定每个 stage 用哪个模型(高质量配置),用户
 # 不必再在 secrets.toml 里维护 model_overrides。可选 preset:
 #
 #   premium_multi_vendor(v0.30.0 默认,推荐) — 不限成本求最优组合,
-#     - 推理 / 长上下文 / 中文锐度都拉满
-#     - 中书省 vs 门下省 故意用不同厂家(Claude vs GPT)避免辩论同色彩
-#     - 内容生成保留 Sonnet 3.7(短中文网感实战最强)
-#     - 兵部 / chancellery 用 GPT 提供异色彩对抗
-#     - 需要 secrets.toml 同时配 Claude 中转 + (可选)DEEPSEEK_API_KEY
+#     - 推理 / 长上下文 / 中文锐度都拉满 (Claude Opus 4-7 担纲)
+#     - 中书省 (Claude) vs 门下省 / 兵部 (GPT) 故意用不同厂家避免辩论同色彩
+#     - 内容生成走 Sonnet 4-6(v0.30.12 起;原 Sonnet 3.7 已退役)
+#     - persona_simulator_alt 用 DeepSeek 提供异厂家画像视角
+#     - 需要 secrets.toml 同时配 Claude 中转 + VECTORENGINE_API_KEY(GPT) +
+#       (可选)DEEPSEEK_API_KEY
 #
 #   content_sonnet(v0.29.x 历史默认) — 保留兼容
-#   all_opus / all_sonnet — 单厂家全跑,降级方案
+#   all_opus / all_sonnet — 单档全跑,降级方案
 MODEL_PRESET = "premium_multi_vendor"
 
-# v0.30.0: 各阶段精确模型映射 — 写在代码里防止 secrets.toml 误覆盖。
-# 用户实际中转里的模型 ID,要和 tdyun-style anthropic-compat relay 对齐。
-# 注:thinking 模式由模型名后缀 `-thinking` 控制(tdyun 约定),不是
-# 通过 thinking JSON 参数传(老路径)。
+# 各阶段精确模型映射 — 写在代码里防止 secrets.toml 误覆盖。
+# Claude stage 用当前可用的 4 款 (opus 4-6/4-7/4-8 + sonnet 4-6);
+# 非 Claude backend (GPT via vectorengine / DeepSeek) 保留原配置不受影响。
+# v0.30.12: Claude 侧的 -thinking 后缀和 Sonnet 3.7 全部退役;thinking
+# 行为由 agents/__init__.py 里 adaptive thinking JSON 参数控制 (Opus 4.6+
+# 自带),不再走模型名后缀路径。
 PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
     # ── 策略 / 推理核心(深推理,Opus 4.7)──
     # v0.30.2: 不带 -thinking 后缀,tdyun 上 -thinking 没定价。Opus 4.7
@@ -204,32 +218,31 @@ PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
     "chancellery_final": "claude-opus-4-7",               # 终审(holistic 把关)
     "ministry_works": "claude-opus-4-7",                  # 工部架构(整脊柱)
     # ── 异厂家辩论(Claude vs GPT)──
+    # 用 GPT 提供和 Claude 不同 distribution 的异色彩对抗,比同厂家
+    # 自言自语更能挑出问题。GPT 走 vectorengine OpenAI-compat 后端。
     "chancellery": "gpt-5.5",                             # 门下省(critic)
     "ministry_war": "gpt-5.5",                            # 兵部(刁钻竞争)
     # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
     "dispatcher": "claude-opus-4-6",
     "ministry_revenue": "claude-opus-4-6",
     "ministry_rites": "claude-opus-4-6",
-    "ministry_justice": "claude-opus-4-6-thinking",       # 合规要严
+    "ministry_justice": "claude-opus-4-6",                # 合规要严(v0.30.12: -thinking 后缀去掉,用户表只有 base)
     "ministry_works_cell_planner": "claude-opus-4-6",
-    # ── 创意 / 内容相关阶段(v0.30.9 user 规定):一律 4.6 或 3.7 ──
-    # Opus 4.7 太"精致 / 端正",对短中文社交内容反而失真。4.6 内容感稍松,
-    # Sonnet 3.7 写作语感最强但缺反思深度。按"判断 vs 写作"分:
+    # ── 创意 / 内容相关阶段:判断走 Opus 4.6,纯写作走 Sonnet 4.6 ──
+    # 历史上写作用 Sonnet 3.7 (网感强),v0.30.12 起模型表里没了,统一切 4.6。
     "ministry_personnel": "claude-opus-4-6",              # 画像创作(创意)
     "narrative_director": "claude-opus-4-6",              # 跨 cell 一致性诊断(创意判断)
     "vibe_critic": "claude-opus-4-6",                     # 网感复检(judge)
     "structural_rewriter": "claude-opus-4-6",             # 身份/缺口手术(content 重写)
-    "ministry_works_builder": "claude-3-7-sonnet-20250219-thinking",  # 内容写作
-    "vibe_rewriter": "claude-3-7-sonnet-20250219-thinking",           # 内容重写
-    # ── 红蓝精炼真对抗(v0.30.9):异模型 Red vs Blue ──
-    # 之前 Red 和 Blue 都用 Sonnet 3.7,同模型同盲区不构成真对抗。现在拆:
-    # Red Team 用 Opus 4.6(异 distribution,善找 AI 腔指纹和结构问题)
-    # Blue Team 用 Sonnet 3.7(写作语感,做最小修复保留人味)
-    "red_blue_refiner": "claude-3-7-sonnet-20250219-thinking",  # legacy 兼容,实际不用
+    "ministry_works_builder": "claude-sonnet-4-6",        # 内容写作(v0.30.12: 原 Sonnet 3.7)
+    "vibe_rewriter": "claude-sonnet-4-6",                 # 内容重写(v0.30.12: 原 Sonnet 3.7)
+    # ── 红蓝精炼真对抗:Red (Opus 4.6) vs Blue (Sonnet 4.6) ──
+    # 异 distribution: Opus 找 AI 腔指纹和结构问题,Sonnet 接力最小修复
+    "red_blue_refiner": "claude-sonnet-4-6",              # legacy 兼容,实际不用
     "red_blue_red": "claude-opus-4-6",                    # 攻方
-    "red_blue_blue": "claude-3-7-sonnet-20250219-thinking",  # 守方
-    # ── 画像模拟双 backend(v0.30.8) ──
-    "persona_simulator": "claude-3-7-sonnet-20250219-thinking",  # Claude 系
+    "red_blue_blue": "claude-sonnet-4-6",                 # 守方(v0.30.12: 原 Sonnet 3.7)
+    # ── 画像模拟双 backend(v0.30.8):主 Claude + alt DeepSeek 异厂家 ──
+    "persona_simulator": "claude-sonnet-4-6",             # 主路径(v0.30.12: 原 Sonnet 3.7)
     "persona_simulator_alt": "deepseek-v4-pro",           # DeepSeek 异厂家
 }
 
@@ -604,24 +617,21 @@ ENABLE_PROMPT_CACHING = True
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
 COST_PER_1M_INPUT: dict[str, float] = {
+    # v0.30.12: 只列当前可用的 4 款 Claude。Opus 三代同 tier ($15/$75 in/out),
+    # Sonnet 4-6 是轻量 tier ($3/$15)。老条目 (opus-4-1 / sonnet-3-7) 删除,
+    # 它们在 MODELS 映射里已无引用;如果有历史 run 在 DB 里引用,
+    # _estimate_call_cost_usd 会 fallback 到 0 (见 agents/__init__.py)。
+    "claude-opus-4-8": 15.0,
     "claude-opus-4-7": 15.0,
     "claude-opus-4-6": 15.0,
-    "claude-opus-4-1": 5.0,
     "claude-sonnet-4-6": 3.0,
-    "claude-sonnet-3-7": 3.0,  # Sonnet 3.7 价格与 Sonnet 4.x 同量级
-    # Anthropic 官方名兼容(如果 relay 要求用全名)
-    "claude-3-7-sonnet-20250219": 3.0,
-    "claude-3-7-sonnet-latest": 3.0,
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "claude-opus-4-8": 75.0,
     "claude-opus-4-7": 75.0,
     "claude-opus-4-6": 75.0,
-    "claude-opus-4-1": 25.0,
     "claude-sonnet-4-6": 15.0,
-    "claude-sonnet-3-7": 15.0,
-    "claude-3-7-sonnet-20250219": 15.0,
-    "claude-3-7-sonnet-latest": 15.0,
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────
