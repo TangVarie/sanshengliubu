@@ -824,16 +824,17 @@ class BaseAgent:
         # On Vertex: uses adaptive thinking (model decides depth).
         # On relay: uses budget_tokens=10000 as fallback.
         #
-        # v0.30.12: strategy debate (orchestrator._run_strategy_debate) 临时把
-        # agent.stage_name 改成 "strategy_debate_N" 以区分每轮的 stage_log。
-        # 这副作用让精确匹配的 THINKING_STAGES 检查失效 —— secretariat /
-        # chancellery 在 debate 期间拿不到 thinking。debate 只由这两个逻辑
-        # stage 参与(偶数轮 secretariat、奇数轮 chancellery),两者都在
-        # THINKING_STAGES 里,所以识别这个前缀直接放行 thinking。
-        # (若该轮实际跑 GPT,_call_claude 里会因 _is_gpt_family 跳过 thinking
-        # 注入,这里返回 True 无副作用。)
-        if self.stage_name.startswith("strategy_debate_"):
-            return True
+        # ⚠️ v0.30.13: 故意【不】为 strategy_debate_* 放行 thinking。
+        # 背景:strategy debate 里 secretariat 以 "strategy_debate_N" 身份跑
+        # (orchestrator._strategy_loop 临时改 stage_name)。v0.30.12 一度识别
+        # 这个前缀给它开 thinking(原意:debate 也该深推理),但 secretariat
+        # 每轮输出的是【完整大 plan】(5-7 个 tactical_directions + matrix_skeleton
+        # 含十几个 active_cells),它的 max_tokens=32K 需要几乎全部留给输出。
+        # adaptive thinking 会先吃掉一大块预算,导致 plan JSON 被截断 ——
+        # truncation repair 只救回第 1 个 direction,target_platforms /
+        # matrix_skeleton 直接丢失,下游 cell 重建得 0 cell 整条流水线崩。
+        # 结论:debate 的深推理收益 < plan 输出完整性,这里回到精确匹配,
+        # secretariat 在 debate 不开 thinking(和 v0.30.11 及之前一致)。
         return self.stage_name in THINKING_STAGES
 
     @staticmethod

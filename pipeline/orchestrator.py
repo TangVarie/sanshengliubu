@@ -470,7 +470,11 @@ class PipelineOrchestrator:
                     f"plan keys: {list(plan.keys())}, "
                     f"matrix_skeleton: {plan.get('matrix_skeleton', 'MISSING')}, "
                     f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
-                    f"target_platforms: {plan.get('target_platforms', [])}"
+                    f"target_platforms: {plan.get('target_platforms', [])}, "
+                    f"brief.target_platforms: {(structured_brief or {}).get('target_platforms', 'MISSING')}. "
+                    f"常见根因：secretariat 输出被 max_tokens 截断(plan JSON 不完整，"
+                    f"target_platforms/matrix_skeleton 丢失)。检查 strategy_debate "
+                    f"stage_log 是否触发了 truncation repair。"
                 )
 
             # v0.27.0: 把 cell_plan / tactical_direction 索引挂到 self,
@@ -835,7 +839,7 @@ class PipelineOrchestrator:
 
         return {name: output for name, output in results}
 
-    def _reconstruct_active_cells(self, plan: dict) -> list[dict]:
+    def _reconstruct_active_cells(self, plan: dict, brief: dict | None = None) -> list[dict]:
         """Compute the active cell list from the plan.
 
         Reconciles secretariat's active_cells with the D×P (directions ×
@@ -851,6 +855,21 @@ class PipelineOrchestrator:
         directions = plan.get("tactical_directions", []) or []
         platforms = plan.get("target_platforms", []) or []
         excluded = (plan.get("matrix_skeleton", {}) or {}).get("excluded_cells", []) or []
+
+        # v0.30.13 防御:secretariat 偶发输出截断会丢掉 target_platforms,
+        # 让 D×P 重建得 0 cell、整条流水线直接崩(见 _use_thinking 注释里的
+        # debate-thinking 截断 case)。target_platforms 为空时退回 brief 里
+        # crown_prince 提取的原始平台列表兜底,并 warning 暴露 plan 残缺 ——
+        # 比直接 RuntimeError 好,至少能用 brief 平台把 cell 撑起来。
+        if not platforms and brief:
+            _brief_platforms = (brief.get("target_platforms") or [])
+            if _brief_platforms:
+                logger.warning(
+                    "plan.target_platforms 为空(secretariat 输出疑似被截断),"
+                    "回退到 brief.target_platforms=%s 重建 cells",
+                    _brief_platforms,
+                )
+                platforms = _brief_platforms
 
         def _norm_platform(p) -> str:
             return p if isinstance(p, str) else str(p)
@@ -940,12 +959,13 @@ class PipelineOrchestrator:
             f"target_platforms: {plan.get('target_platforms', [])}"
         )
 
-        active_cells = self._reconstruct_active_cells(plan)
+        active_cells = self._reconstruct_active_cells(plan, brief)
         if not active_cells:
             logger.error(
                 "No active_cells found and could not reconstruct. "
                 f"plan keys: {list(plan.keys())}, "
-                f"matrix_skeleton: {plan.get('matrix_skeleton', 'MISSING')}"
+                f"matrix_skeleton: {plan.get('matrix_skeleton', 'MISSING')}, "
+                f"brief.target_platforms: {(brief or {}).get('target_platforms', 'MISSING')}"
             )
             return []
 
