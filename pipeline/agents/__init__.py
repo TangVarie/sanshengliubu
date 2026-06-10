@@ -651,7 +651,10 @@ class BaseAgent:
     prompt_file: str = ""  # relative to pipeline/prompts/
 
     def __init__(self):
-        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-20250514")
+        # v0.30.12: fallback 用当前可用模型表里最便宜的 (Sonnet 4-6)。
+        # 老 fallback 是带日期后缀的 claude-sonnet-4-20250514,中转 / Vertex
+        # 用户表上不一定能解析。
+        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-6")
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
         # Validate prompt file exists at construction time so we fail fast
         # instead of crashing mid-pipeline after burning tokens on prior stages.
@@ -781,6 +784,17 @@ class BaseAgent:
         # Thinking is enabled for specific strategic stages, not tied to model name.
         # On Vertex: uses adaptive thinking (model decides depth).
         # On relay: uses budget_tokens=10000 as fallback.
+        #
+        # v0.30.12: strategy debate (orchestrator._run_strategy_debate) 临时把
+        # agent.stage_name 改成 "strategy_debate_N" 以区分每轮的 stage_log。
+        # 这副作用让精确匹配的 THINKING_STAGES 检查失效 —— secretariat /
+        # chancellery 在 debate 期间拿不到 thinking。debate 只由这两个逻辑
+        # stage 参与(偶数轮 secretariat、奇数轮 chancellery),两者都在
+        # THINKING_STAGES 里,所以识别这个前缀直接放行 thinking。
+        # (若该轮实际跑 GPT,_call_claude 里会因 _is_gpt_family 跳过 thinking
+        # 注入,这里返回 True 无副作用。)
+        if self.stage_name.startswith("strategy_debate_"):
+            return True
         return self.stage_name in THINKING_STAGES
 
     @staticmethod
@@ -1031,13 +1045,15 @@ class BaseAgent:
             "supports_adaptive_thinking", True
         )
         # Adaptive thinking is an Opus-4.6+ API feature(自 Opus 4.6 起支持,
-        # Opus 4.7 继承)。Match canonical model family prefixes exactly, so
-        # future names like "claude-opus-5-0" don't accidentally match and
-        # we don't cross-match unrelated model names containing those digits.
-        # Sonnet 3.7 不支持 adaptive thinking,会走到 else 分支发 budget_tokens。
+        # Opus 4.7 / 4.8 继承,Sonnet 4.6 同代际)。Match canonical model
+        # family prefixes exactly, so future names like "claude-opus-5-0"
+        # don't accidentally match and we don't cross-match unrelated model
+        # names containing those digits. Sonnet 3.7 不支持 adaptive
+        # thinking,会走到 else 分支发 budget_tokens。
         _is_adaptive_thinking_family = (
             "claude-opus-4-6" in effective_model
             or "claude-opus-4-7" in effective_model
+            or "claude-opus-4-8" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
         # v0.30.0: GPT 模型即使 stage 在 THINKING_STAGES 里也强制不发
