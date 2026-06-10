@@ -1541,9 +1541,23 @@ class BaseAgent:
                 # orchestrator level which marks the run as failed. Runs
                 # BEFORE JSON extraction so a catastrophic reply doesn't also
                 # get billed into a loop.
+                #
+                # v0.30.12: 成本按【实际跑通的模型】actual_model 核算,而不是
+                # 计划的 self.model。no-channel fallback 时(如 opus-4-7 降级到
+                # sonnet-4-6)用 Opus 费率算会让 total_cost_usd 严重偏高。
+                # 若 actual_model 不在价格表(罕见:relay suffix 变体如
+                # claude-opus-4-6-high),退回 self.model 的 base 名查费率
+                # (suffix 变体与 base 同费率);都没有则 _estimate 返回 0
+                # (已有的 unknown-model 行为,运营看到 $0 就知道要补价格表)。
+                _cost_model = actual_model or self.model
+                if (
+                    _cost_model not in COST_PER_1M_INPUT
+                    and _cost_model not in COST_PER_1M_OUTPUT
+                ):
+                    _cost_model = self.model
                 _, _call_cost = _accumulate_run_tokens(
                     run_id,
-                    self.model,
+                    _cost_model,
                     input_tokens,
                     output_tokens,
                     cache_read,
