@@ -1,5 +1,14 @@
 """Gemini 小红书原文取样官 — fetches RAW current posts, no summarization.
 
+.. deprecated::
+    Superseded by pipeline/agents/socialdatax_trend_scout.py, which fetches
+    real XHS content via SocialDataX's first-party MCP instead of reaching
+    XHS through Google Search grounding. The orchestrator now imports
+    ``run_trend_scout`` / ``format_trend_intel_for_prompt`` from that module.
+    This file is retained only for reference / quick rollback (re-point the
+    orchestrator import) and is no longer on any live code path.
+
+
 Used by two pipeline points:
   1. Pre-secretariat (A1): enrich the brief with real trending posts
      so secretariat's strategy is calibrated against actual current

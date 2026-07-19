@@ -530,8 +530,8 @@ for log in stage_logs:
 STAGE_DISPLAY_NAMES = {
     "crown_prince": "太子",
     "gemini_reference_analyzer": "参考帖子·Gemini",
-    "gemini_trend_scout_pre": "趋势取样·Gemini",
-    "gemini_trend_scout_post": "网感对标·Gemini",
+    "gemini_trend_scout_pre": "趋势取样·SocialDataX",
+    "gemini_trend_scout_post": "网感对标·SocialDataX",
     "secretariat": "中书省",
     "chancellery": "门下省",
     "dispatcher": "尚书省",
@@ -986,13 +986,14 @@ with tabs[0]:
     else:
         st.caption("等待执行...")
 
-    # Gemini trend scout (pre-secretariat) — surface the raw posts
-    # that got injected into brief._trend_intel so the user sees
-    # exactly what secretariat received as calibration samples.
+    # Trend scout (pre-secretariat) — surface the raw posts that got
+    # injected into brief._trend_intel so the user sees exactly what
+    # secretariat received as calibration samples. (Data source migrated
+    # to SocialDataX; the stage_log key stays "gemini_trend_scout_pre".)
     ts_log = log_map.get("gemini_trend_scout_pre")
     if ts_log:
         st.divider()
-        st.markdown("**🔭 Gemini 趋势取样（pre-secretariat）**")
+        st.markdown("**🔭 趋势取样 · SocialDataX 直连小红书（pre-secretariat）**")
         render_stage_meta(ts_log)
         ts_status = ts_log.get("status", "pending")
         ts_out = ts_log.get("output_data") or {}
@@ -1000,20 +1001,19 @@ with tabs[0]:
             reason = str(ts_out.get("_skip_reason", "unknown"))
             if "not_configured" in reason:
                 st.warning(
-                    "⚠️ 跳过（Gemini 未配置）——配置好 `VERTEX_EXPRESS_API_KEY` "
-                    "且 `ENABLE_GEMINI_TREND_SCOUT_PRE=True` 后下次生效。"
+                    "⚠️ 跳过（SocialDataX 未配置）——配置好 `SOCIALDATAX_API_KEY` "
+                    "（https://socialdatax.com/?from=npm）且 "
+                    "`ENABLE_SOCIALDATAX_TREND_SCOUT_PRE=True` 后下次生效。"
                 )
             elif "parse_error" in reason:
                 _raw = ts_out.get("_raw_text_preview", "")
                 st.error(
-                    f"❌ Gemini 输出非 JSON，无法解析（`{reason}`）。"
-                    "Google Search grounding 经常让 Gemini 改口用自然语言叙述。"
-                    "下面是它实际返回的前 500 字："
+                    f"❌ 返回无法解析（`{reason}`）。下面是实际返回的前 500 字："
                 )
                 if _raw:
                     st.code(mask_secrets(_raw), language="text")
                 else:
-                    st.caption("（没抓到原文预览，试试 Reboot 或换 GEMINI_MODEL。）")
+                    st.caption("（没抓到原文预览。）")
             else:
                 st.info(f"⏭️ 跳过：`{reason}`")
         elif ts_status == "completed":
@@ -1022,27 +1022,29 @@ with tabs[0]:
             rejected = ts_out.get("_rejected_off_domain_count", 0)
             if posts:
                 st.success(
-                    f"✅ 拉到 {len(posts)} 条小红书原文帖子"
-                    + (f"（过滤掉 {rejected} 条非 xiaohongshu 域名）" if rejected else "")
+                    f"✅ 拉到 {len(posts)} 条小红书真实爆款（按互动量排序）"
                 )
                 for i, p in enumerate(posts, 1):
                     title = p.get("title") or "(无标题)"
                     snippet = p.get("snippet") or ""
                     url = p.get("url", "")
-                    flag = " ⚠️ 疑似分析文" if p.get("_suspect_analysis") else ""
-                    with st.expander(f"#{i} 《{title}》{flag}"):
+                    eng = p.get("engagement_display") or ""
+                    head = f"#{i} 《{title}》" + (f" · {eng}" if eng else "")
+                    with st.expander(head):
+                        if p.get("author"):
+                            st.caption(f"作者：{p['author']}")
                         if snippet:
-                            st.markdown(f"**片段**：{snippet}")
+                            st.markdown(f"**原文开头**：{snippet}")
                         if url:
-                            st.markdown(f"**URL**：[{url}]({url})")
+                            st.markdown(f"**note_url**：[{url}]({url})")
                         if p.get("cover_image_url"):
                             st.image(
                                 p["cover_image_url"],
-                                caption="封面（来自 Google 缩略图）",
+                                caption="小红书封面",
                                 width=200,
                             )
                 if queries:
-                    with st.expander("🔍 Gemini 用到的搜索查询", expanded=False):
+                    with st.expander("🔍 SocialDataX 搜索关键词", expanded=False):
                         for q in queries:
                             st.markdown(f"- `{q}`")
             else:

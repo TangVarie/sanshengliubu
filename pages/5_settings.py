@@ -279,7 +279,6 @@ else:
             _role_descriptions: dict[str, str] = {
                 "critic":              "网感二审（烟火气判断）",
                 "structure_reviewer":  "结构审（system_prompt 完整性）",
-                "trend_scout":         "趋势取样（Google Search grounding）",
                 "image_transcriber":   "图片预转写（Vision）",
                 "screenshot_analyzer": "截图分析（Vision）",
                 "reference_analyzer":  "参考帖 URL 抓取分析",
@@ -439,10 +438,8 @@ GEMINI_ASSIST_STAGES: dict[str, tuple[str, str]] = {
         "reference_analyzer",
         "主判（Gemini-only，url_context 抓用户贴的参考 URL）",
     ),
-    "gemini_trend_scout_pre": (
-        "trend_scout",
-        "主判（Gemini-only，Google 搜小红书原文）",
-    ),
+    # NOTE: trend_scout migrated off Gemini → SocialDataX (first-party XHS).
+    # It no longer runs on Gemini, so it is intentionally absent here.
     "vibe_critic": (
         "critic",
         "二审（Claude 判 pass 的 cell 再过 Gemini）",

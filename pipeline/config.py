@@ -591,26 +591,60 @@ GEMINI_MODEL_OVERRIDES: dict[str, str] = {
     "critic":              "gemini-3.1-pro-preview",
 }
 
-# Trend scout — when True, Gemini runs a live Google Search
-# (site:xiaohongshu.com) in two places:
+# ── SocialDataX trend scout ────────────────────────────────────────────────
+# The trend scout pulls real current 小红书 posts as calibration samples for
+# the copy pipeline. As of this migration it fetches them via SocialDataX's
+# first-party MCP (direct XHS access), replacing the old Gemini +
+# Google-Search-grounding path (which could only reach XHS through Google's
+# thin index, returned copyright-filtered snippets with no engagement data,
+# and was disabled by default). See:
+#   pipeline/agents/socialdatax_client.py
+#   pipeline/agents/socialdatax_trend_scout.py
+#
+# Used in two places:
 #   - PRE: before secretariat, to enrich the brief with real current
-#          post samples (titles + snippets) so strategy is calibrated
-#          against concrete examples, not abstract assumptions.
+#          爆款 samples (原文 + 互动量) so strategy is calibrated against
+#          concrete, currently-viral examples.
 #   - POST: after chancellery_final, per direction, for side-by-side
 #           comparison with our produced demos. Advisory, non-blocking.
-# Costs: Google Search grounding is billed separately by Google
-# (~$35 / 1000 queries). PRE is 1 query/run; POST is 1 query per
-# direction (~5-8/run). Budget ~$0.30 extra per full run.
 #
-# IMPORTANT CONTRACT — scout output is forced to be RAW POSTS ONLY,
-# never trend analysis. See pipeline/prompts/gemini_trend_scout.md +
-# pipeline/agents/gemini_trend_scout.py _FORBIDDEN_SUMMARY_KEYS.
-ENABLE_GEMINI_TREND_SCOUT_PRE = False
-ENABLE_GEMINI_TREND_SCOUT_POST = False
-# How many posts to ask the scout to pull per invocation. Each post is
-# ~150 chars in the output, so 10 is a reasonable default — gives
-# secretariat meaningful calibration without ballooning the prompt.
-GEMINI_TREND_SCOUT_TARGET_COUNT = 10
+# Auth: top-level `SOCIALDATAX_API_KEY` in .streamlit/secrets.toml (request
+# one at https://socialdatax.com/?from=npm). Missing key → scout returns
+# verdict="skipped" and the pipeline proceeds (advisory-only, never blocks).
+#
+# Cost: SocialDataX bills per API call by plan. PRE is ~1 call/run; POST is
+# ~1 call per tactical direction (~5-8/run). Set SOCIALDATAX_COST_PER_CALL_USD
+# to your plan's per-call price to fold it into run cost accounting.
+
+# Master switch for all SocialDataX access (client-level). False → every
+# SocialDataX call short-circuits to SocialDataXNotConfigured.
+ENABLE_SOCIALDATAX = True
+
+# MCP endpoint base. Per-platform URL is f"{base}/{platform}/mcp"
+# (e.g. https://mcp.socialdatax.com/xhs/mcp). Override only if SocialDataX
+# publishes a new host.
+SOCIALDATAX_MCP_BASE = "https://mcp.socialdatax.com"
+
+# Per-call network timeout (seconds). XHS scraping upstream can be slow;
+# 60s is a comfortable ceiling for a single search call.
+SOCIALDATAX_REQUEST_TIMEOUT_SECONDS = 60
+
+# Search sort for the scout. like_count_descending surfaces real 爆款
+# (most-liked first). Other XHS options: general | time_descending |
+# comment_count_descending | collect_count_descending.
+SOCIALDATAX_TREND_SCOUT_SORT = "like_count_descending"
+
+# Per-API-call price in USD for run cost accounting. 0.0 = don't track.
+# Set to your SocialDataX plan's effective per-call cost.
+SOCIALDATAX_COST_PER_CALL_USD = 0.0
+
+# PRE runs on nearly every strategy build (1 call, high value) → default on.
+# It no-ops safely when the key is absent. POST fans out per direction
+# (more calls) → opt-in.
+ENABLE_SOCIALDATAX_TREND_SCOUT_PRE = True
+ENABLE_SOCIALDATAX_TREND_SCOUT_POST = False
+# How many posts to keep per invocation (ranked by real engagement).
+SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10
 
 # Max output tokens per Gemini call. 16K handles 6-cell structure
 # reviews without truncation. Grounding calls auto-bump to 24K (see

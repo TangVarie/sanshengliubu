@@ -18,13 +18,13 @@ from pipeline.config import (
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
     DEFAULT_PLATFORM,
-    ENABLE_GEMINI_TREND_SCOUT_POST,
-    ENABLE_GEMINI_TREND_SCOUT_PRE,
+    ENABLE_SOCIALDATAX_TREND_SCOUT_POST,
+    ENABLE_SOCIALDATAX_TREND_SCOUT_PRE,
     ENABLE_STRUCTURAL_REWRITER,
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
     STRATEGIC_LOOP_MAX_ITERATIONS,
-    GEMINI_TREND_SCOUT_TARGET_COUNT,
+    SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
     MAX_DEBATE_TURNS,
@@ -57,7 +57,7 @@ from pipeline.retrieve_samples import (
     retrieve_reference_packs,
     summarize_packs_by_platform,
 )
-from pipeline.agents.gemini_trend_scout import (
+from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
 )
@@ -2228,31 +2228,28 @@ class PipelineOrchestrator:
         )
 
     async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
-        """A1: pre-secretariat trend scout. Pulls current real Xiaohongshu
-        VIRAL素人 post samples (not product-relevant; just "what's hot
-        right now") via Gemini + Google Search to calibrate downstream
+        """A1: pre-secretariat trend scout. Pulls real current 小红书 爆款
+        via SocialDataX (first-party XHS access) to calibrate downstream
         copy writing against current platform voice. Advisory-only.
 
-        Design note: we deliberately do NOT search product/brand
-        keywords here. Searching "珂润精华液" returns 软广 + 分析 articles
-        that have no素人 vibe at all. Instead we pass the brief's
-        target_audience snippet as a soft "vibe_hints" — the scout's
-        prompt tells Gemini to use it for sorting results (prefer viral
-        posts that feel like they target the same demographic), never
-        as a direct search term. The scout's queries are format-anchored
-        (反差 / 社死 / 身份标签 / reposts on weibo) so what comes back
-        is a set of raw current viral first-sentences we can calibrate
-        against, regardless of topic.
+        Search-keyword note: unlike the old Gemini/Google path — which
+        avoided product terms because Google returned 软广 + 分析 — we now
+        search the product *category* and rank by real 互动量, so topical
+        keywords return relevant AND currently-viral samples. We pass
+        product_category / product_name / target_audience as ordered
+        search-keyword candidates and the scout tries them in order.
+        (Stage-log names keep the historical ``gemini_trend_scout_*`` keys
+        for UI compatibility.)
         """
-        if not ENABLE_GEMINI_TREND_SCOUT_PRE:
+        if not ENABLE_SOCIALDATAX_TREND_SCOUT_PRE:
             return
 
-        # vibe_hints: demographic/audience context used by the scout
-        # only for soft sorting of results. Never searched directly.
-        # We deliberately exclude product_name / product_category /
-        # core_claim — those lead to ads and analysis articles.
+        # Ordered SEARCH-KEYWORD candidates. product_category is the best
+        # topical anchor (relevant + rankable by real engagement);
+        # product_name and target_audience are fallbacks. campaign_objective
+        # is a goal, not a searchable topic, so it is excluded.
         vibe_hints: list[str] = []
-        for k in ("target_audience", "campaign_objective"):
+        for k in ("product_category", "product_name", "target_audience"):
             v = brief.get(k)
             if v and isinstance(v, str) and v.strip():
                 vibe_hints.append(v.strip())
@@ -2260,8 +2257,8 @@ class PipelineOrchestrator:
                 for item in v:
                     if isinstance(item, str) and item.strip():
                         vibe_hints.append(item.strip())
-        # Empty vibe_hints is fine — the scout falls back to generic
-        # "current xhs viral" queries.
+        # Empty candidates is fine — the scout falls back to the platform's
+        # real hot list (xhs) for generic "what's hot now" samples.
 
         platforms = brief.get("target_platforms") or []
         platform = platforms[0] if platforms else DEFAULT_PLATFORM
@@ -2278,7 +2275,7 @@ class PipelineOrchestrator:
             result = await run_trend_scout(
                 vibe_hints=vibe_hints,
                 platform=platform,
-                target_count=GEMINI_TREND_SCOUT_TARGET_COUNT,
+                target_count=SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
             )
         except Exception as e:
             logger.warning(
@@ -2366,13 +2363,14 @@ class PipelineOrchestrator:
         posts — advisory only, no prompt-matrix mutation.
 
         Runs in parallel per direction (bounded concurrency) because
-        each direction is an independent Gemini call.
+        each direction is an independent SocialDataX call.
 
-        Skipped wholesale if ENABLE_GEMINI_TREND_SCOUT_POST=False or
-        Gemini's unavailable. One stage_log per direction so the UI
-        can display status independently.
+        Skipped wholesale if ENABLE_SOCIALDATAX_TREND_SCOUT_POST=False or
+        SocialDataX is unavailable. One stage_log per direction so the UI
+        can display status independently. (Stage-log names keep the
+        historical ``gemini_trend_scout_post_*`` keys for UI compatibility.)
         """
-        if not ENABLE_GEMINI_TREND_SCOUT_POST:
+        if not ENABLE_SOCIALDATAX_TREND_SCOUT_POST:
             return
 
         directions = plan.get("tactical_directions") or []
@@ -2388,7 +2386,7 @@ class PipelineOrchestrator:
         # Target per-direction sample count — keep smaller than pre (10)
         # because we hit this once per direction, and too many samples
         # overwhelm the UI comparison.
-        per_direction_count = min(GEMINI_TREND_SCOUT_TARGET_COUNT, 5)
+        per_direction_count = min(SOCIALDATAX_TREND_SCOUT_TARGET_COUNT, 5)
 
         semaphore = asyncio.Semaphore(TREND_SCOUT_POST_CONCURRENCY)
 
@@ -2397,12 +2395,9 @@ class PipelineOrchestrator:
             d_name = str(direction.get("direction_name", "")).strip()
             if not d_id:
                 return "", {}
-            # vibe_hints = soft context about this direction's flavor.
-            # Like the pre-scout, the scout prompt will NOT search these
-            # directly — it uses them to sort results among viral-format
-            # query returns. direction_name + paradigm tells Gemini
-            # "among all current viral xhs posts, prefer ones that
-            # match this particular flavor" without hard-filtering.
+            # SEARCH-KEYWORD candidates for this direction. direction_name
+            # is the topical theme; the paradigm label adds a flavor term.
+            # The scout searches them in order and ranks by real engagement.
             vibe_hints: list[str] = []
             if d_name:
                 vibe_hints.append(d_name)
