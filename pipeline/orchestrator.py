@@ -377,10 +377,12 @@ class PipelineOrchestrator:
             # Advisory-only.
             await self._run_gemini_reference_analyzer(structured_brief)
 
-            # 1b. Gemini 趋势取样（advisory, A1）— 在策略规划之前拉一批当前
-            # 平台的真实帖子（标题 + snippet 原文），注入到 structured_brief
+            # 1b. 趋势取样（SocialDataX, A1）— 在策略规划之前拉一批当前
+            # 平台的真实爆款（原文 + 互动量），注入到 structured_brief
             # 的 _trend_intel 字段。这些是**原文样本**不是趋势分析。
-            # 失败时跳过不阻塞。
+            # ⚠️ REQUIRED 默认开:取样失败且无可复用数据时抛
+            # TrendScoutRequiredError 提前终止 run(fail-fast,见
+            # SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED)。
             await self._run_gemini_trend_scout_pre(structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
@@ -2231,7 +2233,15 @@ class PipelineOrchestrator:
     async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
         """A1: pre-secretariat trend scout. Pulls real current 小红书 爆款
         via SocialDataX (first-party XHS access) to calibrate downstream
-        copy writing against current platform voice. Advisory-only.
+        copy writing against current platform voice.
+
+        NOT advisory by default: under SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
+        (=True), a scout failure with no reusable _trend_intel raises
+        TrendScoutRequiredError and fails the run — fail-fast at the cost
+        of only the 太子 stage beats silently producing an uncalibrated
+        run. Deterministic non-fixable cases (unsupported platform,
+        keyword-less brief with no hot-list fallback) and reuse-eligible
+        resumes stay non-blocking.
 
         Search-keyword note: unlike the old Gemini/Google path — which
         avoided product terms because Google returned 软广 + 分析 — we now
@@ -2308,56 +2318,49 @@ class PipelineOrchestrator:
                 or result.get("_not_found_reason")
                 or verdict
             )
-            skip_output = {
-                "_skip_reason": reason,
-                "queries_used": result.get("queries_used", []),
-                "_raw_text_preview": result.get("_raw_text_preview", ""),
-                "_gemini_usage": usage,
-            }
             tokens = int(usage.get("input_tokens", 0)) + int(
                 usage.get("output_tokens", 0)
             )
 
-            # (a) Reuse guard — a revision/resume may already carry usable
-            # calibration posts from a previous successful attempt. A fresh
-            # fetch failing must not discard them or kill the run.
-            existing_posts = (brief.get("_trend_intel") or {}).get(
-                "posts"
-            ) or []
-            if existing_posts:
-                skip_output["_skip_reason"] = (
-                    f"reused_existing_trend_intel ({reason})"
+            # Reuse guard — a resume/revision may already have usable
+            # calibration posts from a previous successful attempt. NOTE:
+            # on resume `brief` is done["crown_prince"] (the stage-log
+            # output), which never carries _trend_intel — the persisted
+            # copy lives on project.brief (written below on success), so
+            # read it from there. A fresh fetch failing must not discard
+            # existing data or kill the run.
+            existing_intel = (brief.get("_trend_intel") or {})
+            if not existing_intel.get("posts"):
+                _project = self.db.get_project(self.project_id) or {}
+                existing_intel = (
+                    (_project.get("brief") or {}).get("_trend_intel") or {}
                 )
-                self.db.update_stage_log(
-                    log_id,
-                    status="skipped",
-                    output_data=skip_output,
-                    tokens_used=tokens,
-                    model_used=usage.get("model"),
-                )
-                logger.info(
-                    "[trend_scout pre] fresh fetch failed (%s) — reusing "
-                    "%d existing _trend_intel posts",
-                    reason,
-                    len(existing_posts),
-                )
-                return
+            existing_posts = existing_intel.get("posts") or []
+            reuse = bool(existing_posts)
+            if reuse:
+                # Re-attach so secretariat sees the previous posts even
+                # though this brief instance (stage-log copy) lacked them.
+                brief["_trend_intel"] = existing_intel
+                reason = f"reused_existing_trend_intel ({reason})"
 
-            # (b) REQUIRED / fail-fast — missing calibration data skews the
-            # whole downstream strategy; failing here costs only the 太子
+            # REQUIRED / fail-fast — missing calibration data skews the
+            # whole downstream strategy; failing at A1 costs only the 太子
             # stage instead of a full uncalibrated run + rerun. Platforms
-            # SocialDataX can't serve at all stay advisory (nothing the
-            # user can fix by retrying).
-            unsupported = reason.startswith("unsupported_platform")
-            if SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED and not unsupported:
-                self.db.update_stage_log(
-                    log_id,
-                    status="failed",
-                    output_data=skip_output,
-                    tokens_used=tokens,
-                    model_used=usage.get("model"),
-                )
-                raise TrendScoutRequiredError(
+            # SocialDataX can't serve at all, and keyword-less briefs on
+            # platforms without a hot-list fallback, stay advisory —
+            # retrying can never fix those.
+            deterministic = reason.startswith(
+                ("unsupported_platform", "no_search_keywords")
+            )
+            required_fail = (
+                SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
+                and not reuse
+                and not deterministic
+            )
+
+            error_message = None
+            if required_fail:
+                error_message = (
                     f"趋势取样(SocialDataX)未能拿到校准样本：{reason}。"
                     f"该阶段是策略校准的关键输入,缺失会导致全程产出跑偏,"
                     f"故按 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True 提前终止"
@@ -2369,15 +2372,31 @@ class PipelineOrchestrator:
                     f"SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED 设为 False。"
                 )
 
-            # (c) Advisory — legacy behavior: log skip, proceed.
             self.db.update_stage_log(
                 log_id,
-                status="skipped",
-                output_data=skip_output,
+                status="failed" if required_fail else "skipped",
+                output_data={
+                    "_skip_reason": reason,
+                    "queries_used": result.get("queries_used", []),
+                    "_partial_failures": result.get(
+                        "_partial_failures", []
+                    ),
+                    "_raw_keys_sample": result.get("_raw_keys_sample", []),
+                    "_gemini_usage": usage,
+                },
                 tokens_used=tokens,
                 model_used=usage.get("model"),
+                # error_message is the channel pages/3's
+                # render_stage_error actually displays — without it a
+                # failed stage renders as "error_message 为空,请查看
+                # 服务端日志", unreachable on Streamlit Cloud.
+                error_message=error_message,
             )
-            logger.info("[trend_scout pre] skipped: %s", reason)
+            if required_fail:
+                raise TrendScoutRequiredError(error_message)
+            logger.info("[trend_scout pre] %s: %s",
+                        "reusing previous posts" if reuse else "skipped",
+                        reason)
             return
 
         # Inject raw posts into brief so secretariat sees them. Store
@@ -2399,10 +2418,15 @@ class PipelineOrchestrator:
                 "posts": result.get("posts", []),
                 "queries_used": result.get("queries_used", []),
                 "grounding_urls": result.get("grounding_urls", []),
-                "_rejected_off_domain_count": result.get(
-                    "_rejected_off_domain_count", 0
+                "_partial_failures": result.get("_partial_failures", []),
+                # Observability for the tolerant field mapping: whether
+                # engagement counts resolved (False → ranking degraded to
+                # API order) and the first raw note's keys so the mapping
+                # can be pinned from the UI without server-log access.
+                "_engagement_resolved": result.get(
+                    "_engagement_resolved", True
                 ),
-                "_not_found_reason": result.get("_not_found_reason"),
+                "_raw_keys_sample": result.get("_raw_keys_sample", []),
             },
             model_used=usage.get("model"),
             tokens_used=int(usage.get("input_tokens", 0))

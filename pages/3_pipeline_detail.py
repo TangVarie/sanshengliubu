@@ -1277,7 +1277,7 @@ with tabs[4]:
                             else:
                                 st.caption(
                                     "（没抓到原文预览——可能响应完全空，"
-                                    "换个 `GEMINI_MODEL` 或关掉 `ENABLE_GEMINI_TREND_SCOUT_*` 试试。）"
+                                    "换个 `GEMINI_MODEL` 试试。）"
                                 )
                         else:
                             st.info(f"⏭️ 跳过：`{reason}`")

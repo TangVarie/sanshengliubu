@@ -26,22 +26,32 @@ We speak it from Python with the official ``mcp`` SDK's
 ``streamablehttp_client`` — pure Python, no Node runtime required in the
 deploy environment (Streamlit Cloud).
 
-Failure semantics (advisory-only, identical to the Gemini agents)
------------------------------------------------------------------
-Missing key / disabled  → :class:`SocialDataXNotConfigured`
-API / network / protocol error → :class:`SocialDataXCallFailed`
+Use :func:`open_session` when making several calls to the same platform
+(one TCP+TLS connect + MCP initialize handshake for the whole batch);
+:func:`call_tool` is the one-shot convenience wrapper.
 
-Callers catch both, log a warning, and let the pipeline proceed. Nothing
-here is ever allowed to block a run.
+Failure semantics
+-----------------
+Missing key / disabled / mcp SDK absent → :class:`SocialDataXNotConfigured`
+API / network / protocol error (after bounded transient retries)
+→ :class:`SocialDataXCallFailed`
+
+This client only ever raises these two typed exceptions — POLICY lives in
+the caller: the orchestrator's POST scout treats them as advisory (skip and
+proceed), while the PRE scout may escalate to a fail-fast run abort under
+``SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED`` (missing calibration data skews
+the whole strategy; see pipeline/config.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Any
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from pipeline.config import (
     ENABLE_SOCIALDATAX,
@@ -58,7 +68,21 @@ _PRIMARY_KEY_NAME = "SOCIALDATAX_API_KEY"
 _LEGACY_KEY_NAME = "SOCIAL_MEDIA_MCP_API_KEY"
 _KEY_NAMES = (_PRIMARY_KEY_NAME, _LEGACY_KEY_NAME)
 
+# Bounded transient retry: attempts = 1 initial + _TRANSIENT_RETRIES.
+# Matters because the PRE scout can run under REQUIRED/fail-fast — a
+# single transient 429/5xx must not kill a whole pipeline run.
+_TRANSIENT_RETRIES = 2
+_TRANSIENT_BACKOFF_SECONDS = (1.0, 2.0)
+_TRANSIENT_MARKERS = (
+    "429", "rate limit", "too many request",
+    "502", "503", "504", "bad gateway", "service unavailable",
+    "gateway timeout", "timed out", "timeout",
+    "connection reset", "connection refused", "connection error",
+    "temporarily", "eof occurred", "broken pipe",
+)
+
 # Human-facing platform label → SocialDataX MCP platform id (URL segment).
+# All ASCII keys lowercase; CJK keys are unaffected by .lower().
 PLATFORM_ID_MAP = {
     "小红书": "xhs",
     "xhs": "xhs",
@@ -81,15 +105,12 @@ PLATFORM_ID_MAP = {
 class SocialDataXNotConfigured(RuntimeError):
     """Raised when a SocialDataX call is requested but the backend isn't
     usable (feature disabled, missing API key, ``mcp`` SDK not installed).
-    Callers treat this as advisory — the pipeline continues without
-    SocialDataX input.
     """
 
 
 class SocialDataXCallFailed(RuntimeError):
     """Raised when a SocialDataX MCP call errors (auth, quota, network,
-    protocol, tool-level error). Callers catch → log warn → proceed.
-    Never propagated to the top-level run.
+    protocol, tool-level error) after bounded transient retries.
     """
 
 
@@ -98,11 +119,7 @@ def resolve_platform_id(platform: str | None) -> str | None:
     MCP platform id ('xhs', 'douyin', …). Returns None if unsupported."""
     if not platform:
         return None
-    key = str(platform).strip().lower()
-    # exact (covers CJK labels which .lower() leaves unchanged)
-    if platform.strip() in PLATFORM_ID_MAP:
-        return PLATFORM_ID_MAP[platform.strip()]
-    return PLATFORM_ID_MAP.get(key)
+    return PLATFORM_ID_MAP.get(str(platform).strip().lower())
 
 
 def _resolve_api_key() -> str:
@@ -141,7 +158,8 @@ def _resolve_api_key() -> str:
 def is_available() -> bool:
     """Quick predicate: is SocialDataX usable at all? Checks the feature
     flag, the ``mcp`` SDK import, and key presence. Does NOT verify
-    connectivity — a call can still fail at request time."""
+    connectivity — a call can still fail at request time. Used by the
+    settings page to render configuration status."""
     if not ENABLE_SOCIALDATAX:
         return False
     try:
@@ -177,22 +195,54 @@ def _extract_text_content(content: Any) -> str:
     return "\n".join(parts)
 
 
-async def call_tool(
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+def _unwrap_result(platform_id: str, tool: str, result: Any) -> Any:
+    """Shared result unwrapping for session and one-shot paths."""
+    if getattr(result, "isError", False):
+        msg = _extract_text_content(getattr(result, "content", None))
+        raise SocialDataXCallFailed(
+            f"{platform_id}/{tool} returned an error: "
+            f"{mask_secrets(msg) or 'unknown tool error'}"
+        )
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
+    # Fallback: some tools may only return text content — parse JSON out.
+    text = _extract_text_content(getattr(result, "content", None))
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        # Return the raw text so the caller can decide; scouts treat a
+        # non-dict/list payload as "no usable data".
+        return {"_raw_text": text}
+
+
+# A bound session call: (tool, arguments) -> structured payload.
+SessionCall = Callable[[str, dict[str, Any] | None], Awaitable[Any]]
+
+
+@asynccontextmanager
+async def open_session(
     platform_id: str,
-    tool: str,
-    arguments: dict[str, Any] | None = None,
     *,
     timeout_seconds: float | None = None,
-) -> Any:
-    """Call one SocialDataX MCP tool and return its structured payload.
+) -> AsyncIterator[SessionCall]:
+    """Open ONE MCP session to a platform endpoint and yield a bound
+    ``call(tool, arguments)`` coroutine. All calls through it share a
+    single TCP+TLS connection and a single MCP initialize handshake —
+    use this whenever making more than one call (the trend scout's
+    hot-list + N keyword searches, for example).
 
-    Returns ``result.structuredContent`` when the server provides it
-    (the normal case for these tools), else the JSON parsed out of the
-    text content blocks. The shape of the payload is platform/tool
-    specific and is normalized by the calling scout, not here.
-
-    Raises SocialDataXNotConfigured / SocialDataXCallFailed only; both are
-    advisory (see module docstring).
+    Each yielded call retries transient failures (429/5xx/timeouts) with
+    bounded backoff before raising SocialDataXCallFailed. Session-level
+    connect/initialize errors raise SocialDataXCallFailed from the
+    context manager itself.
     """
     if not ENABLE_SOCIALDATAX:
         raise SocialDataXNotConfigured(
@@ -204,66 +254,111 @@ async def call_tool(
         from mcp.client.streamable_http import streamablehttp_client
     except Exception as e:  # ImportError or transitive failure
         raise SocialDataXNotConfigured(
-            f"mcp SDK not installed (pip install 'mcp>=1.9,<2.0'). "
+            f"mcp SDK not installed (pip install 'mcp>=1.9.4,<2.0'). "
             f"Import error: {e}"
         )
 
     api_key = _resolve_api_key()  # raises SocialDataXNotConfigured
     url = _endpoint_for(platform_id)
     headers = {"Authorization": f"Bearer {api_key}"}
-    timeout = float(
-        timeout_seconds
-        if timeout_seconds is not None
-        else SOCIALDATAX_REQUEST_TIMEOUT_SECONDS
-    )
-    args = dict(arguments or {})
-
-    logger.debug(
-        "[socialdatax] call %s/%s args=%s",
-        platform_id,
-        tool,
-        mask_secrets(json.dumps(args, ensure_ascii=False)),
+    # timedelta works on every mcp version; bare floats crash mcp
+    # 1.9.0-1.9.3 (their transport does `timeout.seconds`).
+    timeout_td = timedelta(
+        seconds=float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else SOCIALDATAX_REQUEST_TIMEOUT_SECONDS
+        )
     )
 
     try:
         async with streamablehttp_client(
             url,
             headers=headers,
-            timeout=timeout,
-            sse_read_timeout=timeout,
+            timeout=timeout_td,
+            sse_read_timeout=timeout_td,
         ) as (read_stream, write_stream, _get_session_id):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-                result = await session.call_tool(
-                    tool,
-                    args,
-                    read_timeout_seconds=timedelta(seconds=timeout),
-                )
-    except SocialDataXNotConfigured:
+
+                async def _call(
+                    tool: str, arguments: dict[str, Any] | None = None
+                ) -> Any:
+                    args = dict(arguments or {})
+                    logger.debug(
+                        "[socialdatax] call %s/%s args=%s",
+                        platform_id,
+                        tool,
+                        mask_secrets(json.dumps(args, ensure_ascii=False)),
+                    )
+                    last_exc: Exception | None = None
+                    for attempt in range(1 + _TRANSIENT_RETRIES):
+                        try:
+                            result = await session.call_tool(
+                                tool,
+                                args,
+                                read_timeout_seconds=timeout_td,
+                            )
+                            return _unwrap_result(platform_id, tool, result)
+                        except SocialDataXCallFailed:
+                            raise  # tool-level error — not transient
+                        except Exception as e:
+                            last_exc = e
+                            if (
+                                attempt < _TRANSIENT_RETRIES
+                                and _is_transient(e)
+                            ):
+                                delay = _TRANSIENT_BACKOFF_SECONDS[
+                                    min(
+                                        attempt,
+                                        len(_TRANSIENT_BACKOFF_SECONDS) - 1,
+                                    )
+                                ]
+                                logger.warning(
+                                    "[socialdatax] transient error on "
+                                    "%s/%s (attempt %d/%d), retrying in "
+                                    "%.0fs: %s",
+                                    platform_id,
+                                    tool,
+                                    attempt + 1,
+                                    1 + _TRANSIENT_RETRIES,
+                                    delay,
+                                    mask_secrets(str(e)),
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            break
+                    raise SocialDataXCallFailed(
+                        f"{platform_id}/{tool} call failed: "
+                        f"{mask_secrets(str(last_exc))}"
+                    ) from last_exc
+
+                yield _call
+    except (SocialDataXNotConfigured, SocialDataXCallFailed):
         raise
     except Exception as e:
+        # Connect / initialize / teardown failure.
         raise SocialDataXCallFailed(
-            f"{platform_id}/{tool} call failed: {mask_secrets(str(e))}"
+            f"{platform_id} session failed: {mask_secrets(str(e))}"
         ) from e
 
-    if getattr(result, "isError", False):
-        msg = _extract_text_content(getattr(result, "content", None))
-        raise SocialDataXCallFailed(
-            f"{platform_id}/{tool} returned an error: "
-            f"{mask_secrets(msg) or 'unknown tool error'}"
-        )
 
-    structured = getattr(result, "structuredContent", None)
-    if structured is not None:
-        return structured
+async def call_tool(
+    platform_id: str,
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    timeout_seconds: float | None = None,
+) -> Any:
+    """One-shot convenience wrapper: open a session, make a single tool
+    call, tear down. For multiple calls to the same platform use
+    :func:`open_session` instead (one handshake for the batch).
 
-    # Fallback: some tools may only return text content — parse JSON out.
-    text = _extract_text_content(getattr(result, "content", None))
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        # Return the raw text so the caller can decide; scouts treat a
-        # non-dict/list payload as "no usable data".
-        return {"_raw_text": text}
+    Returns ``result.structuredContent`` when the server provides it,
+    else the JSON parsed out of the text content blocks. Raises
+    SocialDataXNotConfigured / SocialDataXCallFailed only.
+    """
+    async with open_session(
+        platform_id, timeout_seconds=timeout_seconds
+    ) as call:
+        return await call(tool, arguments)
