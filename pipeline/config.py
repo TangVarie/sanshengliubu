@@ -568,10 +568,8 @@ GEMINI_MODEL = "gemini-3.1-pro-preview"
 #       Flash wins outright on multimodal understanding → Flash.
 #   - Structural checklist (structure_reviewer):
 #       Agentic-style task, Flash wins on agentic benchmarks → Flash.
-#   - Search-grounded scout (trend_scout):
-#       Quality dominated by Google Search grounding (billed separately
-#       at ~$35/1k queries); model cost is small fraction → Flash for
-#       speed + savings.
+#   - (trend_scout used to live here; it migrated off Gemini to
+#     SocialDataX first-party data and no longer resolves a Gemini model.)
 #   - Long-content URL reading (reference_analyzer):
 #       Posts can be long, dense recall matters → keep Pro.
 #   - "网感" / "烟火气" critic (critic):
@@ -586,7 +584,6 @@ GEMINI_MODEL_OVERRIDES: dict[str, str] = {
     "image_transcriber":   "gemini-3.5-flash",
     "screenshot_analyzer": "gemini-3.5-flash",
     "structure_reviewer":  "gemini-3.5-flash",
-    "trend_scout":         "gemini-3.5-flash",
     "reference_analyzer":  "gemini-3.1-pro-preview",
     "critic":              "gemini-3.1-pro-preview",
 }
@@ -639,10 +636,24 @@ SOCIALDATAX_TREND_SCOUT_SORT = "like_count_descending"
 SOCIALDATAX_COST_PER_CALL_USD = 0.0
 
 # PRE runs on nearly every strategy build (1 call, high value) → default on.
-# It no-ops safely when the key is absent. POST fans out per direction
-# (more calls) → opt-in.
+# POST fans out per direction (more calls) → opt-in.
 ENABLE_SOCIALDATAX_TREND_SCOUT_PRE = True
 ENABLE_SOCIALDATAX_TREND_SCOUT_POST = False
+
+# Failure policy for PRE. True (default) = REQUIRED / fail-fast: when PRE
+# is enabled and the scout can't deliver calibration posts (missing key,
+# call failure, zero results), the run STOPS right there with a clear
+# error. Rationale: A1 runs before secretariat, so failing here costs only
+# the 太子 stage — whereas silently proceeding without calibration data
+# skews the whole strategy and forces a full (expensive) rerun. Two
+# exceptions never block: (1) the target platform isn't supported by
+# SocialDataX at all, and (2) a revision/resume where the brief already
+# carries usable _trend_intel from a previous attempt (reused instead).
+# Set False to restore pure advisory behavior (skip + proceed).
+# POST is ALWAYS advisory — it runs after all content is produced, so a
+# failure there only loses the side-by-side references, never the output.
+SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED = True
+
 # How many posts to keep per invocation (ranked by real engagement).
 SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10
 
@@ -764,12 +775,14 @@ PIPELINE_STAGES = [
     # xiaohongshu post URLs via url_context — higher-signal than
     # keyword search because the user directly picked the references.
     ("gemini_reference_analyzer", "参考帖子·Gemini", "🔗"),
-    # Advisory-only (Gemini). Skipped if Gemini isn't configured.
-    # Pulls real current Xiaohongshu post samples via Google Search
-    # (site:xiaohongshu.com), injects raw titles + snippets into
-    # brief._trend_intel so secretariat's strategy is calibrated
-    # against concrete current examples, not abstract guesses.
-    ("gemini_trend_scout_pre", "趋势取样·Gemini", "🔭"),
+    # SocialDataX first-party trend sampling. Pulls real current 小红书
+    # 爆款 (原文 + 互动量, engagement-ranked) and injects them into
+    # brief._trend_intel so secretariat's strategy is calibrated against
+    # concrete current examples, not abstract guesses. REQUIRED by
+    # default (SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED) — fail-fast beats
+    # silently producing an uncalibrated run. Stage key keeps the
+    # historical "gemini_" prefix for stage-log/UI compatibility.
+    ("gemini_trend_scout_pre", "趋势取样·SocialDataX", "🔭"),
     ("secretariat", "中书省", "📜"),
     ("chancellery", "门下省", "🔍"),
     ("dispatcher", "尚书省", "📋"),

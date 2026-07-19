@@ -999,7 +999,12 @@ with tabs[0]:
         ts_out = ts_log.get("output_data") or {}
         if ts_status == "skipped":
             reason = str(ts_out.get("_skip_reason", "unknown"))
-            if "not_configured" in reason:
+            if "reused_existing_trend_intel" in reason:
+                st.info(
+                    "♻️ 本次取样未成功,已沿用上一次成功拉取的 _trend_intel "
+                    f"校准样本继续(`{reason}`)。"
+                )
+            elif "not_configured" in reason:
                 st.warning(
                     "⚠️ 跳过（SocialDataX 未配置）——配置好 `SOCIALDATAX_API_KEY` "
                     "（https://socialdatax.com/?from=npm）且 "
@@ -1019,7 +1024,6 @@ with tabs[0]:
         elif ts_status == "completed":
             posts = ts_out.get("posts") or []
             queries = ts_out.get("queries_used") or []
-            rejected = ts_out.get("_rejected_off_domain_count", 0)
             if posts:
                 st.success(
                     f"✅ 拉到 {len(posts)} 条小红书真实爆款（按互动量排序）"

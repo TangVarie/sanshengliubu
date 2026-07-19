@@ -51,17 +51,44 @@ from pipeline.config import (
 
 logger = logging.getLogger(__name__)
 
-# Per-platform keyword-search tool + whether it accepts an XHS-style
-# sort_type. Keyword argument is `keyword` on every platform (verified
-# against socialdatax-skills v0.2.30 cli.mjs).
+# Per-platform keyword-search tool + the sort_type values that platform
+# actually accepts (verified against socialdatax-skills v0.2.30 cli.mjs —
+# they differ per platform, e.g. WeChat Channels has no
+# like_count_descending). "default_sort" is each platform's best
+# engagement-ranked option, used when the configured sort isn't in the
+# platform's allowed set. Keyword argument is `keyword` everywhere.
 _SEARCH_SPEC: dict[str, dict[str, Any]] = {
-    "xhs": {"tool": "xhs_search_notes", "sort": True,
-            "hot_tool": "xhs_get_search_hot_list"},
-    "douyin": {"tool": "douyin_search_videos", "sort": True, "hot_tool": None},
-    "kuaishou": {"tool": "kuaishou_search_videos", "sort": False,
-                 "hot_tool": None},
-    "weibo": {"tool": "weibo_search_posts", "sort": False, "hot_tool": None},
-    "wechat": {"tool": "wechat_search_videos", "sort": True, "hot_tool": None},
+    "xhs": {
+        "tool": "xhs_search_notes",
+        "hot_tool": "xhs_get_search_hot_list",
+        "sorts": ("general", "time_descending", "like_count_descending",
+                  "comment_count_descending", "collect_count_descending"),
+        "default_sort": "like_count_descending",
+    },
+    "douyin": {
+        "tool": "douyin_search_videos",
+        "hot_tool": None,
+        "sorts": ("general", "time_descending", "like_count_descending"),
+        "default_sort": "like_count_descending",
+    },
+    "kuaishou": {  # keyword + page_token only — no sort argument
+        "tool": "kuaishou_search_videos",
+        "hot_tool": None,
+        "sorts": (),
+        "default_sort": None,
+    },
+    "weibo": {  # keyword + page_token only — no sort argument
+        "tool": "weibo_search_posts",
+        "hot_tool": None,
+        "sorts": (),
+        "default_sort": None,
+    },
+    "wechat": {
+        "tool": "wechat_search_videos",
+        "hot_tool": None,
+        "sorts": ("all", "time_descending", "collect_count_descending"),
+        "default_sort": "collect_count_descending",
+    },
 }
 
 # Field-name candidates. The exact SocialDataX response field names are not
@@ -306,8 +333,15 @@ def _build_search_arguments(
     platform_id: str, keyword: str, spec: dict
 ) -> dict[str, Any]:
     args: dict[str, Any] = {"keyword": keyword}
-    if spec.get("sort") and SOCIALDATAX_TREND_SCOUT_SORT:
-        args["sort_type"] = SOCIALDATAX_TREND_SCOUT_SORT
+    allowed = spec.get("sorts") or ()
+    if allowed:
+        configured = str(SOCIALDATAX_TREND_SCOUT_SORT or "").strip()
+        # Use the configured sort only where the platform accepts it;
+        # otherwise fall back to that platform's engagement-ranked default
+        # (e.g. WeChat Channels has no like_count_descending).
+        args["sort_type"] = (
+            configured if configured in allowed else spec["default_sort"]
+        )
     return args
 
 

@@ -24,6 +24,7 @@ from pipeline.config import (
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
     STRATEGIC_LOOP_MAX_ITERATIONS,
+    SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
     SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
@@ -2278,15 +2279,17 @@ class PipelineOrchestrator:
                 target_count=SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
             )
         except Exception as e:
+            # Fold unexpected exceptions into the normal skipped-result
+            # path so the REQUIRED policy below sees them too.
             logger.warning(
-                "[trend_scout pre] unexpected exception, skipping: %r", e
+                "[trend_scout pre] unexpected exception: %r", e
             )
-            self.db.update_stage_log(
-                log_id,
-                status="skipped",
-                output_data={"_skip_reason": f"unexpected_exception: {e}"},
-            )
-            return
+            result = {
+                "verdict": "skipped",
+                "posts": [],
+                "queries_used": [],
+                "_skip_reason": f"unexpected_exception: {e}",
+            }
 
         usage = result.get("_gemini_usage") or {}
         if usage:
@@ -2299,24 +2302,82 @@ class PipelineOrchestrator:
             )
 
         verdict = result.get("verdict", "skipped")
-        if verdict == "skipped":
+        if verdict != "all_pass":
+            reason = str(
+                result.get("_skip_reason")
+                or result.get("_not_found_reason")
+                or verdict
+            )
+            skip_output = {
+                "_skip_reason": reason,
+                "queries_used": result.get("queries_used", []),
+                "_raw_text_preview": result.get("_raw_text_preview", ""),
+                "_gemini_usage": usage,
+            }
+            tokens = int(usage.get("input_tokens", 0)) + int(
+                usage.get("output_tokens", 0)
+            )
+
+            # (a) Reuse guard — a revision/resume may already carry usable
+            # calibration posts from a previous successful attempt. A fresh
+            # fetch failing must not discard them or kill the run.
+            existing_posts = (brief.get("_trend_intel") or {}).get(
+                "posts"
+            ) or []
+            if existing_posts:
+                skip_output["_skip_reason"] = (
+                    f"reused_existing_trend_intel ({reason})"
+                )
+                self.db.update_stage_log(
+                    log_id,
+                    status="skipped",
+                    output_data=skip_output,
+                    tokens_used=tokens,
+                    model_used=usage.get("model"),
+                )
+                logger.info(
+                    "[trend_scout pre] fresh fetch failed (%s) — reusing "
+                    "%d existing _trend_intel posts",
+                    reason,
+                    len(existing_posts),
+                )
+                return
+
+            # (b) REQUIRED / fail-fast — missing calibration data skews the
+            # whole downstream strategy; failing here costs only the 太子
+            # stage instead of a full uncalibrated run + rerun. Platforms
+            # SocialDataX can't serve at all stay advisory (nothing the
+            # user can fix by retrying).
+            unsupported = reason.startswith("unsupported_platform")
+            if SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED and not unsupported:
+                self.db.update_stage_log(
+                    log_id,
+                    status="failed",
+                    output_data=skip_output,
+                    tokens_used=tokens,
+                    model_used=usage.get("model"),
+                )
+                raise TrendScoutRequiredError(
+                    f"趋势取样(SocialDataX)未能拿到校准样本：{reason}。"
+                    f"该阶段是策略校准的关键输入,缺失会导致全程产出跑偏,"
+                    f"故按 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True 提前终止"
+                    f"(此时只消耗了太子阶段)。修复方式:"
+                    f"① 配置 .streamlit/secrets.toml 顶层 SOCIALDATAX_API_KEY"
+                    f"(https://socialdatax.com/?from=npm);"
+                    f"② 网络/配额问题请重试;"
+                    f"③ 若想跳过取样直接跑,把 pipeline/config.py 的 "
+                    f"SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED 设为 False。"
+                )
+
+            # (c) Advisory — legacy behavior: log skip, proceed.
             self.db.update_stage_log(
                 log_id,
                 status="skipped",
-                output_data={
-                    "_skip_reason": result.get("_skip_reason", "unknown"),
-                    "queries_used": result.get("queries_used", []),
-                    "_raw_text_preview": result.get("_raw_text_preview", ""),
-                    "_gemini_usage": usage,
-                },
-                tokens_used=int(usage.get("input_tokens", 0))
-                + int(usage.get("output_tokens", 0)),
+                output_data=skip_output,
+                tokens_used=tokens,
                 model_used=usage.get("model"),
             )
-            logger.info(
-                "[trend_scout pre] skipped: %s",
-                result.get("_skip_reason", "unknown"),
-            )
+            logger.info("[trend_scout pre] skipped: %s", reason)
             return
 
         # Inject raw posts into brief so secretariat sees them. Store
@@ -3508,6 +3569,17 @@ class PipelineOrchestrator:
                 "[consumer_sim] all %d cells passed 2nd-level consumer check",
                 len(prompt_cells),
             )
+
+
+class TrendScoutRequiredError(RuntimeError):
+    """Raised by _run_gemini_trend_scout_pre when
+    SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True and the scout can't deliver
+    calibration posts (and the brief has none to reuse). Propagates to
+    run()'s top-level handler, which marks the run failed — a deliberate
+    fail-fast: at that point only the 太子 stage has been paid for, whereas
+    silently proceeding without calibration data skews the whole strategy
+    and forces a full rerun.
+    """
 
 
 class PipelineAlreadyRunningError(RuntimeError):
