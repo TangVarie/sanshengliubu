@@ -98,10 +98,20 @@ class SupabaseClient:
         resp = self.client.table("projects").select("*").eq("id", project_id).single().execute()
         return resp.data
 
-    def list_projects(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def list_projects(
+        self, limit: int = 50, offset: int = 0, light: bool = False
+    ) -> list[dict]:
+        # light=True selects only the columns the dashboard renders — avoids
+        # dragging every project's full free_text / brief (which can carry
+        # base64 screenshots, hundreds of KB each) across the wire just to
+        # show name + status. Big win when the list refreshes on every load.
+        cols = (
+            "id, name, status, task_type, created_at"
+            if light else "*"
+        )
         resp = (
             self.client.table("projects")
-            .select("*")
+            .select(cols)
             .order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
@@ -310,6 +320,20 @@ class SupabaseClient:
                     _time.sleep(0.5)
                     continue
                 raise
+
+    def get_stage_statuses(self, run_id: str) -> list[dict]:
+        """Ultra-light status poll: only the columns needed for the progress
+        row + liveness (NO output_data). Used by the auto-refresh watcher so
+        the 3-second poll doesn't drag the full stage payload (matrix / posts
+        / cell plans — hundreds of KB) across the wire every tick."""
+        resp = (
+            self.client.table("stage_logs")
+            .select("id, stage_name, status, updated_at, created_at")
+            .eq("run_id", run_id)
+            .order("created_at")
+            .execute()
+        )
+        return resp.data or []
 
     def get_stage_log_by_id(self, log_id: str) -> dict | None:
         resp = self.client.table("stage_logs").select("*").eq("id", log_id).execute()

@@ -33,7 +33,7 @@ TASK_TYPE_LABEL = {
 
 try:
     db = SupabaseClient.get_instance()
-    projects = db.list_projects(limit=50)
+    projects = db.list_projects(limit=50, light=True)
 
     if not projects:
         st.info("暂无项目，点击左侧「新建项目」开始。")

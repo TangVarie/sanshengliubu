@@ -2003,16 +2003,70 @@ with c3:
             st.session_state[_actions_busy_key] = False
             st.error(f"重跑失败：{_err}")
 
-# Auto-refresh when running or paused for review (waiting for user input).
-# Streamlit has no server-push, so live progress requires periodic reruns.
-# Gated by a user toggle so the page doesn't yank out while someone's reading
-# a stage log mid-run.
+# Live auto-refresh via a fragment WATCHER (not a blocking full-page rerun).
+#
+# The old code did `time.sleep(POLL); st.rerun()` at the bottom: that blocked
+# the single Streamlit script thread for POLL seconds (so buttons clicked
+# during that window did nothing — the "点了没反应" jank) AND re-ran the whole
+# ~2000-line page every 3s, re-pulling the full stage payload (output_data)
+# and re-rendering every tab.
+#
+# Instead this fragment re-runs ONLY ITSELF every POLL seconds (st.fragment
+# run_every), doing a tiny status-only poll. The heavy page body stays put and
+# stays responsive. When the set of stage statuses (or the run status) actually
+# changes, it escalates to a single full-page rerun so the progress row + tab
+# details refresh with the new output. No change → no full rerun → no jank.
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
     _auto = st.toggle(
-        f"🔄 自动刷新（每 {POLL_INTERVAL_SECONDS} 秒）",
+        f"🔄 自动刷新（每 {POLL_INTERVAL_SECONDS} 秒，只轮询状态、不阻塞页面）",
         value=st.session_state.get("detail_auto_refresh", True),
         key="detail_auto_refresh",
     )
-    if _auto:
-        time.sleep(POLL_INTERVAL_SECONDS)
-        st.rerun()
+
+    @st.fragment(run_every=(POLL_INTERVAL_SECONDS if _auto else None))
+    def _live_watcher():
+        try:
+            _statuses = db.get_stage_statuses(run_id)   # light: no output_data
+            _run_now = db.get_pipeline_run(run_id)
+        except Exception:
+            return  # transient poll failure — try again next tick, don't crash
+
+        _done = sum(1 for s in _statuses if s.get("status") == "completed")
+        _cur = next(
+            (s.get("stage_name") for s in reversed(_statuses)
+             if s.get("status") == "running"),
+            None,
+        )
+        _hb_age = None
+        _hb = _run_now.get("heartbeat_at")
+        if _hb:
+            try:
+                from datetime import datetime as _dt
+                _hb_age = int(
+                    time.time()
+                    - _dt.fromisoformat(str(_hb).replace("Z", "+00:00")).timestamp()
+                )
+            except Exception:
+                _hb_age = None
+        _bits = [f"🔄 {_run_now.get('status', '?')}", f"{_done} 个阶段完成"]
+        if _cur:
+            _bits.insert(1, f"当前 `{_cur}`")
+        if _hb_age is not None:
+            _bits.append(f"心跳 {_hb_age}s 前")
+        st.caption(" · ".join(_bits) + "　（状态变化时自动刷新整页）")
+
+        # Escalate to a full-page rerun only when meaningful state changed.
+        _sig = (
+            _run_now.get("status"),
+            tuple(sorted(
+                (s.get("stage_name", ""), s.get("status", ""))
+                for s in _statuses
+            )),
+        )
+        _key = f"_watch_sig_{run_id}"
+        _prev = st.session_state.get(_key)
+        st.session_state[_key] = _sig
+        if _prev is not None and _sig != _prev:
+            st.rerun()  # full app rerun → progress row + tab details refresh
+
+    _live_watcher()
