@@ -2898,13 +2898,25 @@ class PipelineOrchestrator:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
                 )
-            except Exception:
+            except Exception as _critic_err:
                 # Full traceback so a vibe-critic failure isn't a mystery
                 # ("why did this run skip the vibe loop?"). Still non-fatal:
-                # we proceed with whatever the builder produced.
+                # we proceed with whatever the builder produced — BUT record a
+                # strategic_warning so the run doesn't silently report success
+                # as if the 网感 gate had passed. #14: a skipped quality gate
+                # must be visible, not swallowed into a green run.
                 logger.exception(
                     "Vibe critic failed, proceeding without critique"
                 )
+                final_system.setdefault("strategic_warnings", []).append({
+                    "type": "quality_gate_skipped",
+                    "stage": "vibe_critic",
+                    "message": (
+                        "⚠️ 网感闸门（vibe_critic）执行失败，本轮产出**未经网感"
+                        "校验**——可能含 AI 腔 / 不够真实。请排查该阶段错误后重跑再交付。"
+                        f"（{type(_critic_err).__name__}: {_critic_err}）"
+                    ),
+                })
                 break
 
             failed = critic_result.get("failed_cells", [])
@@ -3199,8 +3211,20 @@ class PipelineOrchestrator:
                     rewritten = await self.vibe_rewriter.run(
                         rewriter_input, self.run_id, self.db,
                     )
-                except Exception:
+                except Exception as _rw_err:
                     logger.exception("Vibe rewriter failed, keeping original cells")
+                    # #14: rewriter failed → critic-flagged cells ship UNFIXED.
+                    # Don't let that pass as a clean success — surface it.
+                    final_system.setdefault("strategic_warnings", []).append({
+                        "type": "quality_gate_failed",
+                        "stage": "vibe_rewriter",
+                        "message": (
+                            "⚠️ 网感修复（vibe_rewriter）执行失败，被 critic 判"
+                            "不合格的 cell **未经修复直接保留**。交付前请人工复核"
+                            "这些 cell 或排查错误后重跑。"
+                            f"（{type(_rw_err).__name__}: {_rw_err}）"
+                        ),
+                    })
                     break
                 new_cells_by_id = {
                     c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
