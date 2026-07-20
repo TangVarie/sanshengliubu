@@ -358,6 +358,10 @@ class PipelineOrchestrator:
                     "strategic_warnings",
                     "_strategic_escalation_history",
                     "_prior_strategic_warnings",
+                    # 机器抓取的当前爆款样本 — 上一轮的 _trend_intel 若不剥离,
+                    # 会以陈旧"当前爆款"身份混进 crown_prince 输入并扩散到下游。
+                    # 趋势取样(step 1b)会用当前值重填,这里剥离保证不吃旧数据。
+                    "_trend_intel",
                 )
                 _clean_brief = {
                     k: v for k, v in _brief_dict.items()
@@ -389,6 +393,18 @@ class PipelineOrchestrator:
                 if _free_text:
                     structured_brief["_user_raw_input"] = _free_text
                     structured_brief["_raw_input_text"] = _free_text  # 兼容
+                # crown_prince 的输出会整体覆写 project.brief。它的结构化 schema
+                # 不回显这些"用户原始高信号输入"字段,若不并回,update_project 会把
+                # 它们静默丢弃 —— 尤其 _reference_post_urls(用户手贴的对标爆文
+                # URL),丢了之后参考分析器(step 1a)永远拿不到 URL。setdefault:
+                # 只在 crown_prince 没自己产出同名字段时补,不覆盖它的输出。
+                for _k in (
+                    "_reference_post_urls",
+                    "_library_sample_analyses",
+                    "_screenshot_analysis_text",
+                ):
+                    if _k in _brief_dict:
+                        structured_brief.setdefault(_k, _brief_dict[_k])
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             # 1a. User-pasted reference posts (B) — if page 2 recorded
@@ -3020,7 +3036,56 @@ class PipelineOrchestrator:
                 })
                 break
 
-            failed = critic_result.get("failed_cells", [])
+            failed = critic_result.get("failed_cells", []) or []
+            # Fail-CLOSED cross-check. vibe_critic.md 的契约:failed_cells 必须
+            # 包含每个 severity != pass 的 cell,且任一 cell 失败时 verdict 必为
+            # "some_failed"。但中转/模型截断可能只写了尾部空的 failed_cells(而
+            # cell_reviews 里明明有 borderline/fail),此时只信 failed_cells 就是
+            # fail-open —— AI 腔 cell 被当"全过"静默发货。这里交叉校验:凡
+            # cell_reviews 中 severity∈{borderline,fail} 但没进 failed_cells 的,
+            # 补回;并在 verdict=some_failed 却一个都补不出时留告警(闸门不可信)。
+            _declared_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+            _cr = critic_result.get("cell_reviews") or []
+            _recovered = []
+            for _rv in _cr:
+                _sev = (_rv.get("severity") or "").strip().lower()
+                _cid = _rv.get("cell_id")
+                if _cid and _sev in ("borderline", "fail") and _cid not in _declared_ids:
+                    _recovered.append({
+                        "cell_id": _cid,
+                        "platform": _rv.get("platform", ""),
+                        "severity": _sev,
+                        "root_cause_kind": _rv.get("root_cause_kind"),
+                        "root_cause_explanation": _rv.get("root_cause_explanation", ""),
+                        "rewrite_directives": _rv.get("rewrite_directives", ""),
+                        "_flagged_by": "gate_reconcile",
+                    })
+            if _recovered:
+                logger.warning(
+                    "[vibe_loop] fail-closed 补回:%d 个 cell 在 cell_reviews 里 "
+                    "severity!=pass 但没进 failed_cells(critic 输出疑似截断)——"
+                    "补回复检:%s",
+                    len(_recovered),
+                    sorted(r["cell_id"] for r in _recovered),
+                )
+                failed = failed + _recovered
+            _verdict = (critic_result.get("verdict") or "").strip().lower()
+            if _verdict == "some_failed" and not failed:
+                # 判了 some_failed 却连一个可定位的失败 cell 都没有(两个数组都被
+                # 截断)——不能当通过。留告警让交付前可见,不静默放行。
+                final_system.setdefault("strategic_warnings", []).append({
+                    "type": "quality_gate_untrusted",
+                    "stage": "vibe_critic",
+                    "message": (
+                        "⚠️ 网感闸门判定 some_failed 但未返回任何可定位的失败 cell"
+                        "(critic 输出疑似被截断)。本轮无法据此修复,产出**未获可信"
+                        "网感校验**,交付前请人工复核或重跑。"
+                    ),
+                })
+                logger.warning(
+                    "[vibe_loop] verdict=some_failed 但 failed/cell_reviews 均为空"
+                    " — 闸门不可信,已记 strategic_warning"
+                )
             failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
 
             # ── Gemini arbitration (Plan B: 分歧仲裁) ──────────────────
@@ -3187,6 +3252,10 @@ class PipelineOrchestrator:
                 if c.get("cell_id") in failed_ids
             ]
 
+            # #14: 若本轮 vibe_rewriter 抛异常,critic 判不合格的 surface/template
+            # cell 会原样保留(未修复)。用这个 flag 在应用完(可能部分成功的)结构
+            # 重写结果后跳出循环,并记 strategic_warning,不让失败静默混成 completed。
+            _vibe_rewriter_broke = False
             # v0.29.0: 按 root_cause_kind 分流 — critic-rewriter 责任边界划分
             # 的具体落地点。关闭 flag 时回到老行为(全部给 vibe_rewriter)。
             if ENABLE_STRUCTURAL_REWRITER:
@@ -3283,10 +3352,26 @@ class PipelineOrchestrator:
                             c["cell_id"]: c
                             for c in rewritten.get("prompt_cells", [])
                         }
-                    except Exception:
+                    except Exception as _rw_err:
                         logger.exception(
                             "Vibe rewriter failed, keeping original cells for this batch"
                         )
+                        # #14: 镜像 legacy 路径 —— rewriter 失败 → 这批 cell
+                        # (含回落到 surface 桶的 structural cell)未经修复直接保留。
+                        # 记 strategic_warning 让它在 UI 红色 surface,并置 flag
+                        # 在应用完已成功的 structural 结果后跳出循环(rewriter 坏了
+                        # 再转下一轮 critic 也没意义)。
+                        final_system.setdefault("strategic_warnings", []).append({
+                            "type": "quality_gate_failed",
+                            "stage": "vibe_rewriter",
+                            "message": (
+                                "⚠️ 网感修复（vibe_rewriter）执行失败,被 critic 判"
+                                "不合格的 cell **未经修复直接保留**。交付前请人工复核"
+                                "这些 cell 或排查错误后重跑。"
+                                f"（{type(_rw_err).__name__}: {_rw_err}）"
+                            ),
+                        })
+                        _vibe_rewriter_broke = True
 
                 # Merge both rewriter outputs. If both emitted the same cell_id
                 # (shouldn't happen — we bucket disjointly — but defend anyway),
@@ -3339,6 +3424,21 @@ class PipelineOrchestrator:
                 f"{sorted(rewritten_ids)}"
             )
 
+            # 数量对账:critic 判 fail 但 rewriter 没返回的 cell(LLM 漏返/截断)。
+            # 若不管:round2+ 只复检 rewritten_ids(见循环头 2909-2915),这些被
+            # 漏掉的 fail cell 会**掉出复检集**、保留原失败内容静默发货。把它们并回
+            # rewritten_ids,保证下一轮继续盯着它们(再给一次重写机会);循环耗尽时
+            # 由下面的 exhaustion 告警兜底,不静默放行。
+            _missing_rewrites = failed_ids - rewritten_ids
+            if _missing_rewrites:
+                logger.warning(
+                    "[vibe_loop] rewriter 漏返 %d 个已判 fail 的 cell:%s —— "
+                    "保留在复检集里,下一轮再试",
+                    len(_missing_rewrites),
+                    sorted(_missing_rewrites),
+                )
+                rewritten_ids = rewritten_ids | _missing_rewrites
+
             # R-022 follow-up: 运行时审计 rewrite_summary 的"源:..."标记。
             # 这是飞轮 ROI 唯一的可观测信号 — LLM 没按 prompt 写标记时,
             # 运营会以为飞轮没在工作。logger.warning 不阻断流水线(LLM
@@ -3359,10 +3459,25 @@ class PipelineOrchestrator:
                     reference_packs_summary=reference_packs_summary,
                 )
 
-            prompt_cells = [
-                new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
-            ]
+            # 字段 MERGE,不是整体替换。rewriter 的输出 schema 只覆盖
+            # system_prompt/demo_output 等网感字段,不含 builder 产出的
+            # media_brief / comment_seeds。整体替换(旧写法 .get(id, c))会让被重写
+            # 的 cell 丢掉这两个字段 → 交付物残缺(下游 4240-4243 校验会报缺失)。
+            # 把重写结果叠加到 builder cell 之上:网感修复落地,builder-only 字段存活。
+            _merged_cells = []
+            for _c in prompt_cells:
+                _cid = _c.get("cell_id")
+                if _cid in new_cells_by_id:
+                    _merged_cells.append({**_c, **new_cells_by_id[_cid]})
+                else:
+                    _merged_cells.append(_c)
+            prompt_cells = _merged_cells
             final_system["prompt_matrix"] = prompt_cells
+
+            # #14: 结构重写结果已应用完(见上),此刻若 vibe_rewriter 本轮抛过异常,
+            # 停止循环 —— rewriter 坏了继续转下一轮 critic 无意义,且 warning 已记。
+            if _vibe_rewriter_broke:
+                break
 
             iteration += 1
 
