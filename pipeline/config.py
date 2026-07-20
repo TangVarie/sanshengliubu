@@ -768,13 +768,17 @@ POLL_INTERVAL_SECONDS = 3
 
 # ── Stage ordering (for display) ──────────────────────────────────────────
 
+# The third tuple element (stage index/marker) is intentionally a short
+# numeric string rather than an emoji — the UI renders it as a flat,
+# typographic step marker. Kept as a 3-tuple so existing unpackers
+# `(key, label, marker)` stay valid.
 PIPELINE_STAGES = [
-    ("crown_prince", "太子", "📋"),
+    ("crown_prince", "太子", "01"),
     # Advisory-only (Gemini). Skipped if user didn't paste URLs on
     # page 2 OR if Gemini isn't configured. Fetches user-specified
     # xiaohongshu post URLs via url_context — higher-signal than
     # keyword search because the user directly picked the references.
-    ("gemini_reference_analyzer", "参考帖子·Gemini", "🔗"),
+    ("gemini_reference_analyzer", "参考帖子·Gemini", "02"),
     # SocialDataX first-party trend sampling. Pulls real current 小红书
     # 爆款 (原文 + 互动量, engagement-ranked) and injects them into
     # brief._trend_intel so secretariat's strategy is calibrated against
@@ -782,29 +786,29 @@ PIPELINE_STAGES = [
     # default (SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED) — fail-fast beats
     # silently producing an uncalibrated run. Stage key keeps the
     # historical "gemini_" prefix for stage-log/UI compatibility.
-    ("gemini_trend_scout_pre", "趋势取样·SocialDataX", "🔭"),
-    ("secretariat", "中书省", "📜"),
-    ("chancellery", "门下省", "🔍"),
-    ("dispatcher", "尚书省", "📋"),
-    ("ministry_personnel", "吏部", "👤"),
-    ("ministry_revenue", "户部", "🔑"),
-    ("ministry_rites", "礼部", "🎭"),
-    ("ministry_war", "兵部", "⚔️"),
-    ("ministry_justice", "刑部", "⚖️"),
-    ("ministry_works", "工部·架构", "🏗️"),
-    ("ministry_works_cell_planner", "工部·格子规划", "📐"),
-    ("ministry_works_builder", "工部·构建", "🔨"),
-    ("narrative_director", "叙事导演", "🎬"),
-    ("red_blue_red", "红队·攻", "🔴"),
-    ("red_blue_blue", "蓝队·守", "🔵"),
-    ("persona_simulator", "画像模拟·Claude", "👥"),
-    ("persona_simulator_alt", "画像模拟·DeepSeek", "🔮"),
-    ("ministry_works_structure_review", "结构审·Gemini", "🔎"),
-    ("vibe_critic", "网感复检", "🎯"),
+    ("gemini_trend_scout_pre", "趋势取样·SocialDataX", "03"),
+    ("secretariat", "中书省", "04"),
+    ("chancellery", "门下省", "05"),
+    ("dispatcher", "尚书省", "06"),
+    ("ministry_personnel", "吏部", "07"),
+    ("ministry_revenue", "户部", "08"),
+    ("ministry_rites", "礼部", "09"),
+    ("ministry_war", "兵部", "10"),
+    ("ministry_justice", "刑部", "11"),
+    ("ministry_works", "工部·架构", "12"),
+    ("ministry_works_cell_planner", "工部·格子规划", "13"),
+    ("ministry_works_builder", "工部·构建", "14"),
+    ("narrative_director", "叙事导演", "15"),
+    ("red_blue_red", "红队·攻", "16"),
+    ("red_blue_blue", "蓝队·守", "17"),
+    ("persona_simulator", "画像模拟·Claude", "18"),
+    ("persona_simulator_alt", "画像模拟·DeepSeek", "19"),
+    ("ministry_works_structure_review", "结构审·Gemini", "20"),
+    ("vibe_critic", "网感复检", "21"),
     # v0.29.3: 补展示 — 这两个阶段其实一直在跑也各自记 stage_log,
     # 但 PIPELINE_STAGES 漏了,导致 Settings 页面"模型配置"看不到它们
     # 用的是哪个模型(用户手动在 secrets 里配了 override 也找不到对应行)。
-    ("vibe_rewriter", "网感重写", "✏️"),
-    ("structural_rewriter", "叙事结构重写", "🧱"),
-    ("chancellery_final", "终审", "✅"),
+    ("vibe_rewriter", "网感重写", "22"),
+    ("structural_rewriter", "叙事结构重写", "23"),
+    ("chancellery_final", "终审", "24"),
 ]

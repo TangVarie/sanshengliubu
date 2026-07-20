@@ -7,9 +7,9 @@ from db.supabase_client import SupabaseClient
 from utils.export import export_as_markdown, export_as_json
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="产出中心", page_icon="📦", layout="wide")
+st.set_page_config(page_title="产出中心", page_icon="省", layout="wide")
 show_version_badge()
-st.title("📦 产出中心")
+st.title("产出中心")
 
 project_id = st.session_state.get("current_project_id") or st.query_params.get("project_id")
 if project_id:
@@ -47,7 +47,7 @@ if not output_data:
 prompt_system = output_data.get("prompt_system", {})
 final_review = output_data.get("final_review", {})
 
-st.subheader(f"📄 {project['name']}")
+st.subheader(f"{project['name']}")
 
 # v0.30.0: 成品清单(顶层主视图)— 用户反馈"看不懂分类",这一块用最简
 # 形式回答"产出了什么":几个不重复的 prompt + 每个的内容 + 示例输出。
@@ -69,7 +69,7 @@ if _matrix_for_summary:
     _unique_cells.sort(key=lambda c: c.get("cell_id", ""))
 
     st.markdown(
-        f"### 📋 成品提示词清单 · 共 **{len(_unique_cells)}** 个不重复的提示词"
+        f"### 成品提示词清单 · 共 **{len(_unique_cells)}** 个不重复的提示词"
     )
     st.caption(
         "每条 prompt 自带完整 system_prompt + user_prompt_template + 一段示例文稿,"
@@ -94,22 +94,22 @@ if _matrix_for_summary:
             _demo = _c.get("demo_output", "") or ""
 
             st.markdown(
-                f"**📋 system_prompt** _{len(_sp):,} 字_"
+                f"**system_prompt** _{len(_sp):,} 字_"
             )
             st.code(_sp, language="markdown")
 
             st.markdown(
-                f"**📝 user_prompt_template** _{len(_up):,} 字_"
+                f"**user_prompt_template** _{len(_up):,} 字_"
             )
             st.code(_up, language="markdown")
 
             if _vars:
-                st.markdown("**🔣 变量列表**")
+                st.markdown("**变量列表**")
                 for _vn, _vd in _vars.items():
                     st.markdown(f"- `{{{{{_vn}}}}}`: {_vd}")
 
             if _demo:
-                st.markdown("**✨ 示例文稿(用上面这条 prompt 跑出来的)**")
+                st.markdown("**示例文稿(用上面这条 prompt 跑出来的)**")
                 # 用 success-styled markdown 区分,避免和 prompt 代码混淆
                 st.markdown(
                     f"<div style='background:#f0f9f0;padding:12px 16px;"
@@ -127,9 +127,9 @@ if _matrix_for_summary:
 if final_review:
     verdict = final_review.get("verdict", "unknown")
     if verdict == "approved":
-        st.success("✅ 终审通过")
+        st.success("终审通过")
     else:
-        st.warning(f"⚠️ 终审状态：{verdict}")
+        st.warning(f"终审状态：{verdict}")
 
 # Display prompt matrix (platform → direction).
 # Old runs (pre-v0.6.1) had a duplicate `prompt_templates` field that was
@@ -149,26 +149,26 @@ if matrix:
             for cell in cells:
                 label = f"{cell.get('direction_id', '')}: {cell.get('direction_name', '')}"
                 with st.expander(label, expanded=False):
-                    st.markdown("**📋 System Prompt**（复制即可使用）")
+                    st.markdown("**System Prompt**（复制即可使用）")
                     st.code(cell.get("system_prompt", ""), language="markdown")
 
-                    st.markdown("**📝 User Prompt Template**")
+                    st.markdown("**User Prompt Template**")
                     st.code(cell.get("user_prompt_template", ""), language="markdown")
 
                     variables = cell.get("variables", {})
                     if variables:
-                        st.markdown("**🔣 变量说明**")
+                        st.markdown("**变量说明**")
                         for var_name, var_desc in variables.items():
                             st.markdown(f"- `{{{{{var_name}}}}}`: {var_desc}")
 
                     demo = cell.get("demo_output", "")
                     if demo:
-                        st.markdown("**✨ 示例输出**")
+                        st.markdown("**示例输出**")
                         st.markdown(demo)
 
                     rewrite_summary = cell.get("rewrite_summary")
                     if rewrite_summary:
-                        st.info(f"🎯 网感重写：{rewrite_summary}")
+                        st.info(f"网感重写：{rewrite_summary}")
 
                     # v0.29.2: 红蓝精炼 per-cell 状态 — 即使没改动也显示,
                     # 让用户能区分"跑了没改" vs "跑了失败" vs "没跑"
@@ -176,10 +176,10 @@ if matrix:
                     rb_summary = cell.get("_red_blue_summary", "")
                     if rb_status:
                         _rb_icon = {
-                            "refined": "⚔️",
-                            "unchanged": "✅",
-                            "failed": "❗",
-                        }.get(rb_status, "⚔️")
+                            "refined": "[已精炼]",
+                            "unchanged": "[无需修改]",
+                            "failed": "[失败]",
+                        }.get(rb_status, "[已精炼]")
                         _rb_func = {
                             "refined": st.success,
                             "unchanged": st.caption,
@@ -196,7 +196,7 @@ if matrix:
                     _ref_posts = _cell_refs.get("posts") or []
                     if _ref_posts:
                         st.markdown(
-                            "**🔭 对标参考**（Gemini 搜到的当前小红书真实同方向帖子）"
+                            "**对标参考**（Gemini 搜到的当前小红书真实同方向帖子）"
                         )
                         st.caption(
                             "对比我们的 demo 跟下面这些真人帖子的第一句/场景感——"
@@ -206,7 +206,7 @@ if matrix:
                             title = rp.get("title") or "(无标题)"
                             snippet = rp.get("snippet") or ""
                             url = rp.get("url", "")
-                            flag = " ⚠️ 疑似分析文" if rp.get("_suspect_analysis") else ""
+                            flag = " 疑似分析文" if rp.get("_suspect_analysis") else ""
                             st.markdown(f"- **《{title}》**{flag}")
                             if snippet:
                                 st.caption(snippet)
@@ -249,7 +249,7 @@ if rb_stats:
     failed = rb_stats.get("failed", 0)
     note = rb_stats.get("note", "")
     label = (
-        f"⚔️ 红蓝精炼: {refined} 已修复 · {unchanged} 无需修改 · "
+        f"红蓝精炼: {refined} 已修复 · {unchanged} 无需修改 · "
         f"{failed} 失败 / 总计 {attempted}"
     )
     if failed > 0 and failed == attempted:
@@ -259,7 +259,7 @@ if rb_stats:
     elif refined == 0 and attempted > 0:
         st.info(f"{label} — 这轮所有 cell 都通过 Red Team 检查,无需精修")
     elif attempted == 0:
-        st.caption(f"⚔️ 红蓝精炼: {note or '未执行'}")
+        st.caption(f"红蓝精炼: {note or '未执行'}")
     else:
         st.success(label)
 
@@ -302,13 +302,13 @@ if persona_reactions:
     ps_status = persona_reactions.get("status", "ok")
     if ps_status == "failed":
         st.error(
-            f"👤 画像模拟: 调用失败 — {persona_reactions.get('error', '未知错误')}"
+            f"画像模拟: 调用失败 — {persona_reactions.get('error', '未知错误')}"
         )
         if persona_reactions.get("reason"):
             st.caption(persona_reactions["reason"])
     elif ps_status == "skipped":
         st.caption(
-            f"👤 画像模拟: 跳过 — {persona_reactions.get('reason', '')}"
+            f"画像模拟: 跳过 — {persona_reactions.get('reason', '')}"
         )
     else:
         summary = persona_reactions.get("summary", {}) or {}
@@ -316,7 +316,7 @@ if persona_reactions:
         narrow = summary.get("narrow_cells", []) or []
         weak = summary.get("weak_cells", []) or []
         label = (
-            f"👤 画像模拟: {len(strong)} 强 · {len(narrow)} 窄 · {len(weak)} 弱"
+            f"画像模拟: {len(strong)} 强 · {len(narrow)} 窄 · {len(weak)} 弱"
         )
         if weak:
             st.error(f"{label} — 弱 cell (3 个画像都划走): {weak}")
@@ -327,7 +327,7 @@ if persona_reactions:
 
         overall = summary.get("overall", "")
         if overall:
-            st.caption(f"📊 {overall}")
+            st.caption(f"{overall}")
 
         personas = persona_reactions.get("personas") or []
         if personas:
@@ -338,13 +338,13 @@ if persona_reactions:
                 for p in personas:
                     pid = p.get("id", "?")
                     profile = p.get("profile", "")
-                    st.markdown(f"### 👤 {pid}")
+                    st.markdown(f"### {pid}")
                     st.caption(profile)
                     for r in p.get("reactions", []) or []:
                         action = r.get("action", "?")
                         _act_icon = {
-                            "click": "👆", "save": "⭐", "skip": "⏭️",
-                        }.get(action, "❓")
+                            "click": "[点击]", "save": "[收藏]", "skip": "[划走]",
+                        }.get(action, "[未知]")
                         st.markdown(
                             f"- {_act_icon} **{r.get('cell_id', '?')}** · "
                             f"`{action}` — "
@@ -359,9 +359,9 @@ if vibe_result:
     verdict = vibe_result.get("verdict", "")
     summary = vibe_result.get("summary", "")
     if verdict == "all_pass":
-        st.success(f"🎯 网感复检：全部通过 — {summary}")
+        st.success(f"网感复检：全部通过 — {summary}")
     else:
-        st.warning(f"🎯 网感复检：{verdict} — {summary}")
+        st.warning(f"网感复检：{verdict} — {summary}")
 
 # v0.29.1: 消费者模拟二级校验 — AI 扮演 stop_trigger 描述的具体目标用户,
 # 对每个 cell 做 stop/scroll 二元判决。被 scroll 的 cell 会同步追加进
@@ -371,13 +371,13 @@ consumer_sim = prompt_system.get("_consumer_simulation")
 # v0.29.2: 处理失败 / 跳过状态(之前只处理 judgments 非空的成功路径)
 if consumer_sim and consumer_sim.get("status") == "failed":
     st.error(
-        f"👥 消费者二层校验: 调用失败 — {consumer_sim.get('error', '未知错误')}"
+        f"消费者二层校验: 调用失败 — {consumer_sim.get('error', '未知错误')}"
     )
     if consumer_sim.get("reason"):
         st.caption(consumer_sim["reason"])
 elif consumer_sim and consumer_sim.get("status") == "skipped":
     st.caption(
-        f"👥 消费者二层校验: 跳过 — {consumer_sim.get('reason', '')}"
+        f"消费者二层校验: 跳过 — {consumer_sim.get('reason', '')}"
     )
 elif consumer_sim and consumer_sim.get("judgments"):
     summary = consumer_sim.get("summary", {}) or {}
@@ -385,7 +385,7 @@ elif consumer_sim and consumer_sim.get("judgments"):
     scroll_n = summary.get("scroll_count", 0)
     total = stop_n + scroll_n
     if total > 0:
-        label = f"👥 消费者二层校验: {stop_n}/{total} 会停下来(另 {scroll_n} 被划走)"
+        label = f"消费者二层校验: {stop_n}/{total} 会停下来(另 {scroll_n} 被划走)"
         if scroll_n == 0:
             st.success(label)
         elif scroll_n / max(total, 1) >= 0.5:
@@ -394,11 +394,11 @@ elif consumer_sim and consumer_sim.get("judgments"):
             st.warning(label)
         systemic = summary.get("systemic_issues", "") or ""
         if systemic:
-            st.caption(f"🔎 系统性观察: {systemic}")
+            st.caption(f"系统性观察: {systemic}")
         with st.expander("展开每条 cell 的消费者反应", expanded=False):
             for j in consumer_sim.get("judgments", []) or []:
                 action = j.get("action", "?")
-                icon = "✅" if action == "stop" else "❌"
+                icon = "[停下]" if action == "stop" else "[划走]"
                 st.markdown(
                     f"{icon} **{j.get('cell_id', '?')}** · {action}  \n"
                     f"*构造的用户*: {j.get('constructed_user', '(空)')[:160]}  \n"
@@ -412,7 +412,7 @@ elif consumer_sim and consumer_sim.get("judgments"):
 strategic_warnings = prompt_system.get("strategic_warnings") or []
 if strategic_warnings:
     with st.expander(
-        f"🚨 策略层隐患({len(strategic_warnings)} 条)——这些 cell 流水线跑完了但策略层有漏洞",
+        f"策略层隐患({len(strategic_warnings)} 条)——这些 cell 流水线跑完了但策略层有漏洞",
         expanded=True,
     ):
         st.error(
@@ -453,13 +453,13 @@ if uncertainty_summary:
     items = uncertainty_summary.get("items", [])
     checklist = uncertainty_summary.get("data_checklist", [])
     if items or checklist:
-        with st.expander("💡 可选优化项 — 补充数据可进一步提升产出质量", expanded=True):
+        with st.expander("可选优化项 — 补充数据可进一步提升产出质量", expanded=True):
             if items:
                 for item in items:
                     st.warning(
                         f"**{item.get('source', '')}** → {item.get('field', '')}\n\n"
                         f"{item.get('reason', '')}\n\n"
-                        f"📋 {item.get('data_suggestion', '')}"
+                        f"{item.get('data_suggestion', '')}"
                     )
             if checklist:
                 st.markdown("**建议补充的数据源：**")
@@ -467,7 +467,7 @@ if uncertainty_summary:
                     st.markdown(f"- {c}")
 
             st.divider()
-            st.markdown("### 📤 补充数据并自动优化")
+            st.markdown("### 补充数据并自动优化")
             with st.form(key="uncertainty_supplement"):
                 supplement_text = st.text_area(
                     "补充说明",
@@ -480,7 +480,7 @@ if uncertainty_summary:
                     type=["pdf", "txt", "md", "docx", "png", "jpg", "jpeg"],
                     key="uncertainty_files",
                 )
-                submitted = st.form_submit_button("🔄 补充并重跑优化")
+                submitted = st.form_submit_button("补充并重跑优化")
 
             if submitted and (supplement_text.strip() or supplement_files):
                 # Build supplementary content
@@ -533,7 +533,7 @@ col1, col2, col3 = st.columns(3)
 with col1:
     md_content = export_as_markdown(prompt_system, project["name"])
     st.download_button(
-        "📥 导出 Markdown",
+        "导出 Markdown",
         data=md_content,
         file_name=f"{project['name']}_prompt_system.md",
         mime="text/markdown",
@@ -541,7 +541,7 @@ with col1:
 with col2:
     json_content = export_as_json(prompt_system)
     st.download_button(
-        "📥 导出 JSON",
+        "导出 JSON",
         data=json_content,
         file_name=f"{project['name']}_prompt_system.json",
         mime="application/json",
@@ -558,7 +558,7 @@ with col3:
         },
     }
     st.download_button(
-        "📥 导出完整数据",
+        "导出完整数据",
         data=json.dumps(full_data, ensure_ascii=False, indent=2),
         file_name=f"{project['name']}_full_output.json",
         mime="application/json",

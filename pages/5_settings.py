@@ -10,14 +10,13 @@ from pipeline.config import (
     PIPELINE_STAGES,
     VERSION,
     VERSION_DATE,
-    VERSION_NOTES,
 )
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="设置", page_icon="⚙️")
+st.set_page_config(page_title="设置", page_icon="省")
 show_version_badge()
-st.title("⚙️ 设置")
-st.info(f"**当前版本** `{VERSION}` · {VERSION_DATE} — {VERSION_NOTES}")
+st.title("设置")
+st.caption(f"当前版本 `{VERSION}` · {VERSION_DATE}")
 
 # ── Connection Status ──────────────────────────────────────────────────────
 
@@ -49,14 +48,14 @@ with col1:
     if _active_mode == "vertex":
         _region = st.secrets.get("GCP_REGION", "us-east5")
         _has_sa = "gcp_service_account" in st.secrets
-        st.success(f"✅ Vertex AI · `{_gcp_project}` @ `{_region}`")
+        st.success(f"Vertex AI · `{_gcp_project}` @ `{_region}`")
         if _has_sa:
-            st.caption("🔑 Service Account 凭证已就绪")
+            st.caption("Service Account 凭证已就绪")
         else:
-            st.caption("🔑 回退到 ADC（gcloud auth / env 变量）")
+            st.caption("回退到 ADC（gcloud auth / env 变量）")
         if _api_key or _has_relay_presets:
             st.warning(
-                "⚠️ 同时检测到 Anthropic 配置，但 Vertex 模式优先，它会被忽略。"
+                "同时检测到 Anthropic 配置，但 Vertex 模式优先，它会被忽略。"
                 "要切回 Anthropic 模式请删掉 `GCP_PROJECT_ID` 再重启。"
             )
     elif _active_mode == "direct":
@@ -68,18 +67,18 @@ with col1:
             except Exception:
                 _preset_count = "?"
             st.success(
-                f"✅ Anthropic 直连/中转（多 preset · 共 {_preset_count} 个）"
+                f"Anthropic 直连/中转（多 preset · 共 {_preset_count} 个）"
             )
-            st.caption("下方「🔀 中转 Preset 切换」可以一键切换具体 preset。")
+            st.caption("下方「中转 Preset 切换」可以一键切换具体 preset。")
         else:
             # Legacy single top-level key mode
-            st.success(f"✅ Anthropic 直连/中转 (***{_api_key[-4:]})")
+            st.success(f"Anthropic 直连/中转 (***{_api_key[-4:]})")
             if _base_url:
-                st.info(f"🔀 中转：`{_base_url}`")
+                st.info(f"中转：`{_base_url}`")
             else:
                 st.caption("直连 Anthropic 官方 API")
     else:
-        st.error("❌ 未配置")
+        st.error("未配置")
         st.caption(
             "在 `.streamlit/secrets.toml` 中**二选一**：\n"
             "- 填 `[claude_relay_presets.xxx]` 段（直连/中转，支持多套一键切换）\n"
@@ -98,7 +97,7 @@ if _active_mode == "direct":
 
         _presets = get_available_claude_relay_presets()
         if _presets:
-            st.markdown("##### 🔀 中转 Preset 切换")
+            st.markdown("##### 中转 Preset 切换")
             _active_now = get_active_claude_relay_name()
 
             # Check project running to avoid switching mid-run
@@ -114,7 +113,7 @@ if _active_mode == "direct":
 
             if _any_running:
                 st.warning(
-                    "⚠️ 有项目正在跑流水线，现在切换可能让进行中的调用换到新后端"
+                    "有项目正在跑流水线，现在切换可能让进行中的调用换到新后端"
                     "（当前调用用旧配置，下一个调用才用新配置）。建议等任务结束再切。"
                 )
 
@@ -154,7 +153,7 @@ if _active_mode == "direct":
             _col_apply, _col_current = st.columns([1, 2])
             with _col_apply:
                 if st.button(
-                    "✅ Apply",
+                    "Apply",
                     disabled=(_picked == _active_now),
                     help=(
                         "立即切换到所选 preset。只在当前 Streamlit 进程内生效——"
@@ -165,7 +164,7 @@ if _active_mode == "direct":
                     try:
                         init_api_config()
                         st.success(
-                            f"✅ 已切换到 `{_picked}` ({_presets[_picked].get('label', _picked)})。"
+                            f"已切换到 `{_picked}` ({_presets[_picked].get('label', _picked)})。"
                             "下一个 API 调用会用新配置。"
                         )
                     except Exception as _err:
@@ -183,7 +182,7 @@ if _active_mode == "direct":
             _picked_overrides = _picked_cfg.get("model_overrides") or {}
             if _picked_overrides:
                 with st.expander(
-                    f"🎯 `{_picked}` 的逐阶段模型映射"
+                    f"`{_picked}` 的逐阶段模型映射"
                     f"（{len(_picked_overrides)} 个 stage 被覆盖）",
                     expanded=False,
                 ):
@@ -198,12 +197,12 @@ if _active_mode == "direct":
                     st.dataframe(_override_rows, use_container_width=True)
                 if _picked_cfg.get("thinking_via_model_suffix"):
                     st.caption(
-                        "ℹ️ 此 preset `thinking_via_model_suffix=true`：不发 JSON "
+                        "此 preset `thinking_via_model_suffix=true`：不发 JSON "
                         "thinking 参数，靠模型名后缀（-thinking / -high / -medium / "
                         "-low / -max）传递思考档位。"
                     )
 
-            with st.expander("📋 所有 preset 配置对比（只读）"):
+            with st.expander("所有 preset 配置对比（只读）"):
                 _rows = [
                     {
                         "preset": name,
@@ -233,11 +232,11 @@ with col2:
             db = SupabaseClient.get_instance()
             # Quick connectivity check
             db.list_projects(limit=1)
-            st.success(f"✅ 已连接 ({supa_url[:30]}...)")
+            st.success(f"已连接 ({supa_url[:30]}...)")
         except Exception as e:
-            st.error(f"❌ 连接失败：{e}")
+            st.error(f"连接失败：{e}")
     else:
-        st.error("❌ 未配置")
+        st.error("未配置")
         st.caption("在 `.streamlit/secrets.toml` 中设置 `SUPABASE_URL` 和 `SUPABASE_KEY`")
 
 # ── SocialDataX trend sampling ─────────────────────────────────────────────
@@ -257,7 +256,7 @@ try:
     )
 
     if _sdx_ok():
-        st.success(f"✅ 已配置 (***{_sdx_key[-4:]}) · 直连小红书一手数据")
+        st.success(f"已配置 (***{_sdx_key[-4:]}) · 直连小红书一手数据")
         st.caption(
             "趋势取样(A1)在中书省之前拉真实爆款(原文+互动量)做策略校准。"
             + (
@@ -270,7 +269,7 @@ try:
     elif ENABLE_SOCIALDATAX_TREND_SCOUT_PRE and \
             SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED:
         st.error(
-            "❌ 未配置 `SOCIALDATAX_API_KEY`,而趋势取样当前是 **REQUIRED** "
+            "未配置 `SOCIALDATAX_API_KEY`,而趋势取样当前是 **REQUIRED** "
             "模式——**每次 run 都会在取样阶段提前失败**。"
             "去 https://socialdatax.com/?from=npm 申请 Key 填入 "
             "`.streamlit/secrets.toml` 顶层;或把 `pipeline/config.py` 的 "
@@ -279,11 +278,11 @@ try:
         )
     else:
         st.warning(
-            "⚠️ 未配置 `SOCIALDATAX_API_KEY`(或依赖缺失)。趋势取样将被"
+            "未配置 `SOCIALDATAX_API_KEY`(或依赖缺失)。趋势取样将被"
             "跳过。申请:https://socialdatax.com/?from=npm"
         )
 except Exception as _sdx_e:  # noqa: BLE001 — settings 页永不因状态区崩
-    st.warning(f"⚠️ SocialDataX 状态检查失败:{_sdx_e}")
+    st.warning(f"SocialDataX 状态检查失败:{_sdx_e}")
 
 # ── Gemini auxiliary ────────────────────────────────────────────────────────
 
@@ -293,12 +292,12 @@ st.subheader("Gemini 辅助检查（可选）")
 _gemini_key = st.secrets.get("VERTEX_EXPRESS_API_KEY", "").strip()
 if not ENABLE_GEMINI_ASSIST:
     st.info(
-        "ℹ️ 已在 `pipeline/config.py` 里禁用（`ENABLE_GEMINI_ASSIST=False`）。"
+        "已在 `pipeline/config.py` 里禁用（`ENABLE_GEMINI_ASSIST=False`）。"
         "如需开启：改成 `True` 并在 secrets.toml 配 `VERTEX_EXPRESS_API_KEY`。"
     )
 elif not _gemini_key:
     st.warning(
-        "⚠️ 已在 config 启用但未配 `VERTEX_EXPRESS_API_KEY`。"
+        "已在 config 启用但未配 `VERTEX_EXPRESS_API_KEY`。"
         "Gemini 辅助检查本轮会被跳过（advisory-only，不影响主流程）。"
         "在 GCP Console → Vertex AI → Settings → API keys 生成一个 Key 填入 secrets.toml。"
     )
@@ -309,7 +308,7 @@ else:
         from pipeline.agents.gemini_client import is_available
         if is_available():
             st.success(
-                f"✅ 已配置 (***{_gemini_key[-4:]}) · 默认模型 `{GEMINI_MODEL}`"
+                f"已配置 (***{_gemini_key[-4:]}) · 默认模型 `{GEMINI_MODEL}`"
             )
             st.caption(
                 "Gemini 会作为 (1) 网感二审：Claude critic 判 pass 的 cell 由 Gemini "
@@ -329,7 +328,7 @@ else:
                 "reference_analyzer":  "参考帖 URL 抓取分析",
             }
             with st.expander(
-                "📌 按岗位模型分配（pipeline/config.py · GEMINI_MODEL_OVERRIDES）",
+                "按岗位模型分配（pipeline/config.py · GEMINI_MODEL_OVERRIDES）",
                 expanded=False,
             ):
                 _rows = []
@@ -340,7 +339,7 @@ else:
                             "岗位 (role)": role,
                             "用途": desc,
                             "实际模型": pinned or f"{GEMINI_MODEL} (默认)",
-                            "是否 override": "✅" if pinned else "—",
+                            "是否 override": "[是]" if pinned else "—",
                         }
                     )
                 st.dataframe(_rows, hide_index=True, use_container_width=True)
@@ -353,7 +352,7 @@ else:
             # API key, and network path all work end-to-end. Crucial for
             # diagnosing "why does Gemini always show as skipped".
             if st.button(
-                "🧪 测试 Gemini 连接",
+                "测试 Gemini 连接",
                 help="实发一条最小请求到 Vertex，验证模型名/API key/网络都 OK",
             ):
                 import time as _time
@@ -375,17 +374,17 @@ else:
                         )
                         elapsed = _time.time() - t0
                         st.success(
-                            f"✅ 调用成功 · {elapsed:.2f}s · "
+                            f"调用成功 · {elapsed:.2f}s · "
                             f"输入 {result['input_tokens']} tok / "
                             f"输出 {result['output_tokens']} tok · "
                             f"费用 ${result['cost_usd']:.4f}"
                         )
                         st.json(result["data"])
                     except GeminiNotConfigured as err:
-                        st.error(f"❌ 未配置：{err}")
+                        st.error(f"未配置：{err}")
                     except GeminiCallFailed as err:
                         st.error(
-                            f"❌ 调用失败：\n\n```\n{err}\n```\n\n"
+                            f"调用失败：\n\n```\n{err}\n```\n\n"
                             "**常见原因**：\n"
                             f"- 模型名 `{GEMINI_MODEL}` 你的 Vertex 账户不可用"
                             " → 去 `pipeline/config.py` 改 `GEMINI_MODEL`"
@@ -394,12 +393,12 @@ else:
                             "- 地区配额问题"
                         )
                     except Exception as err:
-                        st.error(f"❌ 未预期的错误：{type(err).__name__}: {err}")
+                        st.error(f"未预期的错误：{type(err).__name__}: {err}")
 
             # List models — answers "what models can this API key actually
             # call" without needing to trial-and-error through pipeline runs.
             if st.button(
-                "📋 列出可用 Gemini 模型",
+                "列出可用 Gemini 模型",
                 help=(
                     "调用 ListModels 接口，显示你这个 API key 能访问的所有"
                     "模型。复制其中一个模型 ID 填到 pipeline/config.py 的 "
@@ -415,7 +414,7 @@ else:
                         )
                         models = list_available_models()
                         if not models:
-                            st.warning("⚠️ ListModels 返回空列表——key 可能有权限问题。")
+                            st.warning("ListModels 返回空列表——key 可能有权限问题。")
                         else:
                             # Flag whether the currently configured GEMINI_MODEL
                             # is actually in the list.
@@ -423,12 +422,12 @@ else:
                             current_ok = GEMINI_MODEL in available_ids
                             if current_ok:
                                 st.success(
-                                    f"✅ 当前配置的 `{GEMINI_MODEL}` "
+                                    f"当前配置的 `{GEMINI_MODEL}` "
                                     f"在可用列表里（共 {len(models)} 个模型）"
                                 )
                             else:
                                 st.warning(
-                                    f"⚠️ 当前配置 `{GEMINI_MODEL}` **不在**可用列表里——"
+                                    f"当前配置 `{GEMINI_MODEL}` **不在**可用列表里——"
                                     f"这就是为什么 Gemini 总是 skipped。"
                                     f"从下表挑一个支持 `generateContent` 的模型 ID，"
                                     f"改 `pipeline/config.py` 里的 `GEMINI_MODEL`。"
@@ -452,19 +451,19 @@ else:
                             ]
                             st.dataframe(rows, use_container_width=True)
                     except GeminiNotConfigured as err:
-                        st.error(f"❌ 未配置：{err}")
+                        st.error(f"未配置：{err}")
                     except GeminiCallFailed as err:
-                        st.error(f"❌ ListModels 失败：\n\n```\n{err}\n```")
+                        st.error(f"ListModels 失败：\n\n```\n{err}\n```")
                     except Exception as err:
-                        st.error(f"❌ 未预期的错误：{type(err).__name__}: {err}")
+                        st.error(f"未预期的错误：{type(err).__name__}: {err}")
         else:
-            st.error("❌ Gemini 客户端初始化失败（`google-genai` 未装？）")
+            st.error("Gemini 客户端初始化失败（`google-genai` 未装？）")
             st.caption(
                 "`pip install google-genai>=0.3.0`（或重新跑 "
                 "`pip install -r requirements.txt`）后重启 Streamlit。"
             )
     except Exception as e:
-        st.error(f"❌ 状态检测异常：{e}")
+        st.error(f"状态检测异常：{e}")
 
 # ── Model Configuration ───────────────────────────────────────────────────
 
@@ -472,8 +471,8 @@ st.divider()
 st.subheader("模型配置")
 st.caption(
     "当前各环节使用的模型（修改需编辑 `pipeline/config.py`）。"
-    "🟣 Opus / 🔵 Sonnet 都是 Claude；🟢 Gemini 是辅助（advisory），失败不阻塞；"
-    "🔎 SocialDataX 是趋势取样数据源（REQUIRED 模式下取样失败会终止 run）。"
+    "Opus / Sonnet 都是 Claude；Gemini 是辅助（advisory），失败不阻塞；"
+    "SocialDataX 是趋势取样数据源（REQUIRED 模式下取样失败会终止 run）。"
 )
 
 # Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
@@ -507,7 +506,7 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
     # Assemble the right-hand-side badges based on which backends run here
     parts: list[str] = []
     if model:
-        tier = "🟣 Opus" if "opus" in model else "🔵 Sonnet"
+        tier = "Opus" if "opus" in model else "Sonnet"
         parts.append(f"`{model}` {tier}")
 
     # SocialDataX-backed trend sampling — not a Gemini stage anymore.
@@ -520,25 +519,25 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
         except Exception:
             _available = False
         if _available:
-            parts.append("🔎 SocialDataX · 趋势取样(直连小红书)")
+            parts.append("SocialDataX · 趋势取样(直连小红书)")
         elif SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED and \
                 ENABLE_SOCIALDATAX_TREND_SCOUT_PRE:
             parts.append(
-                "🔎 SocialDataX · _(未配置 — REQUIRED 模式下 run 会在此"
+                "SocialDataX · _(未配置 — REQUIRED 模式下 run 会在此"
                 "阶段失败,见上方 SocialDataX 区)_"
             )
         else:
-            parts.append("🔎 SocialDataX · _(未配置 · 跳过)_")
+            parts.append("SocialDataX · _(未配置 · 跳过)_")
 
     if gemini_desc and ENABLE_GEMINI_ASSIST and _gemini_key:
         # Gemini actually available — show the resolved (per-role) model
         # so override-vs-default is visible at a glance.
         _resolved = resolve_gemini_model(gemini_role)
-        parts.append(f"+ `{_resolved}` 🟢 Gemini · {gemini_desc}")
+        parts.append(f"+ `{_resolved}` Gemini · {gemini_desc}")
     elif gemini_desc:
         # Gemini role designed but not configured — annotate so user
         # understands why this stage may look "only Claude" in logs
-        parts.append(f"+ 🟢 Gemini · {gemini_desc} _(未配置 · 跳过)_")
+        parts.append(f"+ Gemini · {gemini_desc} _(未配置 · 跳过)_")
 
     if not parts:
         # e.g. structure_review when Gemini disabled + unconfigured
@@ -551,7 +550,7 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
 # ── Setup Guide ────────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader("📖 设置指南")
+st.subheader("设置指南")
 
 with st.expander("Supabase 设置步骤"):
     st.markdown(
