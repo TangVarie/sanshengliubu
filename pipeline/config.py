@@ -568,10 +568,8 @@ GEMINI_MODEL = "gemini-3.1-pro-preview"
 #       Flash wins outright on multimodal understanding → Flash.
 #   - Structural checklist (structure_reviewer):
 #       Agentic-style task, Flash wins on agentic benchmarks → Flash.
-#   - Search-grounded scout (trend_scout):
-#       Quality dominated by Google Search grounding (billed separately
-#       at ~$35/1k queries); model cost is small fraction → Flash for
-#       speed + savings.
+#   - (trend_scout used to live here; it migrated off Gemini to
+#     SocialDataX first-party data and no longer resolves a Gemini model.)
 #   - Long-content URL reading (reference_analyzer):
 #       Posts can be long, dense recall matters → keep Pro.
 #   - "网感" / "烟火气" critic (critic):
@@ -586,31 +584,78 @@ GEMINI_MODEL_OVERRIDES: dict[str, str] = {
     "image_transcriber":   "gemini-3.5-flash",
     "screenshot_analyzer": "gemini-3.5-flash",
     "structure_reviewer":  "gemini-3.5-flash",
-    "trend_scout":         "gemini-3.5-flash",
     "reference_analyzer":  "gemini-3.1-pro-preview",
     "critic":              "gemini-3.1-pro-preview",
 }
 
-# Trend scout — when True, Gemini runs a live Google Search
-# (site:xiaohongshu.com) in two places:
+# ── SocialDataX trend scout ────────────────────────────────────────────────
+# The trend scout pulls real current 小红书 posts as calibration samples for
+# the copy pipeline. As of this migration it fetches them via SocialDataX's
+# first-party MCP (direct XHS access), replacing the old Gemini +
+# Google-Search-grounding path (which could only reach XHS through Google's
+# thin index, returned copyright-filtered snippets with no engagement data,
+# and was disabled by default). See:
+#   pipeline/agents/socialdatax_client.py
+#   pipeline/agents/socialdatax_trend_scout.py
+#
+# Used in two places:
 #   - PRE: before secretariat, to enrich the brief with real current
-#          post samples (titles + snippets) so strategy is calibrated
-#          against concrete examples, not abstract assumptions.
+#          爆款 samples (原文 + 互动量) so strategy is calibrated against
+#          concrete, currently-viral examples.
 #   - POST: after chancellery_final, per direction, for side-by-side
 #           comparison with our produced demos. Advisory, non-blocking.
-# Costs: Google Search grounding is billed separately by Google
-# (~$35 / 1000 queries). PRE is 1 query/run; POST is 1 query per
-# direction (~5-8/run). Budget ~$0.30 extra per full run.
 #
-# IMPORTANT CONTRACT — scout output is forced to be RAW POSTS ONLY,
-# never trend analysis. See pipeline/prompts/gemini_trend_scout.md +
-# pipeline/agents/gemini_trend_scout.py _FORBIDDEN_SUMMARY_KEYS.
-ENABLE_GEMINI_TREND_SCOUT_PRE = False
-ENABLE_GEMINI_TREND_SCOUT_POST = False
-# How many posts to ask the scout to pull per invocation. Each post is
-# ~150 chars in the output, so 10 is a reasonable default — gives
-# secretariat meaningful calibration without ballooning the prompt.
-GEMINI_TREND_SCOUT_TARGET_COUNT = 10
+# Auth: top-level `SOCIALDATAX_API_KEY` in .streamlit/secrets.toml (request
+# one at https://socialdatax.com/?from=npm). Missing key → scout returns
+# verdict="skipped" and the pipeline proceeds (advisory-only, never blocks).
+#
+# Cost: SocialDataX bills per API call by plan. PRE is ~1 call/run; POST is
+# ~1 call per tactical direction (~5-8/run). Set SOCIALDATAX_COST_PER_CALL_USD
+# to your plan's per-call price to fold it into run cost accounting.
+
+# Master switch for all SocialDataX access (client-level). False → every
+# SocialDataX call short-circuits to SocialDataXNotConfigured.
+ENABLE_SOCIALDATAX = True
+
+# MCP endpoint base. Per-platform URL is f"{base}/{platform}/mcp"
+# (e.g. https://mcp.socialdatax.com/xhs/mcp). Override only if SocialDataX
+# publishes a new host.
+SOCIALDATAX_MCP_BASE = "https://mcp.socialdatax.com"
+
+# Per-call network timeout (seconds). XHS scraping upstream can be slow;
+# 60s is a comfortable ceiling for a single search call.
+SOCIALDATAX_REQUEST_TIMEOUT_SECONDS = 60
+
+# Search sort for the scout. like_count_descending surfaces real 爆款
+# (most-liked first). Other XHS options: general | time_descending |
+# comment_count_descending | collect_count_descending.
+SOCIALDATAX_TREND_SCOUT_SORT = "like_count_descending"
+
+# Per-API-call price in USD for run cost accounting. 0.0 = don't track.
+# Set to your SocialDataX plan's effective per-call cost.
+SOCIALDATAX_COST_PER_CALL_USD = 0.0
+
+# PRE runs on nearly every strategy build (1 call, high value) → default on.
+# POST fans out per direction (more calls) → opt-in.
+ENABLE_SOCIALDATAX_TREND_SCOUT_PRE = True
+ENABLE_SOCIALDATAX_TREND_SCOUT_POST = False
+
+# Failure policy for PRE. True (default) = REQUIRED / fail-fast: when PRE
+# is enabled and the scout can't deliver calibration posts (missing key,
+# call failure, zero results), the run STOPS right there with a clear
+# error. Rationale: A1 runs before secretariat, so failing here costs only
+# the 太子 stage — whereas silently proceeding without calibration data
+# skews the whole strategy and forces a full (expensive) rerun. Two
+# exceptions never block: (1) the target platform isn't supported by
+# SocialDataX at all, and (2) a revision/resume where the brief already
+# carries usable _trend_intel from a previous attempt (reused instead).
+# Set False to restore pure advisory behavior (skip + proceed).
+# POST is ALWAYS advisory — it runs after all content is produced, so a
+# failure there only loses the side-by-side references, never the output.
+SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED = True
+
+# How many posts to keep per invocation (ranked by real engagement).
+SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10
 
 # Max output tokens per Gemini call. 16K handles 6-cell structure
 # reviews without truncation. Grounding calls auto-bump to 24K (see
@@ -734,12 +779,14 @@ PIPELINE_STAGES = [
     # xiaohongshu post URLs via url_context — higher-signal than
     # keyword search because the user directly picked the references.
     ("gemini_reference_analyzer", "参考帖子·Gemini", "02"),
-    # Advisory-only (Gemini). Skipped if Gemini isn't configured.
-    # Pulls real current Xiaohongshu post samples via Google Search
-    # (site:xiaohongshu.com), injects raw titles + snippets into
-    # brief._trend_intel so secretariat's strategy is calibrated
-    # against concrete current examples, not abstract guesses.
-    ("gemini_trend_scout_pre", "趋势取样·Gemini", "03"),
+    # SocialDataX first-party trend sampling. Pulls real current 小红书
+    # 爆款 (原文 + 互动量, engagement-ranked) and injects them into
+    # brief._trend_intel so secretariat's strategy is calibrated against
+    # concrete current examples, not abstract guesses. REQUIRED by
+    # default (SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED) — fail-fast beats
+    # silently producing an uncalibrated run. Stage key keeps the
+    # historical "gemini_" prefix for stage-log/UI compatibility.
+    ("gemini_trend_scout_pre", "趋势取样·SocialDataX", "03"),
     ("secretariat", "中书省", "04"),
     ("chancellery", "门下省", "05"),
     ("dispatcher", "尚书省", "06"),

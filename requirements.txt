@@ -17,3 +17,9 @@ python-docx>=1.0.0,<2.0.0
 # 只走 anthropic-compat 不需要这个。Streamlit Cloud / 本地 pip install
 # 都会装上。
 openai>=1.40.0,<2.0.0
+# MCP SDK — used by the trend scout to talk to SocialDataX's first-party
+# MCP servers (streamable-HTTP) for real 小红书 content. Pure Python, so no
+# Node runtime is needed in the deploy. See pipeline/agents/socialdatax_client.py.
+# Floor at 1.9.4: earlier 1.9.x required datetime.timedelta timeouts (we pass
+# timedelta anyway, belt-and-braces) and had streamable-HTTP fixes.
+mcp>=1.9.4,<2.0.0

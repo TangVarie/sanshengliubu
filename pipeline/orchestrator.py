@@ -18,13 +18,14 @@ from pipeline.config import (
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
     DEFAULT_PLATFORM,
-    ENABLE_GEMINI_TREND_SCOUT_POST,
-    ENABLE_GEMINI_TREND_SCOUT_PRE,
+    ENABLE_SOCIALDATAX_TREND_SCOUT_POST,
+    ENABLE_SOCIALDATAX_TREND_SCOUT_PRE,
     ENABLE_STRUCTURAL_REWRITER,
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
     STRATEGIC_LOOP_MAX_ITERATIONS,
-    GEMINI_TREND_SCOUT_TARGET_COUNT,
+    SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
+    SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
     MAX_DEBATE_TURNS,
@@ -57,7 +58,7 @@ from pipeline.retrieve_samples import (
     retrieve_reference_packs,
     summarize_packs_by_platform,
 )
-from pipeline.agents.gemini_trend_scout import (
+from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
 )
@@ -376,10 +377,12 @@ class PipelineOrchestrator:
             # Advisory-only.
             await self._run_gemini_reference_analyzer(structured_brief)
 
-            # 1b. Gemini 趋势取样（advisory, A1）— 在策略规划之前拉一批当前
-            # 平台的真实帖子（标题 + snippet 原文），注入到 structured_brief
+            # 1b. 趋势取样（SocialDataX, A1）— 在策略规划之前拉一批当前
+            # 平台的真实爆款（原文 + 互动量），注入到 structured_brief
             # 的 _trend_intel 字段。这些是**原文样本**不是趋势分析。
-            # 失败时跳过不阻塞。
+            # ⚠️ REQUIRED 默认开:取样失败且无可复用数据时抛
+            # TrendScoutRequiredError 提前终止 run(fail-fast,见
+            # SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED)。
             await self._run_gemini_trend_scout_pre(structured_brief)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
@@ -2228,31 +2231,36 @@ class PipelineOrchestrator:
         )
 
     async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
-        """A1: pre-secretariat trend scout. Pulls current real Xiaohongshu
-        VIRAL素人 post samples (not product-relevant; just "what's hot
-        right now") via Gemini + Google Search to calibrate downstream
-        copy writing against current platform voice. Advisory-only.
+        """A1: pre-secretariat trend scout. Pulls real current 小红书 爆款
+        via SocialDataX (first-party XHS access) to calibrate downstream
+        copy writing against current platform voice.
 
-        Design note: we deliberately do NOT search product/brand
-        keywords here. Searching "珂润精华液" returns 软广 + 分析 articles
-        that have no素人 vibe at all. Instead we pass the brief's
-        target_audience snippet as a soft "vibe_hints" — the scout's
-        prompt tells Gemini to use it for sorting results (prefer viral
-        posts that feel like they target the same demographic), never
-        as a direct search term. The scout's queries are format-anchored
-        (反差 / 社死 / 身份标签 / reposts on weibo) so what comes back
-        is a set of raw current viral first-sentences we can calibrate
-        against, regardless of topic.
+        NOT advisory by default: under SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
+        (=True), a scout failure with no reusable _trend_intel raises
+        TrendScoutRequiredError and fails the run — fail-fast at the cost
+        of only the 太子 stage beats silently producing an uncalibrated
+        run. Deterministic non-fixable cases (unsupported platform,
+        keyword-less brief with no hot-list fallback) and reuse-eligible
+        resumes stay non-blocking.
+
+        Search-keyword note: unlike the old Gemini/Google path — which
+        avoided product terms because Google returned 软广 + 分析 — we now
+        search the product *category* and rank by real 互动量, so topical
+        keywords return relevant AND currently-viral samples. We pass
+        product_category / product_name / target_audience as ordered
+        search-keyword candidates and the scout tries them in order.
+        (Stage-log names keep the historical ``gemini_trend_scout_*`` keys
+        for UI compatibility.)
         """
-        if not ENABLE_GEMINI_TREND_SCOUT_PRE:
+        if not ENABLE_SOCIALDATAX_TREND_SCOUT_PRE:
             return
 
-        # vibe_hints: demographic/audience context used by the scout
-        # only for soft sorting of results. Never searched directly.
-        # We deliberately exclude product_name / product_category /
-        # core_claim — those lead to ads and analysis articles.
+        # Ordered SEARCH-KEYWORD candidates. product_category is the best
+        # topical anchor (relevant + rankable by real engagement);
+        # product_name and target_audience are fallbacks. campaign_objective
+        # is a goal, not a searchable topic, so it is excluded.
         vibe_hints: list[str] = []
-        for k in ("target_audience", "campaign_objective"):
+        for k in ("product_category", "product_name", "target_audience"):
             v = brief.get(k)
             if v and isinstance(v, str) and v.strip():
                 vibe_hints.append(v.strip())
@@ -2260,8 +2268,8 @@ class PipelineOrchestrator:
                 for item in v:
                     if isinstance(item, str) and item.strip():
                         vibe_hints.append(item.strip())
-        # Empty vibe_hints is fine — the scout falls back to generic
-        # "current xhs viral" queries.
+        # Empty candidates is fine — the scout falls back to the platform's
+        # real hot list (xhs) for generic "what's hot now" samples.
 
         platforms = brief.get("target_platforms") or []
         platform = platforms[0] if platforms else DEFAULT_PLATFORM
@@ -2278,18 +2286,20 @@ class PipelineOrchestrator:
             result = await run_trend_scout(
                 vibe_hints=vibe_hints,
                 platform=platform,
-                target_count=GEMINI_TREND_SCOUT_TARGET_COUNT,
+                target_count=SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
             )
         except Exception as e:
+            # Fold unexpected exceptions into the normal skipped-result
+            # path so the REQUIRED policy below sees them too.
             logger.warning(
-                "[trend_scout pre] unexpected exception, skipping: %r", e
+                "[trend_scout pre] unexpected exception: %r", e
             )
-            self.db.update_stage_log(
-                log_id,
-                status="skipped",
-                output_data={"_skip_reason": f"unexpected_exception: {e}"},
-            )
-            return
+            result = {
+                "verdict": "skipped",
+                "posts": [],
+                "queries_used": [],
+                "_skip_reason": f"unexpected_exception: {e}",
+            }
 
         usage = result.get("_gemini_usage") or {}
         if usage:
@@ -2302,24 +2312,91 @@ class PipelineOrchestrator:
             )
 
         verdict = result.get("verdict", "skipped")
-        if verdict == "skipped":
+        if verdict != "all_pass":
+            reason = str(
+                result.get("_skip_reason")
+                or result.get("_not_found_reason")
+                or verdict
+            )
+            tokens = int(usage.get("input_tokens", 0)) + int(
+                usage.get("output_tokens", 0)
+            )
+
+            # Reuse guard — a resume/revision may already have usable
+            # calibration posts from a previous successful attempt. NOTE:
+            # on resume `brief` is done["crown_prince"] (the stage-log
+            # output), which never carries _trend_intel — the persisted
+            # copy lives on project.brief (written below on success), so
+            # read it from there. A fresh fetch failing must not discard
+            # existing data or kill the run.
+            existing_intel = (brief.get("_trend_intel") or {})
+            if not existing_intel.get("posts"):
+                _project = self.db.get_project(self.project_id) or {}
+                existing_intel = (
+                    (_project.get("brief") or {}).get("_trend_intel") or {}
+                )
+            existing_posts = existing_intel.get("posts") or []
+            reuse = bool(existing_posts)
+            if reuse:
+                # Re-attach so secretariat sees the previous posts even
+                # though this brief instance (stage-log copy) lacked them.
+                brief["_trend_intel"] = existing_intel
+                reason = f"reused_existing_trend_intel ({reason})"
+
+            # REQUIRED / fail-fast — missing calibration data skews the
+            # whole downstream strategy; failing at A1 costs only the 太子
+            # stage instead of a full uncalibrated run + rerun. Platforms
+            # SocialDataX can't serve at all, and keyword-less briefs on
+            # platforms without a hot-list fallback, stay advisory —
+            # retrying can never fix those.
+            deterministic = reason.startswith(
+                ("unsupported_platform", "no_search_keywords")
+            )
+            required_fail = (
+                SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
+                and not reuse
+                and not deterministic
+            )
+
+            error_message = None
+            if required_fail:
+                error_message = (
+                    f"趋势取样(SocialDataX)未能拿到校准样本：{reason}。"
+                    f"该阶段是策略校准的关键输入,缺失会导致全程产出跑偏,"
+                    f"故按 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True 提前终止"
+                    f"(此时只消耗了太子阶段)。修复方式:"
+                    f"① 配置 .streamlit/secrets.toml 顶层 SOCIALDATAX_API_KEY"
+                    f"(https://socialdatax.com/?from=npm);"
+                    f"② 网络/配额问题请重试;"
+                    f"③ 若想跳过取样直接跑,把 pipeline/config.py 的 "
+                    f"SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED 设为 False。"
+                )
+
             self.db.update_stage_log(
                 log_id,
-                status="skipped",
+                status="failed" if required_fail else "skipped",
                 output_data={
-                    "_skip_reason": result.get("_skip_reason", "unknown"),
+                    "_skip_reason": reason,
                     "queries_used": result.get("queries_used", []),
-                    "_raw_text_preview": result.get("_raw_text_preview", ""),
+                    "_partial_failures": result.get(
+                        "_partial_failures", []
+                    ),
+                    "_raw_keys_sample": result.get("_raw_keys_sample", []),
                     "_gemini_usage": usage,
                 },
-                tokens_used=int(usage.get("input_tokens", 0))
-                + int(usage.get("output_tokens", 0)),
+                tokens_used=tokens,
                 model_used=usage.get("model"),
+                # error_message is the channel pages/3's
+                # render_stage_error actually displays — without it a
+                # failed stage renders as "error_message 为空,请查看
+                # 服务端日志", unreachable on Streamlit Cloud.
+                error_message=error_message,
             )
-            logger.info(
-                "[trend_scout pre] skipped: %s",
-                result.get("_skip_reason", "unknown"),
-            )
+            if required_fail:
+                raise TrendScoutRequiredError(error_message)
+            logger.info("[trend_scout pre] %s: %s",
+                        "reusing previous posts" if reuse else "skipped",
+                        reason)
             return
 
         # Inject raw posts into brief so secretariat sees them. Store
@@ -2341,10 +2418,15 @@ class PipelineOrchestrator:
                 "posts": result.get("posts", []),
                 "queries_used": result.get("queries_used", []),
                 "grounding_urls": result.get("grounding_urls", []),
-                "_rejected_off_domain_count": result.get(
-                    "_rejected_off_domain_count", 0
+                "_partial_failures": result.get("_partial_failures", []),
+                # Observability for the tolerant field mapping: whether
+                # engagement counts resolved (False → ranking degraded to
+                # API order) and the first raw note's keys so the mapping
+                # can be pinned from the UI without server-log access.
+                "_engagement_resolved": result.get(
+                    "_engagement_resolved", True
                 ),
-                "_not_found_reason": result.get("_not_found_reason"),
+                "_raw_keys_sample": result.get("_raw_keys_sample", []),
             },
             model_used=usage.get("model"),
             tokens_used=int(usage.get("input_tokens", 0))
@@ -2366,13 +2448,14 @@ class PipelineOrchestrator:
         posts — advisory only, no prompt-matrix mutation.
 
         Runs in parallel per direction (bounded concurrency) because
-        each direction is an independent Gemini call.
+        each direction is an independent SocialDataX call.
 
-        Skipped wholesale if ENABLE_GEMINI_TREND_SCOUT_POST=False or
-        Gemini's unavailable. One stage_log per direction so the UI
-        can display status independently.
+        Skipped wholesale if ENABLE_SOCIALDATAX_TREND_SCOUT_POST=False or
+        SocialDataX is unavailable. One stage_log per direction so the UI
+        can display status independently. (Stage-log names keep the
+        historical ``gemini_trend_scout_post_*`` keys for UI compatibility.)
         """
-        if not ENABLE_GEMINI_TREND_SCOUT_POST:
+        if not ENABLE_SOCIALDATAX_TREND_SCOUT_POST:
             return
 
         directions = plan.get("tactical_directions") or []
@@ -2388,7 +2471,7 @@ class PipelineOrchestrator:
         # Target per-direction sample count — keep smaller than pre (10)
         # because we hit this once per direction, and too many samples
         # overwhelm the UI comparison.
-        per_direction_count = min(GEMINI_TREND_SCOUT_TARGET_COUNT, 5)
+        per_direction_count = min(SOCIALDATAX_TREND_SCOUT_TARGET_COUNT, 5)
 
         semaphore = asyncio.Semaphore(TREND_SCOUT_POST_CONCURRENCY)
 
@@ -2397,12 +2480,9 @@ class PipelineOrchestrator:
             d_name = str(direction.get("direction_name", "")).strip()
             if not d_id:
                 return "", {}
-            # vibe_hints = soft context about this direction's flavor.
-            # Like the pre-scout, the scout prompt will NOT search these
-            # directly — it uses them to sort results among viral-format
-            # query returns. direction_name + paradigm tells Gemini
-            # "among all current viral xhs posts, prefer ones that
-            # match this particular flavor" without hard-filtering.
+            # SEARCH-KEYWORD candidates for this direction. direction_name
+            # is the topical theme; the paradigm label adds a flavor term.
+            # The scout searches them in order and ranks by real engagement.
             vibe_hints: list[str] = []
             if d_name:
                 vibe_hints.append(d_name)
@@ -3513,6 +3593,17 @@ class PipelineOrchestrator:
                 "[consumer_sim] all %d cells passed 2nd-level consumer check",
                 len(prompt_cells),
             )
+
+
+class TrendScoutRequiredError(RuntimeError):
+    """Raised by _run_gemini_trend_scout_pre when
+    SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True and the scout can't deliver
+    calibration posts (and the brief has none to reuse). Propagates to
+    run()'s top-level handler, which marks the run failed — a deliberate
+    fail-fast: at that point only the 太子 stage has been paid for, whereas
+    silently proceeding without calibration data skews the whole strategy
+    and forces a full rerun.
+    """
 
 
 class PipelineAlreadyRunningError(RuntimeError):

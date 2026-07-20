@@ -239,6 +239,51 @@ with col2:
         st.error("未配置")
         st.caption("在 `.streamlit/secrets.toml` 中设置 `SUPABASE_URL` 和 `SUPABASE_KEY`")
 
+# ── SocialDataX trend sampling ─────────────────────────────────────────────
+
+st.divider()
+st.subheader("SocialDataX 趋势取样")
+
+_sdx_key = (
+    st.secrets.get("SOCIALDATAX_API_KEY", "")
+    or st.secrets.get("SOCIAL_MEDIA_MCP_API_KEY", "")
+).strip()
+try:
+    from pipeline.agents.socialdatax_client import is_available as _sdx_ok
+    from pipeline.config import (
+        ENABLE_SOCIALDATAX_TREND_SCOUT_PRE,
+        SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
+    )
+
+    if _sdx_ok():
+        st.success(f"已配置 (***{_sdx_key[-4:]}) · 直连小红书一手数据")
+        st.caption(
+            "趋势取样(A1)在中书省之前拉真实爆款(原文+互动量)做策略校准。"
+            + (
+                "当前为 **REQUIRED** 模式:取样失败且无可复用数据时 run 会"
+                "提前终止(fail-fast,只消耗太子阶段)。"
+                if SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
+                else "当前为 advisory 模式:失败跳过不阻塞。"
+            )
+        )
+    elif ENABLE_SOCIALDATAX_TREND_SCOUT_PRE and \
+            SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED:
+        st.error(
+            "未配置 `SOCIALDATAX_API_KEY`,而趋势取样当前是 **REQUIRED** "
+            "模式——**每次 run 都会在取样阶段提前失败**。"
+            "去 https://socialdatax.com/?from=npm 申请 Key 填入 "
+            "`.streamlit/secrets.toml` 顶层;或把 `pipeline/config.py` 的 "
+            "`SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED` 设为 `False` 恢复"
+            "跳过不阻塞。"
+        )
+    else:
+        st.warning(
+            "未配置 `SOCIALDATAX_API_KEY`(或依赖缺失)。趋势取样将被"
+            "跳过。申请:https://socialdatax.com/?from=npm"
+        )
+except Exception as _sdx_e:  # noqa: BLE001 — settings 页永不因状态区崩
+    st.warning(f"SocialDataX 状态检查失败:{_sdx_e}")
+
 # ── Gemini auxiliary ────────────────────────────────────────────────────────
 
 st.divider()
@@ -278,7 +323,6 @@ else:
             _role_descriptions: dict[str, str] = {
                 "critic":              "网感二审（烟火气判断）",
                 "structure_reviewer":  "结构审（system_prompt 完整性）",
-                "trend_scout":         "趋势取样（Google Search grounding）",
                 "image_transcriber":   "图片预转写（Vision）",
                 "screenshot_analyzer": "截图分析（Vision）",
                 "reference_analyzer":  "参考帖 URL 抓取分析",
@@ -427,7 +471,8 @@ st.divider()
 st.subheader("模型配置")
 st.caption(
     "当前各环节使用的模型（修改需编辑 `pipeline/config.py`）。"
-    "Opus / Sonnet 都是 Claude；Gemini 是辅助（advisory），失败不阻塞。"
+    "Opus / Sonnet 都是 Claude；Gemini 是辅助（advisory），失败不阻塞；"
+    "SocialDataX 是趋势取样数据源（REQUIRED 模式下取样失败会终止 run）。"
 )
 
 # Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
@@ -438,10 +483,8 @@ GEMINI_ASSIST_STAGES: dict[str, tuple[str, str]] = {
         "reference_analyzer",
         "主判（Gemini-only，url_context 抓用户贴的参考 URL）",
     ),
-    "gemini_trend_scout_pre": (
-        "trend_scout",
-        "主判（Gemini-only，Google 搜小红书原文）",
-    ),
+    # NOTE: trend_scout migrated off Gemini → SocialDataX (first-party XHS).
+    # It no longer runs on Gemini, so it is intentionally absent here.
     "vibe_critic": (
         "critic",
         "二审（Claude 判 pass 的 cell 再过 Gemini）",
@@ -465,6 +508,26 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
     if model:
         tier = "Opus" if "opus" in model else "Sonnet"
         parts.append(f"`{model}` {tier}")
+
+    # SocialDataX-backed trend sampling — not a Gemini stage anymore.
+    # Badge must reflect the REQUIRED/fail-fast reality, not the generic
+    # "未配置 · 跳过" fallback (which would misdirect a user whose run
+    # just died here for lack of an API key).
+    if stage_key == "gemini_trend_scout_pre":
+        try:
+            _available = _sdx_ok()
+        except Exception:
+            _available = False
+        if _available:
+            parts.append("SocialDataX · 趋势取样(直连小红书)")
+        elif SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED and \
+                ENABLE_SOCIALDATAX_TREND_SCOUT_PRE:
+            parts.append(
+                "SocialDataX · _(未配置 — REQUIRED 模式下 run 会在此"
+                "阶段失败,见上方 SocialDataX 区)_"
+            )
+        else:
+            parts.append("SocialDataX · _(未配置 · 跳过)_")
 
     if gemini_desc and ENABLE_GEMINI_ASSIST and _gemini_key:
         # Gemini actually available — show the resolved (per-role) model
