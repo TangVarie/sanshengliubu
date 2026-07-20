@@ -506,18 +506,37 @@ if uncertainty_summary:
                     + supplement_content
                 )
 
+                # Clear any stale revision context so this iteration run starts
+                # clean (same rationale as pages/3 「重跑流水线」). Do NOT pre-set
+                # status="running" here: start_pipeline_in_background's atomic
+                # claim flips the project to running as its side effect, and a
+                # project already marked running would make that claim fail
+                # (PipelineAlreadyRunningError) — which is exactly what happened
+                # before this fix.
+                _clean_brief = dict(existing_brief)
+                _clean_brief.pop("_revision_context", None)
                 db.update_project(
                     project_id,
                     free_text=new_free_text,
                     task_type="iteration",
-                    status="running",
+                    brief=_clean_brief,
                 )
 
-                from pipeline.orchestrator import start_pipeline_in_background
+                from pipeline.orchestrator import (
+                    PipelineAlreadyRunningError,
+                    start_pipeline_in_background,
+                )
                 from pipeline.agents import init_api_config
-                new_run = db.create_pipeline_run(project_id)
                 init_api_config()
-                start_pipeline_in_background(project_id, new_run["id"], db)
+                try:
+                    new_run = db.create_pipeline_run(project_id)
+                    start_pipeline_in_background(project_id, new_run["id"], db)
+                except PipelineAlreadyRunningError as _e:
+                    st.warning(
+                        f"{_e}\n\n如果任务其实已卡死，先到「流水线详情」页点"
+                        "「强制终止卡死任务」重置状态，再重试。"
+                    )
+                    st.stop()
 
                 st.success("已提交补充数据，流水线正在重新优化...")
                 st.session_state["current_project_id"] = project_id

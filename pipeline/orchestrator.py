@@ -290,7 +290,28 @@ class PipelineOrchestrator:
             # deleted the downstream stage_logs. Load it here so we can inject
             # it into the works agents' inputs.
             _project_brief = (self.db.get_project(self.project_id) or {}).get("brief") or {}
-            self._revision_context: dict | None = _project_brief.get("_revision_context")
+            _rc_raw = _project_brief.get("_revision_context")
+            # Only honor revision context created FOR THIS run. A fresh "重跑"
+            # mints a NEW run_id; a context left behind by a previous run must
+            # not silently drag this run into revision mode — that injects stale
+            # _revision_directives into 工部 and makes 终审 do a *delta* review
+            # against a prior_review describing a prompt_matrix that no longer
+            # exists, so it keeps rejecting and never converges ("从来没通过 +
+            # 变得非常奇怪"). Legacy contexts written before this guard carry no
+            # run_id; those are also cleared at the fresh-start trigger sites.
+            if (
+                _rc_raw
+                and _rc_raw.get("run_id")
+                and _rc_raw.get("run_id") != self.run_id
+            ):
+                logger.info(
+                    "[revise] ignoring stale _revision_context (belongs to run "
+                    "%s, this run is %s)",
+                    str(_rc_raw.get("run_id"))[:8],
+                    str(self.run_id)[:8],
+                )
+                _rc_raw = None
+            self._revision_context: dict | None = _rc_raw
             if self._revision_context:
                 logger.info(
                     f"[revise] revision mode active, "
@@ -4561,10 +4582,18 @@ def revise_and_resume_pipeline_in_background(
     project = db.get_project(project_id)
     brief = project.get("brief") or {}
     prior_rc = (brief or {}).get("_revision_context") or {}
-    next_round = int(prior_rc.get("round", 1)) + 1
+    # Only inherit the round counter when the lingering context belongs to THIS
+    # run. A stale context from an abandoned run would otherwise let a run that
+    # has only been rejected once jump straight to (or past) the force-pass
+    # round — or, worse, never advance because plain "重跑" pinned it.
+    if prior_rc.get("run_id") == run_id:
+        next_round = int(prior_rc.get("round", 1)) + 1
+    else:
+        next_round = 2  # round 1 was this run's fresh final review
     logger.info(f"[revise] advancing final-review round to {next_round}")
 
     revision_context = {
+        "run_id": run_id,
         "round": next_round,
         "prior_verdict": final_review.get("verdict", "unknown"),
         "mandatory_revisions": stored_revs,
