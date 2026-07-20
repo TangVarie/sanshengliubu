@@ -7,9 +7,9 @@ import json
 import streamlit as st
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="新建项目", page_icon="📝", layout="wide")
+st.set_page_config(page_title="新建项目", page_icon="省", layout="wide")
 show_version_badge()
-st.title("📝 新建 Prompt 工程项目")
+st.title("新建 Prompt 工程项目")
 
 
 # ── File processing helpers ────────────────────────────────────────────────
@@ -98,7 +98,7 @@ def extract_file_content(uploaded_file) -> str:
     return f"[不支持的文件类型: {uploaded_file.name}]"
 
 
-def _launch_pipeline(db, project, success_message: str = "✅ 流水线已启动！"):
+def _launch_pipeline(db, project, success_message: str = "流水线已启动！"):
     """Create a pipeline run, initialise API, start background pipeline, navigate."""
     from pipeline.orchestrator import start_pipeline_in_background
     from pipeline.agents import init_api_config
@@ -127,7 +127,7 @@ def process_uploaded_files(files) -> str:
     parts = []
     if has_images:
         with st.spinner(
-            f"📷 正在用 Gemini Vision 转写 {len(files)} 个上传文件中的图片(每张 ~5-15s)..."
+            f"正在用 Gemini Vision 转写 {len(files)} 个上传文件中的图片(每张 ~5-15s)..."
         ):
             for f in files:
                 content = extract_file_content(f)
@@ -141,7 +141,7 @@ def process_uploaded_files(files) -> str:
 
 # ── Tabs ───────────────────────────────────────────────────────────────────
 
-tab_new, tab_iterate = st.tabs(["🆕 全新产品", "🔄 迭代 / 扩展"])
+tab_new, tab_iterate = st.tabs(["全新产品", "迭代 / 扩展"])
 
 # ════════════════════════════════════════════════════════════════════════════
 # Tab 1: 全新产品
@@ -152,7 +152,7 @@ with tab_new:
     _prefill = st.session_state.pop("prefill_from_project", None) or {}
     if _prefill:
         st.info(
-            "📋 **已从上一个项目复制了输入**——下面各字段已预填，改你想改的部分然后点「启动」。"
+            "**已从上一个项目复制了输入**——下面各字段已预填，改你想改的部分然后点「启动」。"
         )
 
     st.markdown("#### 基础信息")
@@ -216,7 +216,7 @@ with tab_new:
     )
 
     # ── Reference samples (screenshot-first) ─────────────────────
-    st.markdown("#### 📸 参考爆文（可选但强烈推荐）")
+    st.markdown("#### 参考爆文（可选但强烈推荐）")
     st.caption(
         "上传小红书截图是**最靠谱**的参考方式——Gemini Vision 直接读图提取标题/正文/钩子结构。"
         "URL 因为鉴权问题大概率拿不到内容，所以截图优先。"
@@ -247,7 +247,7 @@ with tab_new:
 
     _selected_sample_ids: list[str] = []
     if _existing_samples:
-        with st.expander(f"📚 从样本库选（已有 {len(_existing_samples)} 条历史样本）"):
+        with st.expander(f"从样本库选（已有 {len(_existing_samples)} 条历史样本）"):
             for _s in _existing_samples:
                 _s_title = _s.get("title", "未命名")
                 _s_type = _s.get("source_type", "?")
@@ -259,7 +259,7 @@ with tab_new:
                 if _checked:
                     _selected_sample_ids.append(_s["id"])
 
-    with st.expander("🔗 URL 输入（次要，大概率只能拿到标题）", expanded=False):
+    with st.expander("URL 输入（次要，大概率只能拿到标题）", expanded=False):
         _prefill_ref_urls = "\n".join(_prefill.get("reference_urls") or [])
         ref_urls_new = st.text_area(
             "贴小红书帖子 URL，每行一个。最多 10 条。",
@@ -270,7 +270,7 @@ with tab_new:
             help="小红书页面需要登录，Gemini 大概率只能拿到 og:title。截图更靠谱。",
         )
 
-    if st.button("🚀 启动流水线", type="primary", use_container_width=True, key="btn_new"):
+    if st.button("启动流水线", type="primary", use_container_width=True, key="btn_new"):
         if not product_name:
             st.error("请填写产品名称。")
         elif not free_text_new:
@@ -361,7 +361,7 @@ with tab_new:
                 _screenshot_analysis: dict = {}
                 if _screenshot_data:
                     with st.spinner(
-                        f"📸 Gemini 正在分析 {len(_screenshot_data)} 张截图..."
+                        f"Gemini 正在分析 {len(_screenshot_data)} 张截图..."
                     ):
                         try:
                             import asyncio
@@ -393,19 +393,19 @@ with tab_new:
                                     except Exception:
                                         pass  # library save is optional
                                 st.success(
-                                    f"📸 截图分析完成：{len(_screenshot_analysis.get('screenshots', []))} 张"
+                                    f"截图分析完成：{len(_screenshot_analysis.get('screenshots', []))} 张"
                                 )
                             else:
                                 st.warning(
-                                    f"📸 截图分析跳过：{_screenshot_analysis.get('_skip_reason', '?')}"
+                                    f"截图分析跳过：{_screenshot_analysis.get('_skip_reason', '?')}"
                                 )
                         except Exception as _err:
-                            st.warning(f"📸 截图分析异常（不影响流水线）：{_err}")
+                            st.warning(f"截图分析异常（不影响流水线）：{_err}")
 
                 if _brief_init:
                     db.update_project(project["id"], brief=_brief_init)
 
-                _msgs = ["✅ 流水线已启动！"]
+                _msgs = ["流水线已启动！"]
                 if _ref_urls:
                     _msgs.append(f"已记录 {len(_ref_urls)} 条 URL。")
                 if _screenshot_data:
@@ -428,7 +428,7 @@ with tab_iterate:
     )
 
     is_extend = st.checkbox(
-        "📐 扩展新方向（保留原有方向，新增内容角度）", key="iter_extend",
+        "扩展新方向（保留原有方向，新增内容角度）", key="iter_extend",
     )
     task_type_iter = "extension" if is_extend else "iteration"
 
@@ -477,7 +477,7 @@ with tab_iterate:
                 key="iter_files",
             )
 
-            if st.button("🚀 启动迭代流水线", type="primary", use_container_width=True, key="btn_iter"):
+            if st.button("启动迭代流水线", type="primary", use_container_width=True, key="btn_iter"):
                 if not iter_notes:
                     st.error("请填写需要改什么。")
                 else:
@@ -528,7 +528,7 @@ with tab_iterate:
             key="mig_notes",
         )
 
-        if st.button("🚀 启动迭代流水线", type="primary", use_container_width=True, key="btn_mig"):
+        if st.button("启动迭代流水线", type="primary", use_container_width=True, key="btn_mig"):
             if not m_name:
                 st.error("请填写产品名称。")
             elif not prompt_files:
