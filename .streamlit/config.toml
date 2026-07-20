@@ -1,8 +1,11 @@
+# Base theme. Kept in sync with utils/theme.py PALETTE so any native chrome
+# we don't override in CSS still matches (avoids a color flash on first paint).
 [theme]
-primaryColor = "#c62828"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#fafafa"
-textColor = "#333333"
+primaryColor = "#9E2B25"
+backgroundColor = "#F5EFE3"
+secondaryBackgroundColor = "#FDFBF6"
+textColor = "#2C2620"
+font = "sans serif"
 
 [server]
 headless = true

@@ -1,27 +1,21 @@
 """项目总览 — Dashboard page showing all projects and their status."""
 
-import streamlit as st
 import time
+
+import streamlit as st
+
 from db.supabase_client import SupabaseClient
+from utils.theme import eyebrow, status_tag_html
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="项目总览", page_icon="📋", layout="wide")
+st.set_page_config(page_title="项目总览", page_icon="🏛️", layout="wide")
 show_version_badge()
-st.title("📋 项目总览")
-
-STATUS_EMOJI = {
-    "draft": "📝",
-    "running": "🔄",
-    "completed": "✅",
-    "failed": "❌",
-    "needs_revision": "📝🔁",
-    "paused_for_review": "⏸️",
-}
+st.title("项目总览")
 
 TASK_TYPE_LABEL = {
-    "new_system": "🆕 全新系统",
-    "iteration": "🔄 迭代优化",
-    "extension": "📐 扩展方向",
+    "new_system": "全新系统",
+    "iteration": "迭代优化",
+    "extension": "扩展方向",
 }
 
 try:
@@ -29,48 +23,49 @@ try:
     projects = db.list_projects(limit=50)
 
     if not projects:
-        st.info("暂无项目，点击左侧「新建项目」开始。")
+        st.info("暂无项目。点击左侧「新建项目」提交第一份 brief 启动流水线。")
     else:
         # Quick stats
-        col1, col2, col3, col4, col5 = st.columns(5)
         total = len(projects)
         running = sum(1 for p in projects if p["status"] == "running")
         completed = sum(1 for p in projects if p["status"] == "completed")
         needs_rev = sum(1 for p in projects if p["status"] == "needs_revision")
         failed = sum(1 for p in projects if p["status"] == "failed")
 
+        eyebrow("概览", "overview")
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("总项目数", total)
         col2.metric("运行中", running)
         col3.metric("已完成", completed)
         col4.metric("待修订", needs_rev)
         col5.metric("失败", failed)
 
-        st.divider()
+        st.markdown("")
+        eyebrow("全部项目", f"{total} projects")
 
         # Project list
         for project in projects:
             pid = project["id"]
             status = project.get("status", "draft")
-            emoji = STATUS_EMOJI.get(status, "❓")
-            task_label = TASK_TYPE_LABEL.get(project.get("task_type", ""), "")
+            task_label = TASK_TYPE_LABEL.get(project.get("task_type", ""), "—")
             created = project.get("created_at", "")[:16].replace("T", " ")
 
             with st.container(border=True):
-                c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 1, 1])
+                c1, c2, c3, c4 = st.columns([5, 3, 1.4, 1])
                 with c1:
-                    st.markdown(f"### {emoji} {project['name']}")
+                    st.markdown(f"### {project['name']}")
+                    st.markdown(status_tag_html(status), unsafe_allow_html=True)
                 with c2:
                     st.caption(f"类型：{task_label}")
                     st.caption(f"创建：{created}")
                 with c3:
-                    st.caption(f"状态：**{status}**")
-                with c4:
-                    if st.button("查看详情", key=f"view_{pid}"):
+                    if st.button("查看详情", key=f"view_{pid}", use_container_width=True):
                         st.session_state["current_project_id"] = pid
                         st.query_params["project_id"] = pid
                         st.switch_page("pages/3_pipeline_detail.py")
-                with c5:
-                    if st.button("🗑️", key=f"del_{pid}", help="删除项目"):
+                with c4:
+                    if st.button("删除", key=f"del_{pid}", help="删除项目",
+                                 use_container_width=True):
                         st.session_state[f"confirm_del_{pid}"] = True
 
             if st.session_state.get(f"confirm_del_{pid}"):
@@ -93,7 +88,7 @@ try:
         # yanking out from under them.
         if running > 0:
             _auto = st.toggle(
-                "🔄 自动刷新（每 5 秒）",
+                "自动刷新（每 5 秒）",
                 value=st.session_state.get("dashboard_auto_refresh", True),
                 key="dashboard_auto_refresh",
             )
