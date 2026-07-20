@@ -506,6 +506,25 @@ THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 CLAUDE_RPM_LIMIT = 15
 CLAUDE_MAX_CONCURRENT = 16
 
+# ── Adaptive RPM safety valve ────────────────────────────────────────────
+# CLAUDE_RPM_LIMIT above is the KNOWN-SAFE floor. When adaptive mode is on,
+# the limiter starts optimistically at CLAUDE_RPM_CEILING and only backs off
+# toward the floor when the relay actually returns rate-limit (429) errors —
+# then slowly probes back up. This means: if the account can sustain more
+# than 15/min we get the speed for free; if it can't, we auto-fall-back to
+# the safe floor so throttling stays the *relay's* problem, never a flood we
+# created. Set CLAUDE_RPM_ADAPTIVE=False to pin the rate at CLAUDE_RPM_LIMIT.
+CLAUDE_RPM_ADAPTIVE = True
+# Optimistic ceiling to probe toward. Never sends more than this per minute.
+CLAUDE_RPM_CEILING = 60
+# On each observed 429/rate-limit, multiply the effective RPM by this
+# (bounded below by the floor). 0.5 = halve on every throttle signal.
+CLAUDE_RPM_BACKOFF_FACTOR = 0.5
+# After this many seconds with no new 429, step the effective RPM up by
+# CLAUDE_RPM_RECOVERY_STEP (probing back toward the ceiling).
+CLAUDE_RPM_RECOVERY_SECONDS = 45
+CLAUDE_RPM_RECOVERY_STEP = 3
+
 # ── Per-run budget ───────────────────────────────────────────────────────
 # Hard ceiling on combined input + output tokens accumulated within a
 # single pipeline run. Once exceeded, the next agent call raises

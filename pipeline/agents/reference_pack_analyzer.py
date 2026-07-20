@@ -140,12 +140,20 @@ def analyze_reference_pack(pack: dict) -> dict[str, Any]:
 
     client = _shim._get_client()
 
+    # Wrap in the shared bounded-backoff retry so a transient 429/5xx/timeout
+    # on the relay doesn't drop the pack into the failed bucket on the first
+    # blip (the docstring above claimed retry reuse but the call was bare).
+    from pipeline.llm_retry import call_with_retry
+
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=8000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
+        response = call_with_retry(
+            lambda: client.messages.create(
+                model=model,
+                max_tokens=8000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            ),
+            operation="reference_pack_analyzer",
         )
     except Exception as e:
         logger.exception("[reference_pack_analyzer] API call failed")
