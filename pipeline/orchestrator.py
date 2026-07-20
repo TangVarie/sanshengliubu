@@ -1747,71 +1747,80 @@ class PipelineOrchestrator:
         }
         shared_skeleton = works_plan.get("shared_skeleton", {})
 
-        for revision in cells_to_revise:
+        # Rebuild flagged cells in PARALLEL (bounded) — each targets a
+        # distinct cell_id and is independent, so the old serial `for` loop
+        # (the only cell stage that wasn't parallelized) just added
+        # per-flagged-cell latency to the critical path. Collect results,
+        # then splice back by cell_id (order-independent).
+        _sem = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
+
+        async def _rebuild_one(revision: dict):
             cid = revision.get("cell_id")
             fix = revision.get("fix_instruction", "")
             if not cid or not fix:
-                continue
+                return None
             cell_plan = cell_plans_by_id.get(cid)
             if not cell_plan:
-                continue
+                return None
+            async with _sem:
+                logger.info(
+                    "[narrative_director] rebuilding %s: %s", cid, fix[:100]
+                )
+                try:
+                    # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
+                    # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
+                    _brief_for_rebuild = {
+                        "product_name": (brief or {}).get("product_name", ""),
+                        "core_claim": (brief or {}).get("core_claim", ""),
+                        "target_audience": (brief or {}).get("target_audience", ""),
+                        "competitive_context": (brief or {}).get("competitive_context", ""),
+                        "_user_raw_input": (
+                            (brief or {}).get("_user_raw_input")
+                            or (brief or {}).get("_raw_input_text", "")
+                        ),
+                    } if brief else {}
+                    rebuild_input = {
+                        "active_cells": [cell_plan],
+                        "shared_skeleton": shared_skeleton,
+                        "brief": _brief_for_rebuild,
+                        "_batch_info": {
+                            "label": f"叙事导演修复 {cid}",
+                            "round": "narrative_fix",
+                            "cell_ids": [cid],
+                        },
+                        "_narrative_directive": fix,
+                        "_strict_contract": (
+                            f"叙事导演要求修改这个 cell：{fix}\n"
+                            f"在保留原有合规/关键词/人设的前提下，按指令调整 "
+                            f"demo_output 的钩子结构或叙事方式。"
+                        ),
+                    }
+                    rebuilt = await self.works_builder.run(
+                        rebuild_input, self.run_id, self.db
+                    )
+                    for nc in (rebuilt.get("prompt_cells") or []):
+                        if nc.get("cell_id") == cid:
+                            return (cid, nc)
+                    return None
+                except Exception as e:
+                    logger.warning(
+                        "[narrative_director] rebuild %s failed: %r", cid, e
+                    )
+                    return None
 
-            logger.info(
-                "[narrative_director] rebuilding %s: %s",
-                cid,
-                fix[:100],
-            )
-            try:
-                # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
-                # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
-                _brief_for_rebuild = {
-                    "product_name": (brief or {}).get("product_name", ""),
-                    "core_claim": (brief or {}).get("core_claim", ""),
-                    "target_audience": (brief or {}).get("target_audience", ""),
-                    "competitive_context": (brief or {}).get("competitive_context", ""),
-                    "_user_raw_input": (
-                        (brief or {}).get("_user_raw_input")
-                        or (brief or {}).get("_raw_input_text", "")
-                    ),
-                } if brief else {}
-                rebuild_input = {
-                    "active_cells": [cell_plan],
-                    "shared_skeleton": shared_skeleton,
-                    "brief": _brief_for_rebuild,
-                    "_batch_info": {
-                        "label": f"叙事导演修复 {cid}",
-                        "round": "narrative_fix",
-                        "cell_ids": [cid],
-                    },
-                    "_narrative_directive": fix,
-                    "_strict_contract": (
-                        f"叙事导演要求修改这个 cell：{fix}\n"
-                        f"在保留原有合规/关键词/人设的前提下，按指令调整 "
-                        f"demo_output 的钩子结构或叙事方式。"
-                    ),
-                }
-                rebuilt = await self.works_builder.run(
-                    rebuild_input, self.run_id, self.db
-                )
-                new_cells = rebuilt.get("prompt_cells") or []
-                for nc in new_cells:
-                    if nc.get("cell_id") == cid:
-                        # Replace in prompt_matrix
-                        for i, c in enumerate(prompt_cells):
-                            if c.get("cell_id") == cid:
-                                prompt_cells[i] = nc
-                                logger.info(
-                                    "[narrative_director] rebuilt %s OK",
-                                    cid,
-                                )
-                                break
-                        break
-            except Exception as e:
-                logger.warning(
-                    "[narrative_director] rebuild %s failed: %r",
-                    cid,
-                    e,
-                )
+        _results = await asyncio.gather(
+            *[_rebuild_one(r) for r in cells_to_revise],
+            return_exceptions=True,
+        )
+        _idx_by_id = {c.get("cell_id"): i for i, c in enumerate(prompt_cells)}
+        for _r in _results:
+            if isinstance(_r, BaseException) or not _r:
+                continue
+            _cid, _nc = _r
+            _i = _idx_by_id.get(_cid)
+            if _i is not None:
+                prompt_cells[_i] = _nc
+                logger.info("[narrative_director] rebuilt %s OK", _cid)
 
         final_system["prompt_matrix"] = prompt_cells
 

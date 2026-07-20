@@ -456,12 +456,12 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-MATRIX_BATCH_CONCURRENCY = 3    # parallel builder calls
+MATRIX_BATCH_CONCURRENCY = 5    # parallel builder calls
 MATRIX_CELLS_PER_BATCH = 1      # one cell per call (safest for JSON structure)
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
-CELL_PLANNER_CONCURRENCY = 3    # parallel cell-planner calls
+CELL_PLANNER_CONCURRENCY = 5    # parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # 6 strategy/review/compliance stages use extended thinking (budget_tokens
@@ -748,8 +748,8 @@ STRATEGIC_LOOP_MAX_ITERATIONS = 1
 ENABLE_CONSUMER_SIMULATION = True
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
-RED_BLUE_CONCURRENCY = 3
-TREND_SCOUT_POST_CONCURRENCY = 3
+RED_BLUE_CONCURRENCY = 5
+TREND_SCOUT_POST_CONCURRENCY = 5
 
 # ── UI polling ─────────────────────────────────────────────────────────────
 
