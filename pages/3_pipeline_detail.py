@@ -13,12 +13,19 @@ from pipeline.config import (
     MAX_TOKENS_PER_RUN,
     PIPELINE_STAGES,
     POLL_INTERVAL_SECONDS,
+    RUN_STALE_SECONDS,
 )
 from pipeline.logger_utils import mask_secrets
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="省", layout="wide")
 show_version_badge()
+
+# Reap zombie runs (stale heartbeat) before rendering — a run whose process
+# was killed gets marked failed here instead of spinning forever.
+from utils.liveness import maybe_reap_stale_runs
+
+maybe_reap_stale_runs()
 
 
 def render_stage_error(log: dict) -> None:
@@ -667,47 +674,66 @@ for ni_log in needs_input_logs:
 # force-reset the project state — new runs can then be triggered and
 # the zombie thread is just ignored (its future writes land on a run
 # nobody looks at).
-STUCK_THRESHOLD_SECONDS = 300  # 5 minutes since last stage_log update
+# Liveness is now judged by the run's HEARTBEAT (ticks every ~10s
+# independent of stage progress), not by stage_log.updated_at. That fixes
+# the old false-positive where a healthy multi-minute stage (extended
+# thinking / big output / grounded Gemini) looked "stuck" and scared users
+# into force-killing a run that was fine. Only a genuinely dead process
+# (killed thread) stops the beat — and the reaper collects those.
+STUCK_THRESHOLD_SECONDS = 300  # fallback only, for runs with no heartbeat
 
 if status == "running":
-    # Find the most recent update across stage_logs
-    _most_recent = 0.0
-    for _l in stage_logs:
-        _ts = _l.get("updated_at") or _l.get("created_at")
-        if not _ts:
-            continue
+    from datetime import datetime as _dt
+
+    def _age(ts) -> float | None:
+        if not ts:
+            return None
         try:
-            from datetime import datetime as _dt
-            # Supabase timestamps are ISO8601 with timezone
-            _ts_str = str(_ts).replace("Z", "+00:00")
-            _dt_obj = _dt.fromisoformat(_ts_str)
-            _most_recent = max(_most_recent, _dt_obj.timestamp())
+            return time.time() - _dt.fromisoformat(
+                str(ts).replace("Z", "+00:00")
+            ).timestamp()
         except Exception:
-            continue
+            return None
 
-    if _most_recent > 0:
-        _elapsed = time.time() - _most_recent
-        _looks_stuck = _elapsed > STUCK_THRESHOLD_SECONDS
+    _hb_age = _age(run.get("heartbeat_at"))
+    _stage_ages = [
+        a for a in (
+            _age(_l.get("updated_at") or _l.get("created_at"))
+            for _l in stage_logs
+        ) if a is not None
+    ]
+    _stage_age = min(_stage_ages) if _stage_ages else None
+
+    if _hb_age is not None:
+        _looks_stuck = _hb_age > RUN_STALE_SECONDS
+        _liveness_note = f"心跳 {int(_hb_age)}s 前"
     else:
-        _looks_stuck = False
-        _elapsed = 0.0
+        # No heartbeat (run started before this column existed) — fall back
+        # to stage updates with the generous legacy threshold.
+        _looks_stuck = _stage_age is not None and _stage_age > STUCK_THRESHOLD_SECONDS
+        _liveness_note = (
+            f"最近阶段更新 {int(_stage_age)}s 前"
+            if _stage_age is not None else "尚无阶段更新"
+        )
 
-    # Always show a cancel button when status=running (primary escape
-    # hatch). Make the stuck banner loud so the user sees why they'd
-    # click it.
+    # Always show a cancel button when status=running (escape hatch), but
+    # only make the banner loud when the heartbeat is genuinely stale.
     with st.container(border=True):
         if _looks_stuck:
-            st.error(
-                f"**流水线疑似卡死** — 已经 {int(_elapsed // 60)} 分 "
-                f"{int(_elapsed % 60)} 秒没有任何阶段更新。"
-                f"大概率是某个外部调用（中转站 / Gemini / 网络）被 hang 住。"
-                f"Python 无法从外部杀死后台线程，但可以**强制重置状态**让你重新开始——"
-                f"点下面按钮即可。"
+            st.warning(
+                f"**流水线较久无心跳**（{_liveness_note}）。通常意味着运行"
+                f"进程已被 Cloud 回收 / 重启，后台线程中断——系统会在刷新时自动"
+                f"把它标记为 failed（reaper）。如需立即清理并重来，可点下面强制终止。"
             )
         else:
+            _extra = (
+                f"，最近阶段更新 {int(_stage_age)}s 前"
+                if _stage_age is not None else "，当前阶段进行中"
+            )
             st.info(
-                f"流水线正在执行（最近更新 {int(_elapsed)} 秒前）。"
-                f"需要中止当前任务可以点下面的强制终止。"
+                f"流水线正在执行（{_liveness_note}{_extra}）。"
+                f"长阶段（深度推理 / 大产出 / 联网取样）可能几分钟没有阶段更新，"
+                f"只要心跳在跳就一切正常，不用强制终止。"
             )
 
         _force_busy_key = f"force_cancel_busy_{project_id}"
@@ -796,6 +822,36 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
                 f"<div style='text-align:center;color:#999'>{stage_icon}<br>{stage_label}</div>",
                 unsafe_allow_html=True,
             )
+
+# ── Run-level failure surface ───────────────────────────────────────────────
+# Orchestration-layer failures (empty cells, count mismatches, aggregated 六部
+# failures, force-cancel) log under MARKER names that are NOT in PIPELINE_STAGES,
+# so the progress row above can show all-green while the run is actually failed.
+# Surface them here so a failed run is never "莫名其妙" with zero explanation.
+_MARKER_NAMES = ("_pipeline_error", "_thread_target", "_force_cancelled")
+_markers = [
+    log_map[n] for n in _MARKER_NAMES
+    if (log_map.get(n) or {}).get("status") == "failed"
+]
+_run_failed = (run or {}).get("status") == "failed"
+_any_failed_log = any(
+    (lg or {}).get("status") == "failed" for lg in log_map.values()
+)
+if _markers:
+    st.markdown("### ❌ 流水线在编排层失败")
+    for _lg in _markers:
+        render_stage_error(_lg)
+elif _run_failed and not _any_failed_log:
+    # run says failed but NOTHING left an error anywhere → almost always the
+    # process was recycled/killed by Cloud mid-run and the daemon thread
+    # died before it could write status. The startup reaper marks these, but
+    # surface a clear explanation regardless of who set the status.
+    st.markdown("### ❌ 流水线失败（无错误详情）")
+    st.error(
+        "run 标记为 failed，但没有任何阶段留下错误详情——通常是运行进程被 "
+        "Cloud 回收 / 强制重启，后台线程当场中断、来不及把失败原因落库。"
+        "可以点下方「重跑流水线」重来；若反复发生请查看服务端运行日志。"
+    )
 
 # ── Stage Details ──────────────────────────────────────────────────────────
 
@@ -1953,16 +2009,70 @@ with c3:
             st.session_state[_actions_busy_key] = False
             st.error(f"重跑失败：{_err}")
 
-# Auto-refresh when running or paused for review (waiting for user input).
-# Streamlit has no server-push, so live progress requires periodic reruns.
-# Gated by a user toggle so the page doesn't yank out while someone's reading
-# a stage log mid-run.
+# Live auto-refresh via a fragment WATCHER (not a blocking full-page rerun).
+#
+# The old code did `time.sleep(POLL); st.rerun()` at the bottom: that blocked
+# the single Streamlit script thread for POLL seconds (so buttons clicked
+# during that window did nothing — the "点了没反应" jank) AND re-ran the whole
+# ~2000-line page every 3s, re-pulling the full stage payload (output_data)
+# and re-rendering every tab.
+#
+# Instead this fragment re-runs ONLY ITSELF every POLL seconds (st.fragment
+# run_every), doing a tiny status-only poll. The heavy page body stays put and
+# stays responsive. When the set of stage statuses (or the run status) actually
+# changes, it escalates to a single full-page rerun so the progress row + tab
+# details refresh with the new output. No change → no full rerun → no jank.
 if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
     _auto = st.toggle(
-        f"自动刷新（每 {POLL_INTERVAL_SECONDS} 秒）",
+        f"自动刷新（每 {POLL_INTERVAL_SECONDS} 秒，只轮询状态、不阻塞页面）",
         value=st.session_state.get("detail_auto_refresh", True),
         key="detail_auto_refresh",
     )
-    if _auto:
-        time.sleep(POLL_INTERVAL_SECONDS)
-        st.rerun()
+
+    @st.fragment(run_every=(POLL_INTERVAL_SECONDS if _auto else None))
+    def _live_watcher():
+        try:
+            _statuses = db.get_stage_statuses(run_id)   # light: no output_data
+            _run_now = db.get_pipeline_run(run_id)
+        except Exception:
+            return  # transient poll failure — try again next tick, don't crash
+
+        _done = sum(1 for s in _statuses if s.get("status") == "completed")
+        _cur = next(
+            (s.get("stage_name") for s in reversed(_statuses)
+             if s.get("status") == "running"),
+            None,
+        )
+        _hb_age = None
+        _hb = _run_now.get("heartbeat_at")
+        if _hb:
+            try:
+                from datetime import datetime as _dt
+                _hb_age = int(
+                    time.time()
+                    - _dt.fromisoformat(str(_hb).replace("Z", "+00:00")).timestamp()
+                )
+            except Exception:
+                _hb_age = None
+        _bits = [f"🔄 {_run_now.get('status', '?')}", f"{_done} 个阶段完成"]
+        if _cur:
+            _bits.insert(1, f"当前 `{_cur}`")
+        if _hb_age is not None:
+            _bits.append(f"心跳 {_hb_age}s 前")
+        st.caption(" · ".join(_bits) + "　（状态变化时自动刷新整页）")
+
+        # Escalate to a full-page rerun only when meaningful state changed.
+        _sig = (
+            _run_now.get("status"),
+            tuple(sorted(
+                (s.get("stage_name", ""), s.get("status", ""))
+                for s in _statuses
+            )),
+        )
+        _key = f"_watch_sig_{run_id}"
+        _prev = st.session_state.get(_key)
+        st.session_state[_key] = _sig
+        if _prev is not None and _sig != _prev:
+            st.rerun()  # full app rerun → progress row + tab details refresh
+
+    _live_watcher()

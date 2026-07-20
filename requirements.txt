@@ -1,7 +1,10 @@
 # Upper bounds pin the next major version so a `pip install -U` can't
 # silently pull a breaking release into a working deployment. Bump the
 # ceiling deliberately after verifying the new major locally.
-streamlit>=1.32.0,<2.0.0
+# Floor at 1.37: st.fragment (stable) is required by the live-progress
+# watcher in pages/3 (non-blocking auto-refresh). Older versions only had
+# st.experimental_fragment.
+streamlit>=1.37.0,<2.0.0
 anthropic[vertex]>=0.25.0,<1.0.0
 google-auth>=2.20.0,<3.0.0
 # Gemini (Vertex AI Express API key or Studio API key). Optional —

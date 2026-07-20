@@ -24,7 +24,12 @@ from db.supabase_client import SupabaseClient
 from pipeline.config import (
     CLAUDE_FALLBACK_CHAIN,
     CLAUDE_MAX_CONCURRENT,
+    CLAUDE_RPM_ADAPTIVE,
+    CLAUDE_RPM_BACKOFF_FACTOR,
+    CLAUDE_RPM_CEILING,
     CLAUDE_RPM_LIMIT,
+    CLAUDE_RPM_RECOVERY_SECONDS,
+    CLAUDE_RPM_RECOVERY_STEP,
     COST_PER_1M_INPUT,
     COST_PER_1M_OUTPUT,
     ENABLE_PROMPT_CACHING,
@@ -37,22 +42,123 @@ from pipeline.config import (
     THINKING_BUDGET_TOKENS,
     THINKING_STAGES,
 )
+from pipeline.logger_utils import mask_secrets
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
+# Relay "no upstream channel" phrasings, English + common Chinese-relay
+# variants (tdyun/vectorengine/等国内中转 return Chinese). Matching these
+# routes the model through the Claude fallback chain instead of failing the
+# whole stage. Kept specific enough to NOT swallow generic auth/quota errors.
+_NO_CHANNEL_MARKERS = (
+    "no available channel",
+    "no channel for model",
+    "无可用渠道",
+    "无可用通道",
+    "没有可用渠道",
+    "当前分组下对于模型",   # tdyun: "当前分组下对于模型 X 无可用渠道"
+    "上游负载已饱和",
+    "无可用的渠道",
+)
+
+
 def _is_no_channel_error(exc: BaseException) -> bool:
     """True if the error looks like a relay "no upstream channel for this
-    model" rejection, e.g. "No available channel for model claude-opus-4-7".
-
-    Match is intentionally loose (covers "no available channel" and
-    "no channel for model" phrasings across relay vendors) so a model that
-    a relay can't currently route triggers the Claude fallback chain in
-    _call_claude instead of failing the whole stage. Kept narrow enough to
-    NOT swallow generic auth/quota/validation errors.
-    """
+    model" rejection (English or Chinese-relay phrasing). Such errors are
+    routing failures, not model failures — they should trigger the Claude
+    fallback chain in _call_claude, not fail the stage."""
     msg = str(exc).lower()
-    return "no available channel" in msg or "no channel for model" in msg
+    return any(m.lower() in msg for m in _NO_CHANNEL_MARKERS)
+
+
+# Rate-limit phrasings across vendors. Used to (a) trip the adaptive-RPM
+# safety valve and (b) classify the error as transient with long backoff.
+_RATE_LIMIT_MARKERS = (
+    "429", "rate limit", "rate_limit", "too many request",
+    "请求过于频繁", "请求频率", "限流", "quota", "overloaded",
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True for 429 / rate-limit / overloaded errors from any vendor."""
+    try:
+        import anthropic as _anthropic
+        if isinstance(exc, _anthropic.RateLimitError):
+            return True
+    except Exception:
+        pass
+    try:
+        import openai as _openai
+        if isinstance(exc, getattr(_openai, "RateLimitError", ())):
+            return True
+    except Exception:
+        pass
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _RATE_LIMIT_MARKERS)
+
+
+def _classify_llm_error(exc: BaseException, attempt: int) -> tuple[bool, bool]:
+    """Vendor-agnostic error classification. Returns (retryable, is_5xx).
+
+    Works for anthropic.* AND openai.* AND relay errors surfaced as plain
+    strings — the old code only isinstance'd anthropic.*, so every GPT
+    (openai.*) error fell through to the default 'retryable=True', wasting
+    retries on auth/400 and using the wrong backoff for 5xx.
+    """
+    # Non-retryable: auth / permission / malformed request (except the
+    # cache_control fault, which _call_claude self-heals by retrying).
+    import anthropic as _anthropic
+    _low = str(exc).lower()
+    _status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+
+    _auth_types: tuple = (
+        _anthropic.AuthenticationError,
+        _anthropic.PermissionDeniedError,
+    )
+    _badreq_types: tuple = (_anthropic.BadRequestError,)
+    try:
+        import openai as _openai
+        _auth_types += (
+            getattr(_openai, "AuthenticationError", ()),
+            getattr(_openai, "PermissionDeniedError", ()),
+        )
+        _badreq_types += (getattr(_openai, "BadRequestError", ()),)
+    except Exception:
+        pass
+
+    if isinstance(exc, _auth_types) or _status in (401, 403):
+        return (False, False)
+    if _status == 400 or isinstance(exc, _badreq_types):
+        # A 400 that's a cache_control fault IS retryable (self-heal path).
+        return ("cache_control" in _low, False)
+    # No-channel / rate-limit / 5xx / timeout / connection = transient.
+    _is_5xx = bool(
+        (_status is not None and 500 <= int(_status) < 600)
+        or isinstance(
+            exc,
+            (_anthropic.InternalServerError, _anthropic.APIConnectionError),
+        )
+        or any(s in _low for s in ("500", "502", "503", "504", "bad gateway",
+                                   "service unavailable", "gateway timeout",
+                                   "internal server", "connection", "timed out",
+                                   "timeout", "eof occurred", "broken pipe"))
+    )
+    # JSON parse failures: allow at most one retry (transient model weirdness).
+    if isinstance(exc, (ValueError, json.JSONDecodeError)):
+        return (attempt < 1, False)
+    return (True, _is_5xx)
+
+
+def note_rate_limit_hit(stage_name: str = "") -> None:
+    """Module-level hook: tell the active limiter a 429 was observed so its
+    adaptive safety valve backs the effective RPM off toward the floor."""
+    lim = _get_active_limiter()
+    if lim is not None:
+        lim.note_rate_limited(stage_name)
 
 
 # ── API config cache (populated in main thread, used by background threads) ──
@@ -338,9 +444,25 @@ class _SlidingWindowLimiter:
     later fails.
     """
 
-    def __init__(self, max_per_minute: int, max_concurrent: int):
-        self.max_per_minute = int(max_per_minute)
+    def __init__(
+        self,
+        max_per_minute: int,
+        max_concurrent: int,
+        *,
+        adaptive: bool = CLAUDE_RPM_ADAPTIVE,
+        ceiling: int = CLAUDE_RPM_CEILING,
+    ):
+        # max_per_minute is the KNOWN-SAFE FLOOR. When adaptive, the
+        # effective rate starts at `ceiling` and backs off toward the
+        # floor on observed throttling (see note_rate_limited / recovery).
+        self.max_per_minute = int(max_per_minute)  # floor
         self.max_concurrent = int(max_concurrent)
+        self.adaptive = bool(adaptive)
+        self.ceiling = max(int(ceiling), int(max_per_minute))
+        # Effective RPM currently in force. Start optimistic when adaptive.
+        self._effective = self.ceiling if self.adaptive else self.max_per_minute
+        self._last_throttle = 0.0   # time.time() of last observed 429
+        self._last_recovery = 0.0   # time.time() of last upward probe
         self._lock = threading.Lock()
         self._history: collections.deque[float] = collections.deque()
         # threading.Semaphore is process-wide and works across asyncio
@@ -352,7 +474,8 @@ class _SlidingWindowLimiter:
         the active relay preset changes (each preset carries its own
         RPM / concurrency).
 
-        RPM limit is updated under the lock so it lands atomically.
+        RPM floor is updated under the lock so it lands atomically. The
+        adaptive effective rate is clamped back into [floor, ceiling].
 
         Concurrency semaphore: rather than swapping the semaphore object
         (which leaves in-flight holders releasing into a dead reference),
@@ -364,19 +487,64 @@ class _SlidingWindowLimiter:
         with self._lock:
             self.max_per_minute = int(max_per_minute)
             self.max_concurrent = int(max_concurrent)
+            self.ceiling = max(self.ceiling, self.max_per_minute)
+            self._effective = min(max(self._effective, self.max_per_minute), self.ceiling)
+
+    def note_rate_limited(self, stage_name: str = "") -> None:
+        """Safety valve: called when the relay returns a 429 / rate-limit.
+        Drops the effective RPM toward the safe floor and starts a cooldown
+        before probing back up. Idempotent-ish under a burst of 429s (each
+        one nudges it lower, bounded by the floor)."""
+        if not self.adaptive:
+            return
+        with self._lock:
+            now = time.time()
+            # Coalesce bursts: don't stack multiple backoffs within 2s.
+            if now - self._last_throttle < 2.0:
+                self._last_throttle = now
+                return
+            prev = self._effective
+            self._effective = max(
+                self.max_per_minute,
+                int(self._effective * CLAUDE_RPM_BACKOFF_FACTOR),
+            )
+            self._last_throttle = now
+            self._last_recovery = now
+        if prev != self._effective:
+            logger.warning(
+                "[%s] adaptive RPM: 429 observed, backing off %d → %d/min "
+                "(floor=%d)",
+                stage_name or "rate", prev, self._effective, self.max_per_minute,
+            )
+
+    def _maybe_recover(self, now: float) -> None:
+        """Under lock: probe the effective RPM back up toward the ceiling
+        after a quiet period with no throttling."""
+        if not self.adaptive or self._effective >= self.ceiling:
+            return
+        anchor = max(self._last_throttle, self._last_recovery)
+        if now - anchor >= CLAUDE_RPM_RECOVERY_SECONDS:
+            self._effective = min(
+                self.ceiling, self._effective + CLAUDE_RPM_RECOVERY_STEP
+            )
+            self._last_recovery = now
 
     def _wait_for_window(self, stage_name: str) -> None:
         """Block until our timestamp can be appended to the rolling
-        window without exceeding max_per_minute."""
-        if self.max_per_minute <= 0:
+        window without exceeding the current effective RPM."""
+        if self.max_per_minute <= 0 and not self.adaptive:
             return  # disabled
         while True:
             with self._lock:
                 now = time.time()
+                self._maybe_recover(now)
+                limit = self._effective if self.adaptive else self.max_per_minute
+                if limit <= 0:
+                    return  # disabled
                 # Drop entries older than 60s
                 while self._history and now - self._history[0] >= 60.0:
                     self._history.popleft()
-                if len(self._history) < self.max_per_minute:
+                if len(self._history) < limit:
                     self._history.append(now)
                     return
                 # +0.1s slack so we don't wake up exactly at the boundary
@@ -384,7 +552,7 @@ class _SlidingWindowLimiter:
                 wait_for = 60.0 - (now - self._history[0]) + 0.1
             logger.info(
                 f"[{stage_name}] rate limiter: window full "
-                f"({self.max_per_minute}/min), sleeping {wait_for:.1f}s"
+                f"({limit}/min effective), sleeping {wait_for:.1f}s"
             )
             time.sleep(wait_for)
 
@@ -1043,12 +1211,44 @@ class BaseAgent:
         _model_low = (effective_model or "").lower()
         _is_gpt_family = _model_low.startswith("gpt-")
         if _is_gpt_family:
-            return self._call_openai_chat(
-                system_prompt=system_prompt,
-                user_message=user_message,
-                effective_model=effective_model,
-                max_tokens=self.max_tokens,
-            )
+            try:
+                return self._call_openai_chat(
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    effective_model=effective_model,
+                    max_tokens=self.max_tokens,
+                )
+            except Exception as _gpt_err:
+                # Cross-vendor fallback: vectorengine (a small single relay)
+                # carries two REQUIRED stages (chancellery / ministry_war)
+                # with NO backend of its own to fall back to. On a
+                # routing/transient failure, re-run this call on a Claude
+                # model instead of burning retries on a dead GPT channel and
+                # failing the whole run. Auth/400 errors are NOT masked —
+                # they re-raise and fail fast with a real message.
+                if _is_rate_limit_error(_gpt_err):
+                    note_rate_limit_hit(self.stage_name)
+                _routing_or_transient = (
+                    _is_no_channel_error(_gpt_err)
+                    or _is_rate_limit_error(_gpt_err)
+                    or _classify_llm_error(_gpt_err, 0)[1]  # is_5xx
+                )
+                _cross = (CLAUDE_FALLBACK_CHAIN or [None])[0]
+                if _routing_or_transient and _cross:
+                    logger.warning(
+                        "[%s] GPT backend failed (%s: %s); cross-vendor "
+                        "fallback to Claude %s",
+                        self.stage_name, type(_gpt_err).__name__,
+                        mask_secrets(str(_gpt_err))[:200], _cross,
+                    )
+                    effective_model = _cross
+                    _model_low = effective_model.lower()
+                    _is_gpt_family = False
+                    # fall through to the Claude path below with the Claude
+                    # model; thinking/backend selection recompute off
+                    # effective_model, so this behaves like a Claude stage.
+                else:
+                    raise
 
         # v0.30.0: 按模型族选 backend(Claude 走 default relay 或 Vertex,
         # DeepSeek 走独立官方 anthropic-compat 端点)。client 必须按
@@ -1588,14 +1788,30 @@ class BaseAgent:
                         log_id=log_id,
                     )
 
-                db.update_stage_log(
-                    log_id,
-                    status="completed",
-                    output_data=output,
-                    model_used=model_label,
-                    tokens_used=total_input_tokens + total_output_tokens,
-                    duration_seconds=round(duration, 2),
-                )
+                # The model call + parse already SUCCEEDED — `output` is in
+                # hand. A DB write failure here must NOT bubble into the retry
+                # loop below (its except would misclassify it and re-run the
+                # expensive model call). update_stage_log self-retries transient
+                # errors now; if it still fails, log and return the output
+                # anyway — losing one stage_log row is far cheaper than
+                # re-billing or failing a good run.
+                try:
+                    db.update_stage_log(
+                        log_id,
+                        status="completed",
+                        output_data=output,
+                        model_used=model_label,
+                        tokens_used=total_input_tokens + total_output_tokens,
+                        duration_seconds=round(duration, 2),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] completion stage_log write failed after retries "
+                        "— returning output anyway (model call succeeded, not "
+                        "re-running)",
+                        self.stage_name,
+                        exc_info=True,
+                    )
                 # Push the run-level cost + token totals to pipeline_runs so
                 # the UI can display current spend without needing access to
                 # the in-process _run_totals dict. Swallow DB errors — cost
@@ -1648,38 +1864,26 @@ class BaseAgent:
                 logger.exception(
                     f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
                 )
-                # Classify error: only retry on transient failures (rate
-                # limits, server errors, timeouts). Non-retryable errors
-                # (auth failures, malformed requests) waste tokens and time.
-                _retryable = True
-                if isinstance(e, anthropic.AuthenticationError):
-                    _retryable = False
-                elif isinstance(e, anthropic.PermissionDeniedError):
-                    _retryable = False
-                elif isinstance(e, anthropic.BadRequestError) and "cache_control" not in str(e).lower():
-                    # Bad request that isn't a cache fault is not retryable
-                    _retryable = False
-                elif isinstance(e, (ValueError, json.JSONDecodeError)):
-                    # JSON parse failures from _extract_json — retrying with
-                    # the same input rarely helps, but one retry can recover
-                    # from transient model weirdness.
-                    _retryable = attempt < 1  # allow at most 1 retry for parse errors
+                # Adaptive-RPM safety valve: a 429 means the relay is
+                # throttling us. Back the effective rate off toward the safe
+                # floor before retrying — so throttling stays the relay's
+                # problem, not a flood we keep re-sending.
+                if _is_rate_limit_error(e):
+                    note_rate_limit_hit(self.stage_name)
 
-                # v0.28.2: 对上游 5xx(relay 或 Anthropic internal)用更长的
-                # 退避窗口 —— 抖动通常需要 10-30s 恢复,3s*2^attempt 太激进,
-                # 会把重试烧在还没恢复的上游。5xx 用 base=10s,其他错误仍用
-                # RETRY_BASE_DELAY_SECONDS(3s)。
-                # 注意:v0.28.1 的模型自动降级已移除——用户明确选择"全部用
-                # Opus 4.7,失败就重跑",避免降级在 multi-batch 场景下悄悄
-                # 污染后续 batch。
-                _is_5xx = isinstance(
-                    e,
-                    (anthropic.InternalServerError, anthropic.APIConnectionError),
-                )
+                # Vendor-agnostic classification (anthropic.* AND openai.* AND
+                # relay string errors). The old code isinstance'd anthropic.*
+                # only, so every GPT error fell through to retryable=True and
+                # burned retries on auth/400 with the wrong (short) backoff.
+                _retryable, _is_5xx = _classify_llm_error(e, attempt)
 
                 if _retryable and attempt < MAX_RETRIES:
-                    _base = 10 if _is_5xx else RETRY_BASE_DELAY_SECONDS
-                    delay = _base * (2 ** attempt)
+                    # 5xx / rate-limit need a longer window to recover
+                    # (~10-30s); other transients use the 3s base. Cap at
+                    # 30s so a flapping upstream can't stretch one retry into
+                    # minutes.
+                    _base = 10 if (_is_5xx or _is_rate_limit_error(e)) else RETRY_BASE_DELAY_SECONDS
+                    delay = min(_base * (2 ** attempt), 30)
                     await asyncio.sleep(delay)
                 elif not _retryable:
                     logger.warning(
@@ -1708,6 +1912,9 @@ class BaseAgent:
                 f"but no error info was captured (last_error={last_error!r}, "
                 f"model={self.model})"
             )
+        # Mask secrets (API keys / JWTs in the traceback) BEFORE persisting —
+        # this string is stored long-term in stage_logs and shown in the UI.
+        err_str = mask_secrets(err_str)
         # Cap to avoid blowing up the DB column; but leave an explicit marker
         # so the UI/operator knows the tail was cut instead of silently
         # getting 8000 chars that look complete.

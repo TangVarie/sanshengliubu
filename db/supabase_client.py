@@ -5,12 +5,68 @@ from __future__ import annotations
 import logging
 import streamlit as st
 from supabase import create_client, Client
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_WRITE_RETRIES = 2
+_WRITE_BACKOFF_SECONDS = (0.4, 1.0)
+
+
+def _with_write_retry(fn):
+    """Run a DB write with bounded retry on transient network errors. The
+    write methods had NO retry: a single httpx.ReadError on update_stage_log
+    would bubble up — and in the agent retry loop it was even misclassified
+    as a model failure and re-ran an expensive LLM call. Wrapping the write
+    itself keeps a transient blip from becoming a run failure / re-billed
+    call. Non-network errors (RLS, 4xx) are NOT retried — they won't heal."""
+    import time as _time
+
+    import httpx
+
+    _TRANSIENT = (
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.PoolTimeout,
+        httpx.WriteError,
+    )
+    last: Exception | None = None
+    for i in range(1 + _WRITE_RETRIES):
+        try:
+            return fn()
+        except _TRANSIENT as e:
+            last = e
+            if i < _WRITE_RETRIES:
+                _time.sleep(
+                    _WRITE_BACKOFF_SECONDS[min(i, len(_WRITE_BACKOFF_SECONDS) - 1)]
+                )
+                continue
+            raise
+    if last is not None:  # pragma: no cover — loop always returns/raises
+        raise last
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    """Parse a Supabase ISO timestamp into an aware datetime, or None.
+    Tolerant of trailing 'Z' and missing tz (assumes UTC)."""
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    try:
+        s = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def _first_row(resp, *, op: str, table: str) -> dict:
@@ -81,10 +137,20 @@ class SupabaseClient:
         resp = self.client.table("projects").select("*").eq("id", project_id).single().execute()
         return resp.data
 
-    def list_projects(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def list_projects(
+        self, limit: int = 50, offset: int = 0, light: bool = False
+    ) -> list[dict]:
+        # light=True selects only the columns the dashboard renders — avoids
+        # dragging every project's full free_text / brief (which can carry
+        # base64 screenshots, hundreds of KB each) across the wire just to
+        # show name + status. Big win when the list refreshes on every load.
+        cols = (
+            "id, name, status, task_type, created_at"
+            if light else "*"
+        )
         resp = (
             self.client.table("projects")
-            .select("*")
+            .select(cols)
             .order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
@@ -122,8 +188,10 @@ class SupabaseClient:
         return _first_row(resp, op="insert", table="pipeline_runs")
 
     def update_pipeline_run(self, run_id: str, **fields) -> dict:
-        resp = self.client.table("pipeline_runs").update(fields).eq("id", run_id).execute()
-        return _first_row(resp, op="update", table="pipeline_runs")
+        def _do():
+            resp = self.client.table("pipeline_runs").update(fields).eq("id", run_id).execute()
+            return _first_row(resp, op="update", table="pipeline_runs")
+        return _with_write_retry(_do)
 
     def get_pipeline_run(self, run_id: str) -> dict:
         resp = self.client.table("pipeline_runs").select("*").eq("id", run_id).single().execute()
@@ -139,25 +207,118 @@ class SupabaseClient:
         )
         return resp.data
 
+    def try_claim_project_running(
+        self, project_id: str, allowed_from: list[str] | None = None
+    ) -> dict | None:
+        """Atomically flip a project to 'running' IFF it isn't already running
+        (or, when allowed_from is given, IFF its current status is in that
+        set). Returns the updated project dict if we claimed it, else None.
+
+        This is the authoritative gate against two clicks / two tabs racing
+        to start the SAME project: a read-then-write guard has a TOCTOU
+        window (the status only flips much later inside the run thread), so
+        both racers pass and start two orchestrators that clobber each other.
+        A conditional UPDATE ... WHERE status <> 'running' is atomic in
+        Postgres — exactly one racer's update affects a row.
+        """
+        q = (
+            self.client.table("projects")
+            .update({"status": "running"})
+            .eq("id", project_id)
+        )
+        if allowed_from:
+            q = q.in_("status", list(allowed_from))
+        else:
+            q = q.neq("status", "running")
+        resp = q.execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+
+    def get_running_runs(self, limit: int = 200) -> list[dict]:
+        resp = (
+            self.client.table("pipeline_runs")
+            .select("*")
+            .eq("status", "running")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
+    def reap_stale_runs(self, stale_seconds: int) -> int:
+        """Mark 'running' runs whose heartbeat (or start time when heartbeat
+        is absent, e.g. rows from before the column existed) is older than
+        stale_seconds as failed. Returns the count reaped.
+
+        This is the ONLY thing that cleans up zombie runs: when Streamlit
+        Cloud SIGKILLs the process, the background thread dies without
+        running its except/finally, so the DB stays 'running' forever. Call
+        this on app load. Heartbeat ticks every PIPELINE_HEARTBEAT_INTERVAL
+        while a run is genuinely alive, so a stale heartbeat means the
+        process is dead, not that a stage is just slow.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        reaped = 0
+        for run in self.get_running_runs():
+            ts = _parse_ts(
+                run.get("heartbeat_at")
+                or run.get("started_at")
+                or run.get("created_at")
+            )
+            if ts is not None and ts >= cutoff:
+                continue  # heartbeat still fresh — genuinely alive, leave it
+            rid = run.get("id")
+            if not rid:
+                continue
+            try:
+                self.update_pipeline_run(
+                    rid, status="failed", completed_at=_now()
+                )
+                if run.get("project_id"):
+                    self.update_project(run["project_id"], status="failed")
+                log = self.create_stage_log(
+                    rid, "_pipeline_error", {"reaped_at": _now()}
+                )
+                self.update_stage_log(
+                    log["id"],
+                    status="failed",
+                    error_message=(
+                        "⛔ 这条 run 被自动收割:它标记为 running 但心跳已停止"
+                        f"（超过 {stale_seconds}s 无更新）,说明运行进程已被 "
+                        "Cloud 回收/重启,后台线程当场中断、来不及自己落库。"
+                        "状态已重置为 failed,可以点「重跑流水线」重来。"
+                    ),
+                )
+                reaped += 1
+            except Exception as e:
+                logger.warning("[reap] failed to reap run %s: %r", rid, e)
+        if reaped:
+            logger.info("[reap] reaped %d stale (zombie) running run(s)", reaped)
+        return reaped
+
     # ── Stage Logs ─────────────────────────────────────────────────────
 
     def create_stage_log(self, run_id: str, stage_name: str, input_data: dict | None = None) -> dict:
-        resp = (
-            self.client.table("stage_logs")
-            .insert({
-                "run_id": run_id,
-                "stage_name": stage_name,
-                "status": "running",
-                "input_data": input_data,
-            })
-            .execute()
-        )
-        return _first_row(resp, op="insert", table="stage_logs")
+        def _do():
+            resp = (
+                self.client.table("stage_logs")
+                .insert({
+                    "run_id": run_id,
+                    "stage_name": stage_name,
+                    "status": "running",
+                    "input_data": input_data,
+                })
+                .execute()
+            )
+            return _first_row(resp, op="insert", table="stage_logs")
+        return _with_write_retry(_do)
 
     def update_stage_log(self, log_id: str, **fields) -> dict:
         fields["updated_at"] = _now()
-        resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
-        return _first_row(resp, op="update", table="stage_logs")
+        def _do():
+            resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
+            return _first_row(resp, op="update", table="stage_logs")
+        return _with_write_retry(_do)
 
     def get_stage_logs(
         self, run_id: str, stage_name: str | None = None
@@ -231,6 +392,20 @@ class SupabaseClient:
                     _time.sleep(0.5)
                     continue
                 raise
+
+    def get_stage_statuses(self, run_id: str) -> list[dict]:
+        """Ultra-light status poll: only the columns needed for the progress
+        row + liveness (NO output_data). Used by the auto-refresh watcher so
+        the 3-second poll doesn't drag the full stage payload (matrix / posts
+        / cell plans — hundreds of KB) across the wire every tick."""
+        resp = (
+            self.client.table("stage_logs")
+            .select("id, stage_name, status, updated_at, created_at")
+            .eq("run_id", run_id)
+            .order("created_at")
+            .execute()
+        )
+        return resp.data or []
 
     def get_stage_log_by_id(self, log_id: str) -> dict | None:
         resp = self.client.table("stage_logs").select("*").eq("id", log_id).execute()

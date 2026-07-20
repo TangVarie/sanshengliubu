@@ -24,6 +24,7 @@ from pipeline.config import (
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
     STRATEGIC_LOOP_MAX_ITERATIONS,
+    PIPELINE_HEARTBEAT_INTERVAL_SECONDS,
     SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
     SOCIALDATAX_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
@@ -58,6 +59,7 @@ from pipeline.retrieve_samples import (
     retrieve_reference_packs,
     summarize_packs_by_platform,
 )
+from pipeline.logger_utils import mask_secrets
 from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -659,6 +661,40 @@ class PipelineOrchestrator:
 
         except Exception as e:
             logger.exception("Pipeline failed")
+            # Persist the failure where the UI can actually show it. run()'s
+            # own RuntimeErrors (empty cells, count mismatches, aggregated部
+            # failures) and any unhandled exception land here; without this
+            # the detail page renders "failed but error_message empty, 请查看
+            # 服务端日志" — unreachable on Streamlit Cloud. Mirror the
+            # _force_cancelled marker pattern so pages/3 can render it.
+            try:
+                import traceback as _tb
+                _detail = mask_secrets(
+                    f"{type(e).__name__}: {e}\n--- traceback ---\n"
+                    + "".join(_tb.format_exception(type(e), e, e.__traceback__))
+                )
+                if len(_detail) > 8000:
+                    _detail = _detail[:7900] + "\n[... 截断于 8000 字符 ...]"
+                _elog = self.db.create_stage_log(
+                    self.run_id,
+                    "_pipeline_error",
+                    {"failed_at": datetime.now(timezone.utc).isoformat()},
+                )
+                self.db.update_stage_log(
+                    _elog["id"],
+                    status="failed",
+                    error_message=(
+                        "流水线在编排层抛出未被单个阶段捕获的错误（常见于策略/"
+                        "工部阶段的校验失败：重建 cell 为空、cell 数量对不上、"
+                        "六部有部执行失败等）。完整 traceback 见下：\n\n"
+                        + _detail
+                    ),
+                )
+            except Exception as _persist_err:
+                logger.warning(
+                    "[run] failed to persist _pipeline_error marker: %r",
+                    _persist_err,
+                )
             self.db.update_pipeline_run(
                 self.run_id,
                 status="failed",
@@ -836,11 +872,27 @@ class PipelineOrchestrator:
                 logger.exception(f"Ministry {name} failed: {e}")
                 raise RuntimeError(f"{name} 执行失败：{e}") from e
 
+        # return_exceptions=True so ALL 六部 settle before we decide —
+        # plain gather would propagate the first failure while the other
+        # ministries keep running in the background (leaking tokens + rate
+        # slots) and their real error is masked by whoever raised first.
         results = await asyncio.gather(
-            *[run_one(name) for name in self.ministries]
+            *[run_one(name) for name in self.ministries],
+            return_exceptions=True,
         )
+        pairs: list[tuple[str, Any]] = []
+        errors: list[str] = []
+        for name, res in zip(self.ministries, results):
+            if isinstance(res, BaseException):
+                errors.append(f"{name}: {res}")
+            else:
+                pairs.append(res)
+        if errors:
+            # Required stage — surface an aggregated error naming every部
+            # that failed (not just the first) so the failed run is diagnosable.
+            raise RuntimeError("六部并行执行失败：" + "；".join(errors))
 
-        return {name: output for name, output in results}
+        return {name: output for name, output in pairs}
 
     def _reconstruct_active_cells(self, plan: dict, brief: dict | None = None) -> list[dict]:
         """Compute the active cell list from the plan.
@@ -1177,8 +1229,16 @@ class PipelineOrchestrator:
                 return [merged_by_id[cid] for cid in expected_ids]
 
         results = await asyncio.gather(
-            *[plan_batch(b, i) for i, b in enumerate(batches)]
+            *[plan_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
+        _batch_errs = [str(r) for r in results if isinstance(r, BaseException)]
+        if _batch_errs:
+            # Let every batch settle before failing (no leaked in-flight
+            # calls) and aggregate all batch failures, not just the first.
+            raise RuntimeError(
+                "cell_planner 批次执行失败：" + "；".join(_batch_errs)
+            )
 
         # Merge newly-generated batches
         new_plans_by_id: dict[str, dict] = {}
@@ -1527,8 +1587,14 @@ class PipelineOrchestrator:
                 return [merged_by_id[cid] for cid in expected_ids], merged_demos
 
         results = await asyncio.gather(
-            *[build_batch(b, i) for i, b in enumerate(batches)]
+            *[build_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
+        _batch_errs = [str(r) for r in results if isinstance(r, BaseException)]
+        if _batch_errs:
+            raise RuntimeError(
+                "works_builder 批次执行失败：" + "；".join(_batch_errs)
+            )
 
         # Collect newly-generated cells/demos from this run
         new_cells_by_id: dict[str, dict] = {}
@@ -1684,71 +1750,80 @@ class PipelineOrchestrator:
         }
         shared_skeleton = works_plan.get("shared_skeleton", {})
 
-        for revision in cells_to_revise:
+        # Rebuild flagged cells in PARALLEL (bounded) — each targets a
+        # distinct cell_id and is independent, so the old serial `for` loop
+        # (the only cell stage that wasn't parallelized) just added
+        # per-flagged-cell latency to the critical path. Collect results,
+        # then splice back by cell_id (order-independent).
+        _sem = asyncio.Semaphore(MATRIX_BATCH_CONCURRENCY)
+
+        async def _rebuild_one(revision: dict):
             cid = revision.get("cell_id")
             fix = revision.get("fix_instruction", "")
             if not cid or not fix:
-                continue
+                return None
             cell_plan = cell_plans_by_id.get(cid)
             if not cell_plan:
-                continue
+                return None
+            async with _sem:
+                logger.info(
+                    "[narrative_director] rebuilding %s: %s", cid, fix[:100]
+                )
+                try:
+                    # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
+                    # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
+                    _brief_for_rebuild = {
+                        "product_name": (brief or {}).get("product_name", ""),
+                        "core_claim": (brief or {}).get("core_claim", ""),
+                        "target_audience": (brief or {}).get("target_audience", ""),
+                        "competitive_context": (brief or {}).get("competitive_context", ""),
+                        "_user_raw_input": (
+                            (brief or {}).get("_user_raw_input")
+                            or (brief or {}).get("_raw_input_text", "")
+                        ),
+                    } if brief else {}
+                    rebuild_input = {
+                        "active_cells": [cell_plan],
+                        "shared_skeleton": shared_skeleton,
+                        "brief": _brief_for_rebuild,
+                        "_batch_info": {
+                            "label": f"叙事导演修复 {cid}",
+                            "round": "narrative_fix",
+                            "cell_ids": [cid],
+                        },
+                        "_narrative_directive": fix,
+                        "_strict_contract": (
+                            f"叙事导演要求修改这个 cell：{fix}\n"
+                            f"在保留原有合规/关键词/人设的前提下，按指令调整 "
+                            f"demo_output 的钩子结构或叙事方式。"
+                        ),
+                    }
+                    rebuilt = await self.works_builder.run(
+                        rebuild_input, self.run_id, self.db
+                    )
+                    for nc in (rebuilt.get("prompt_cells") or []):
+                        if nc.get("cell_id") == cid:
+                            return (cid, nc)
+                    return None
+                except Exception as e:
+                    logger.warning(
+                        "[narrative_director] rebuild %s failed: %r", cid, e
+                    )
+                    return None
 
-            logger.info(
-                "[narrative_director] rebuilding %s: %s",
-                cid,
-                fix[:100],
-            )
-            try:
-                # v0.30.5 H1: rebuild 时也要给 brief,否则修订后写出来的
-                # demo 仍然只能用 cell_plan 三层总结,看不到原文细节。
-                _brief_for_rebuild = {
-                    "product_name": (brief or {}).get("product_name", ""),
-                    "core_claim": (brief or {}).get("core_claim", ""),
-                    "target_audience": (brief or {}).get("target_audience", ""),
-                    "competitive_context": (brief or {}).get("competitive_context", ""),
-                    "_user_raw_input": (
-                        (brief or {}).get("_user_raw_input")
-                        or (brief or {}).get("_raw_input_text", "")
-                    ),
-                } if brief else {}
-                rebuild_input = {
-                    "active_cells": [cell_plan],
-                    "shared_skeleton": shared_skeleton,
-                    "brief": _brief_for_rebuild,
-                    "_batch_info": {
-                        "label": f"叙事导演修复 {cid}",
-                        "round": "narrative_fix",
-                        "cell_ids": [cid],
-                    },
-                    "_narrative_directive": fix,
-                    "_strict_contract": (
-                        f"叙事导演要求修改这个 cell：{fix}\n"
-                        f"在保留原有合规/关键词/人设的前提下，按指令调整 "
-                        f"demo_output 的钩子结构或叙事方式。"
-                    ),
-                }
-                rebuilt = await self.works_builder.run(
-                    rebuild_input, self.run_id, self.db
-                )
-                new_cells = rebuilt.get("prompt_cells") or []
-                for nc in new_cells:
-                    if nc.get("cell_id") == cid:
-                        # Replace in prompt_matrix
-                        for i, c in enumerate(prompt_cells):
-                            if c.get("cell_id") == cid:
-                                prompt_cells[i] = nc
-                                logger.info(
-                                    "[narrative_director] rebuilt %s OK",
-                                    cid,
-                                )
-                                break
-                        break
-            except Exception as e:
-                logger.warning(
-                    "[narrative_director] rebuild %s failed: %r",
-                    cid,
-                    e,
-                )
+        _results = await asyncio.gather(
+            *[_rebuild_one(r) for r in cells_to_revise],
+            return_exceptions=True,
+        )
+        _idx_by_id = {c.get("cell_id"): i for i, c in enumerate(prompt_cells)}
+        for _r in _results:
+            if isinstance(_r, BaseException) or not _r:
+                continue
+            _cid, _nc = _r
+            _i = _idx_by_id.get(_cid)
+            if _i is not None:
+                prompt_cells[_i] = _nc
+                logger.info("[narrative_director] rebuilt %s OK", _cid)
 
         final_system["prompt_matrix"] = prompt_cells
 
@@ -2903,13 +2978,25 @@ class PipelineOrchestrator:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
                 )
-            except Exception:
+            except Exception as _critic_err:
                 # Full traceback so a vibe-critic failure isn't a mystery
                 # ("why did this run skip the vibe loop?"). Still non-fatal:
-                # we proceed with whatever the builder produced.
+                # we proceed with whatever the builder produced — BUT record a
+                # strategic_warning so the run doesn't silently report success
+                # as if the 网感 gate had passed. #14: a skipped quality gate
+                # must be visible, not swallowed into a green run.
                 logger.exception(
                     "Vibe critic failed, proceeding without critique"
                 )
+                final_system.setdefault("strategic_warnings", []).append({
+                    "type": "quality_gate_skipped",
+                    "stage": "vibe_critic",
+                    "message": (
+                        "⚠️ 网感闸门（vibe_critic）执行失败，本轮产出**未经网感"
+                        "校验**——可能含 AI 腔 / 不够真实。请排查该阶段错误后重跑再交付。"
+                        f"（{type(_critic_err).__name__}: {_critic_err}）"
+                    ),
+                })
                 break
 
             failed = critic_result.get("failed_cells", [])
@@ -3204,8 +3291,20 @@ class PipelineOrchestrator:
                     rewritten = await self.vibe_rewriter.run(
                         rewriter_input, self.run_id, self.db,
                     )
-                except Exception:
+                except Exception as _rw_err:
                     logger.exception("Vibe rewriter failed, keeping original cells")
+                    # #14: rewriter failed → critic-flagged cells ship UNFIXED.
+                    # Don't let that pass as a clean success — surface it.
+                    final_system.setdefault("strategic_warnings", []).append({
+                        "type": "quality_gate_failed",
+                        "stage": "vibe_rewriter",
+                        "message": (
+                            "⚠️ 网感修复（vibe_rewriter）执行失败，被 critic 判"
+                            "不合格的 cell **未经修复直接保留**。交付前请人工复核"
+                            "这些 cell 或排查错误后重跑。"
+                            f"（{type(_rw_err).__name__}: {_rw_err}）"
+                        ),
+                    })
                     break
                 new_cells_by_id = {
                     c["cell_id"]: c for c in rewritten.get("prompt_cells", [])
@@ -3623,12 +3722,20 @@ def _assert_project_not_running(
     and the project isn't in that state. Returns the fresh project dict on
     success.
 
-    The race window between this check and the caller's own "status=running"
-    write is small (ms) but not zero. For full correctness we'd need an
-    atomic compare-and-swap in Supabase, which the Python client doesn't
-    expose cleanly. Combined with the UI-level session_state lock, this
-    closes the practical failure modes (user double-clicks, two tabs).
+    Uses an ATOMIC compare-and-swap (try_claim_project_running) rather than
+    a read-then-check: the old read-only guard had a TOCTOU window because
+    the status only flips to 'running' much later inside the run thread, so
+    two racing starts both read a non-running status and both proceeded —
+    two orchestrators clobbering the same run (duplicate output / doubled
+    tokens / whoever-writes-last-wins). The claim flips the project to
+    'running' as its side effect, so this MUST be immediately followed by
+    launching the run (both callers do).
     """
+    allowed = [required_status] if required_status else None
+    claimed = db.try_claim_project_running(project_id, allowed_from=allowed)
+    if claimed is not None:
+        return claimed
+    # Claim failed — read the current status to produce a precise message.
     project = db.get_project(project_id) or {}
     current = (project.get("status") or "").strip()
     if current == "running":
@@ -3641,7 +3748,10 @@ def _assert_project_not_running(
             f"项目 {project_id[:8]} 当前状态是 {current!r}，不满足触发条件 "
             f"{required_status!r}。请刷新页面查看最新状态。"
         )
-    return project
+    raise PipelineAlreadyRunningError(
+        f"项目 {project_id[:8]} 无法占用为 running（可能有并发启动抢先一步）。"
+        f"请刷新页面后重试。"
+    )
 
 
 def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
@@ -3737,13 +3847,44 @@ def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
     return summary
 
 
-def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
-    """Launch pipeline in a background thread (for Streamlit compatibility)."""
-    _assert_project_not_running(project_id, db)
+def start_pipeline_in_background(
+    project_id: str, run_id: str, db: SupabaseClient, *, claim: bool = True
+):
+    """Launch pipeline in a background thread (for Streamlit compatibility).
+
+    claim=True (default) atomically claims the project as 'running' first.
+    Callers that ALREADY claimed it (resume: revise_and_resume claims it up
+    front so its destructive stage_log deletion is race-protected) pass
+    claim=False to avoid a double-claim that would raise AlreadyRunning.
+    """
+    if claim:
+        _assert_project_not_running(project_id, db)
 
     def _thread_target():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # Liveness heartbeat: an independent daemon renews
+        # pipeline_run.heartbeat_at every N seconds while this run executes.
+        # If the PROCESS is killed (Cloud recycle/sleep), this thread dies
+        # too and the heartbeat stops → the startup reaper collects the
+        # zombie. The beat is independent of stage progress, so a healthy
+        # long stage (multi-minute thinking call) never looks stalled.
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while True:
+                try:
+                    db.update_pipeline_run(
+                        run_id,
+                        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                except Exception:
+                    pass  # a transient DB blip must not kill the heartbeat
+                if _hb_stop.wait(PIPELINE_HEARTBEAT_INTERVAL_SECONDS):
+                    return
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
         try:
             orchestrator = PipelineOrchestrator(project_id, run_id, db)
             loop.run_until_complete(orchestrator.run())
@@ -3772,11 +3913,23 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
                 )
                 db.update_project(project_id, status="failed")
                 # Also surface the failure in stage_logs so UI has something
-                # to render instead of just an empty "running" spinner.
-                db.create_stage_log(
+                # to render instead of just an empty "running" spinner. Write
+                # status=failed + error_message so the run-level error banner
+                # (pages/3) actually renders it — an input-only marker showed
+                # nothing.
+                _tlog = db.create_stage_log(
                     run_id,
                     stage_name="_thread_target",
                     input_data={"phase": "thread_init_or_teardown"},
+                )
+                db.update_stage_log(
+                    _tlog["id"],
+                    status="failed",
+                    error_message=mask_secrets(
+                        "后台线程在 orchestrator.run() 之外失败（通常是 "
+                        "PipelineOrchestrator 初始化 / 事件循环建立失败 / 线程"
+                        "被提前杀）。详情：\n" + err_str
+                    ),
                 )
                 logger.info(
                     f"[thread_target] marked run={run_id} failed with: {err_str}"
@@ -3784,9 +3937,11 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
             except Exception:
                 logger.exception(
                     "[thread_target] also failed to mark run as failed — "
-                    "run will stay in 'running' state; manual DB cleanup needed"
+                    "run will stay in 'running' state; startup reaper will "
+                    "collect it once the heartbeat goes stale"
                 )
         finally:
+            _hb_stop.set()
             loop.close()
 
     thread = threading.Thread(target=_thread_target, daemon=True)
@@ -4326,11 +4481,17 @@ def revise_and_resume_pipeline_in_background(
     Preserves: crown_prince, secretariat, chancellery_*, dispatcher, 五部.
     These are upstream of works and don't need to re-run.
     """
-    # 0. Guard: only allow this from needs_revision state. The check happens
-    # BEFORE any destructive action (stage_logs deletion, _revision_context
-    # write) because if two clicks race here, the loser would destroy the
-    # winner's still-valid stage_logs. Raising early keeps the DB consistent.
+    # 0. Guard: atomically claim needs_revision → running BEFORE any
+    # destructive action (stage_logs deletion, _revision_context write). Two
+    # racing "apply revision" clicks: only one wins the CAS; the loser raises
+    # here instead of destroying the winner's still-valid stage_logs.
     _assert_project_not_running(project_id, db, required_status="needs_revision")
+
+    # 0.5 Flip the RUN to running immediately, BEFORE the destructive
+    # deletion below. If this resume crashes/gets killed mid-deletion, a
+    # running run with a stale heartbeat is reaper-collectable; a project
+    # stuck 'running' with a non-running run would NOT be.
+    db.update_pipeline_run(run_id, status="running", completed_at=None)
 
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
@@ -4498,9 +4659,8 @@ def revise_and_resume_pipeline_in_background(
         f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"
     )
 
-    # 4. Reset pipeline_run status so the UI shows it as running again;
-    # project.status gets flipped by orchestrator.run() as its first action,
-    # so don't pre-empt it here (doing so would break the guard in
-    # start_pipeline_in_background).
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
-    return start_pipeline_in_background(project_id, run_id, db)
+    # 4. Launch. The project was already atomically claimed as 'running' in
+    # step 0 and the run set running in step 0.5, so tell
+    # start_pipeline_in_background NOT to claim again (that would raise
+    # AlreadyRunning against the status we ourselves just set).
+    return start_pipeline_in_background(project_id, run_id, db, claim=False)

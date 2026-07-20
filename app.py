@@ -10,6 +10,13 @@ from utils.version_badge import show_version_badge
 # 转发到第三方平台时凭据外泄。Idempotent,多次 import 安全。
 install_secret_masking_on_root_logger()
 
+# Collect zombie 'running' runs left behind by a killed/recycled process
+# (their heartbeat has gone stale). Throttled + best-effort — see
+# utils/liveness.py.
+from utils.liveness import maybe_reap_stale_runs
+
+maybe_reap_stale_runs()
+
 st.set_page_config(
     page_title="三省六部 · Prompt Engineering",
     page_icon="省",

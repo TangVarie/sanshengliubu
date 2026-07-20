@@ -456,12 +456,12 @@ STAGE_MAX_TOKENS: dict[str, int] = {
 }
 
 # ── Matrix Execution ─────────────────────────────────────────────────────
-MATRIX_BATCH_CONCURRENCY = 3    # parallel builder calls
+MATRIX_BATCH_CONCURRENCY = 5    # parallel builder calls
 MATRIX_CELLS_PER_BATCH = 1      # one cell per call (safest for JSON structure)
 
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
-CELL_PLANNER_CONCURRENCY = 3    # parallel cell-planner calls
+CELL_PLANNER_CONCURRENCY = 5    # parallel cell-planner calls
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # 6 strategy/review/compliance stages use extended thinking (budget_tokens
@@ -506,6 +506,25 @@ THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 CLAUDE_RPM_LIMIT = 15
 CLAUDE_MAX_CONCURRENT = 16
 
+# ── Adaptive RPM safety valve ────────────────────────────────────────────
+# CLAUDE_RPM_LIMIT above is the KNOWN-SAFE floor. When adaptive mode is on,
+# the limiter starts optimistically at CLAUDE_RPM_CEILING and only backs off
+# toward the floor when the relay actually returns rate-limit (429) errors —
+# then slowly probes back up. This means: if the account can sustain more
+# than 15/min we get the speed for free; if it can't, we auto-fall-back to
+# the safe floor so throttling stays the *relay's* problem, never a flood we
+# created. Set CLAUDE_RPM_ADAPTIVE=False to pin the rate at CLAUDE_RPM_LIMIT.
+CLAUDE_RPM_ADAPTIVE = True
+# Optimistic ceiling to probe toward. Never sends more than this per minute.
+CLAUDE_RPM_CEILING = 60
+# On each observed 429/rate-limit, multiply the effective RPM by this
+# (bounded below by the floor). 0.5 = halve on every throttle signal.
+CLAUDE_RPM_BACKOFF_FACTOR = 0.5
+# After this many seconds with no new 429, step the effective RPM up by
+# CLAUDE_RPM_RECOVERY_STEP (probing back toward the ceiling).
+CLAUDE_RPM_RECOVERY_SECONDS = 45
+CLAUDE_RPM_RECOVERY_STEP = 3
+
 # ── Per-run budget ───────────────────────────────────────────────────────
 # Hard ceiling on combined input + output tokens accumulated within a
 # single pipeline run. Once exceeded, the next agent call raises
@@ -516,6 +535,21 @@ CLAUDE_MAX_CONCURRENT = 16
 # Opus at $15/M input + $75/M output → 1M tokens ≈ $45 ceiling per run
 # (assuming roughly balanced in/out). Tune to your cost tolerance.
 MAX_TOKENS_PER_RUN = 2_000_000
+
+# ── Liveness: heartbeat + stale-run reaper ───────────────────────────────
+# The pipeline runs in a daemon thread inside the Streamlit process. When
+# Streamlit Cloud recycles/sleeps the process (SIGKILL), that thread dies
+# mid-run and its except/finally never runs — the DB row stays 'running'
+# forever ("zombie"). Defense: the thread writes heartbeat_at every
+# HEARTBEAT_INTERVAL; a reaper on app load marks any 'running' run whose
+# heartbeat is older than RUN_STALE_SECONDS as failed. Heartbeat ticks
+# independently of stage progress, so a healthy long stage never looks
+# dead — only a truly dead process stops the beat.
+PIPELINE_HEARTBEAT_INTERVAL_SECONDS = 10
+# A run is considered dead if its heartbeat hasn't advanced in this long.
+# Must be comfortably larger than the heartbeat interval (missed a few
+# beats = dead), but small enough that zombies clear quickly.
+RUN_STALE_SECONDS = 75
 
 # ── Gemini auxiliary assist (second-opinion critic + structure reviewer) ──
 # Independent of the primary Claude backend. When configured, Gemini:
@@ -759,8 +793,8 @@ STRATEGIC_LOOP_MAX_ITERATIONS = 1
 ENABLE_CONSUMER_SIMULATION = True
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
-RED_BLUE_CONCURRENCY = 3
-TREND_SCOUT_POST_CONCURRENCY = 3
+RED_BLUE_CONCURRENCY = 5
+TREND_SCOUT_POST_CONCURRENCY = 5
 
 # ── UI polling ─────────────────────────────────────────────────────────────
 
