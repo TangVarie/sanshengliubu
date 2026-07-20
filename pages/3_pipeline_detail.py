@@ -13,12 +13,19 @@ from pipeline.config import (
     MAX_TOKENS_PER_RUN,
     PIPELINE_STAGES,
     POLL_INTERVAL_SECONDS,
+    RUN_STALE_SECONDS,
 )
 from pipeline.logger_utils import mask_secrets
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="流水线详情", page_icon="🏛️", layout="wide")
 show_version_badge()
+
+# Reap zombie runs (stale heartbeat) before rendering — a run whose process
+# was killed gets marked failed here instead of spinning forever.
+from utils.liveness import maybe_reap_stale_runs
+
+maybe_reap_stale_runs()
 
 
 def render_stage_error(log: dict) -> None:
@@ -667,47 +674,66 @@ for ni_log in needs_input_logs:
 # force-reset the project state — new runs can then be triggered and
 # the zombie thread is just ignored (its future writes land on a run
 # nobody looks at).
-STUCK_THRESHOLD_SECONDS = 300  # 5 minutes since last stage_log update
+# Liveness is now judged by the run's HEARTBEAT (ticks every ~10s
+# independent of stage progress), not by stage_log.updated_at. That fixes
+# the old false-positive where a healthy multi-minute stage (extended
+# thinking / big output / grounded Gemini) looked "stuck" and scared users
+# into force-killing a run that was fine. Only a genuinely dead process
+# (killed thread) stops the beat — and the reaper collects those.
+STUCK_THRESHOLD_SECONDS = 300  # fallback only, for runs with no heartbeat
 
 if status == "running":
-    # Find the most recent update across stage_logs
-    _most_recent = 0.0
-    for _l in stage_logs:
-        _ts = _l.get("updated_at") or _l.get("created_at")
-        if not _ts:
-            continue
+    from datetime import datetime as _dt
+
+    def _age(ts) -> float | None:
+        if not ts:
+            return None
         try:
-            from datetime import datetime as _dt
-            # Supabase timestamps are ISO8601 with timezone
-            _ts_str = str(_ts).replace("Z", "+00:00")
-            _dt_obj = _dt.fromisoformat(_ts_str)
-            _most_recent = max(_most_recent, _dt_obj.timestamp())
+            return time.time() - _dt.fromisoformat(
+                str(ts).replace("Z", "+00:00")
+            ).timestamp()
         except Exception:
-            continue
+            return None
 
-    if _most_recent > 0:
-        _elapsed = time.time() - _most_recent
-        _looks_stuck = _elapsed > STUCK_THRESHOLD_SECONDS
+    _hb_age = _age(run.get("heartbeat_at"))
+    _stage_ages = [
+        a for a in (
+            _age(_l.get("updated_at") or _l.get("created_at"))
+            for _l in stage_logs
+        ) if a is not None
+    ]
+    _stage_age = min(_stage_ages) if _stage_ages else None
+
+    if _hb_age is not None:
+        _looks_stuck = _hb_age > RUN_STALE_SECONDS
+        _liveness_note = f"心跳 {int(_hb_age)}s 前"
     else:
-        _looks_stuck = False
-        _elapsed = 0.0
+        # No heartbeat (run started before this column existed) — fall back
+        # to stage updates with the generous legacy threshold.
+        _looks_stuck = _stage_age is not None and _stage_age > STUCK_THRESHOLD_SECONDS
+        _liveness_note = (
+            f"最近阶段更新 {int(_stage_age)}s 前"
+            if _stage_age is not None else "尚无阶段更新"
+        )
 
-    # Always show a cancel button when status=running (primary escape
-    # hatch). Make the stuck banner loud so the user sees why they'd
-    # click it.
+    # Always show a cancel button when status=running (escape hatch), but
+    # only make the banner loud when the heartbeat is genuinely stale.
     with st.container(border=True):
         if _looks_stuck:
-            st.error(
-                f"⚠️ **流水线疑似卡死** — 已经 {int(_elapsed // 60)} 分 "
-                f"{int(_elapsed % 60)} 秒没有任何阶段更新。"
-                f"大概率是某个外部调用（中转站 / Gemini / 网络）被 hang 住。"
-                f"Python 无法从外部杀死后台线程，但可以**强制重置状态**让你重新开始——"
-                f"点下面按钮即可。"
+            st.warning(
+                f"⏳ **流水线较久无心跳**（{_liveness_note}）。通常意味着运行"
+                f"进程已被 Cloud 回收 / 重启，后台线程中断——系统会在刷新时自动"
+                f"把它标记为 failed（reaper）。如需立即清理并重来，可点下面强制终止。"
             )
         else:
+            _extra = (
+                f"，最近阶段更新 {int(_stage_age)}s 前"
+                if _stage_age is not None else "，当前阶段进行中"
+            )
             st.info(
-                f"🔄 流水线正在执行（最近更新 {int(_elapsed)} 秒前）。"
-                f"需要中止当前任务可以点下面的强制终止。"
+                f"🔄 流水线正在执行（{_liveness_note}{_extra}）。"
+                f"长阶段（深度推理 / 大产出 / 联网取样）可能几分钟没有阶段更新，"
+                f"只要心跳在跳就一切正常，不用强制终止。"
             )
 
         _force_busy_key = f"force_cancel_busy_{project_id}"

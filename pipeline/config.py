@@ -536,6 +536,21 @@ CLAUDE_RPM_RECOVERY_STEP = 3
 # (assuming roughly balanced in/out). Tune to your cost tolerance.
 MAX_TOKENS_PER_RUN = 2_000_000
 
+# ── Liveness: heartbeat + stale-run reaper ───────────────────────────────
+# The pipeline runs in a daemon thread inside the Streamlit process. When
+# Streamlit Cloud recycles/sleeps the process (SIGKILL), that thread dies
+# mid-run and its except/finally never runs — the DB row stays 'running'
+# forever ("zombie"). Defense: the thread writes heartbeat_at every
+# HEARTBEAT_INTERVAL; a reaper on app load marks any 'running' run whose
+# heartbeat is older than RUN_STALE_SECONDS as failed. Heartbeat ticks
+# independently of stage progress, so a healthy long stage never looks
+# dead — only a truly dead process stops the beat.
+PIPELINE_HEARTBEAT_INTERVAL_SECONDS = 10
+# A run is considered dead if its heartbeat hasn't advanced in this long.
+# Must be comfortably larger than the heartbeat interval (missed a few
+# beats = dead), but small enough that zombies clear quickly.
+RUN_STALE_SECONDS = 75
+
 # ── Gemini auxiliary assist (second-opinion critic + structure reviewer) ──
 # Independent of the primary Claude backend. When configured, Gemini:
 #   1. Re-evaluates cells Claude's vibe_critic passed (B: 分歧仲裁).

@@ -7,6 +7,13 @@ from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="项目总览", page_icon="📋", layout="wide")
 show_version_badge()
+
+# Collect zombie 'running' runs (stale heartbeat = killed process) before we
+# render statuses, so the dashboard never shows a permanent 🔄 for a dead run.
+from utils.liveness import maybe_reap_stale_runs
+
+maybe_reap_stale_runs()
+
 st.title("📋 项目总览")
 
 STATUS_EMOJI = {

@@ -24,6 +24,7 @@ from pipeline.config import (
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
     STRATEGIC_LOOP_MAX_ITERATIONS,
+    PIPELINE_HEARTBEAT_INTERVAL_SECONDS,
     GEMINI_TREND_SCOUT_TARGET_COUNT,
     MAX_CHANCELLERY_REJECTIONS,
     MAX_CLARIFICATION_PER_AGENT,
@@ -3718,6 +3719,28 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
     def _thread_target():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # Liveness heartbeat: an independent daemon renews
+        # pipeline_run.heartbeat_at every N seconds while this run executes.
+        # If the PROCESS is killed (Cloud recycle/sleep), this thread dies
+        # too and the heartbeat stops → the startup reaper collects the
+        # zombie. The beat is independent of stage progress, so a healthy
+        # long stage (multi-minute thinking call) never looks stalled.
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while True:
+                try:
+                    db.update_pipeline_run(
+                        run_id,
+                        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                except Exception:
+                    pass  # a transient DB blip must not kill the heartbeat
+                if _hb_stop.wait(PIPELINE_HEARTBEAT_INTERVAL_SECONDS):
+                    return
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
         try:
             orchestrator = PipelineOrchestrator(project_id, run_id, db)
             loop.run_until_complete(orchestrator.run())
@@ -3746,11 +3769,23 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
                 )
                 db.update_project(project_id, status="failed")
                 # Also surface the failure in stage_logs so UI has something
-                # to render instead of just an empty "running" spinner.
-                db.create_stage_log(
+                # to render instead of just an empty "running" spinner. Write
+                # status=failed + error_message so the run-level error banner
+                # (pages/3) actually renders it — an input-only marker showed
+                # nothing.
+                _tlog = db.create_stage_log(
                     run_id,
                     stage_name="_thread_target",
                     input_data={"phase": "thread_init_or_teardown"},
+                )
+                db.update_stage_log(
+                    _tlog["id"],
+                    status="failed",
+                    error_message=mask_secrets(
+                        "后台线程在 orchestrator.run() 之外失败（通常是 "
+                        "PipelineOrchestrator 初始化 / 事件循环建立失败 / 线程"
+                        "被提前杀）。详情：\n" + err_str
+                    ),
                 )
                 logger.info(
                     f"[thread_target] marked run={run_id} failed with: {err_str}"
@@ -3758,9 +3793,11 @@ def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClien
             except Exception:
                 logger.exception(
                     "[thread_target] also failed to mark run as failed — "
-                    "run will stay in 'running' state; manual DB cleanup needed"
+                    "run will stay in 'running' state; startup reaper will "
+                    "collect it once the heartbeat goes stale"
                 )
         finally:
+            _hb_stop.set()
             loop.close()
 
     thread = threading.Thread(target=_thread_target, daemon=True)

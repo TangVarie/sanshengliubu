@@ -5,12 +5,29 @@ from __future__ import annotations
 import logging
 import streamlit as st
 from supabase import create_client, Client
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    """Parse a Supabase ISO timestamp into an aware datetime, or None.
+    Tolerant of trailing 'Z' and missing tz (assumes UTC)."""
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    try:
+        s = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def _first_row(resp, *, op: str, table: str) -> dict:
@@ -138,6 +155,68 @@ class SupabaseClient:
             .execute()
         )
         return resp.data
+
+    def get_running_runs(self, limit: int = 200) -> list[dict]:
+        resp = (
+            self.client.table("pipeline_runs")
+            .select("*")
+            .eq("status", "running")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
+    def reap_stale_runs(self, stale_seconds: int) -> int:
+        """Mark 'running' runs whose heartbeat (or start time when heartbeat
+        is absent, e.g. rows from before the column existed) is older than
+        stale_seconds as failed. Returns the count reaped.
+
+        This is the ONLY thing that cleans up zombie runs: when Streamlit
+        Cloud SIGKILLs the process, the background thread dies without
+        running its except/finally, so the DB stays 'running' forever. Call
+        this on app load. Heartbeat ticks every PIPELINE_HEARTBEAT_INTERVAL
+        while a run is genuinely alive, so a stale heartbeat means the
+        process is dead, not that a stage is just slow.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        reaped = 0
+        for run in self.get_running_runs():
+            ts = _parse_ts(
+                run.get("heartbeat_at")
+                or run.get("started_at")
+                or run.get("created_at")
+            )
+            if ts is not None and ts >= cutoff:
+                continue  # heartbeat still fresh — genuinely alive, leave it
+            rid = run.get("id")
+            if not rid:
+                continue
+            try:
+                self.update_pipeline_run(
+                    rid, status="failed", completed_at=_now()
+                )
+                if run.get("project_id"):
+                    self.update_project(run["project_id"], status="failed")
+                log = self.create_stage_log(
+                    rid, "_pipeline_error", {"reaped_at": _now()}
+                )
+                self.update_stage_log(
+                    log["id"],
+                    status="failed",
+                    error_message=(
+                        "⛔ 这条 run 被自动收割:它标记为 running 但心跳已停止"
+                        f"（超过 {stale_seconds}s 无更新）,说明运行进程已被 "
+                        "Cloud 回收/重启,后台线程当场中断、来不及自己落库。"
+                        "状态已重置为 failed,可以点「重跑流水线」重来。"
+                    ),
+                )
+                reaped += 1
+            except Exception as e:
+                logger.warning("[reap] failed to reap run %s: %r", rid, e)
+        if reaped:
+            logger.info("[reap] reaped %d stale (zombie) running run(s)", reaped)
+        return reaped
 
     # ── Stage Logs ─────────────────────────────────────────────────────
 

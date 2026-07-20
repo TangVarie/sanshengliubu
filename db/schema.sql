@@ -30,8 +30,13 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     completed_at TIMESTAMPTZ,
     total_tokens INTEGER DEFAULT 0,
     total_cost_usd NUMERIC(10,4) DEFAULT 0,
+    heartbeat_at TIMESTAMPTZ,              -- 后台线程周期续期;停跳=进程已死,供 reaper 收割僵尸 running
     created_at TIMESTAMPTZ DEFAULT now()
 );
+-- 升级路径:老库补列(见 reference_samples 同款惯例)。每次给 pipeline_runs
+-- 加新列都要在这里补一行 ALTER,否则老部署 select/update 会 42703。
+ALTER TABLE pipeline_runs
+    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
 
 -- 各环节执行日志
 CREATE TABLE IF NOT EXISTS stage_logs (
