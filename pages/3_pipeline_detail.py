@@ -797,6 +797,36 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
                 unsafe_allow_html=True,
             )
 
+# ── Run-level failure surface ───────────────────────────────────────────────
+# Orchestration-layer failures (empty cells, count mismatches, aggregated 六部
+# failures, force-cancel) log under MARKER names that are NOT in PIPELINE_STAGES,
+# so the progress row above can show all-green while the run is actually failed.
+# Surface them here so a failed run is never "莫名其妙" with zero explanation.
+_MARKER_NAMES = ("_pipeline_error", "_thread_target", "_force_cancelled")
+_markers = [
+    log_map[n] for n in _MARKER_NAMES
+    if (log_map.get(n) or {}).get("status") == "failed"
+]
+_run_failed = (run or {}).get("status") == "failed"
+_any_failed_log = any(
+    (lg or {}).get("status") == "failed" for lg in log_map.values()
+)
+if _markers:
+    st.markdown("### ❌ 流水线在编排层失败")
+    for _lg in _markers:
+        render_stage_error(_lg)
+elif _run_failed and not _any_failed_log:
+    # run says failed but NOTHING left an error anywhere → almost always the
+    # process was recycled/killed by Cloud mid-run and the daemon thread
+    # died before it could write status. The startup reaper marks these, but
+    # surface a clear explanation regardless of who set the status.
+    st.markdown("### ❌ 流水线失败（无错误详情）")
+    st.error(
+        "run 标记为 failed，但没有任何阶段留下错误详情——通常是运行进程被 "
+        "Cloud 回收 / 强制重启，后台线程当场中断、来不及把失败原因落库。"
+        "可以点下方「重跑流水线」重来；若反复发生请查看服务端运行日志。"
+    )
+
 # ── Stage Details ──────────────────────────────────────────────────────────
 
 st.divider()

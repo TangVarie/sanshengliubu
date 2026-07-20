@@ -57,6 +57,7 @@ from pipeline.retrieve_samples import (
     retrieve_reference_packs,
     summarize_packs_by_platform,
 )
+from pipeline.logger_utils import mask_secrets
 from pipeline.agents.gemini_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -656,6 +657,40 @@ class PipelineOrchestrator:
 
         except Exception as e:
             logger.exception("Pipeline failed")
+            # Persist the failure where the UI can actually show it. run()'s
+            # own RuntimeErrors (empty cells, count mismatches, aggregated部
+            # failures) and any unhandled exception land here; without this
+            # the detail page renders "failed but error_message empty, 请查看
+            # 服务端日志" — unreachable on Streamlit Cloud. Mirror the
+            # _force_cancelled marker pattern so pages/3 can render it.
+            try:
+                import traceback as _tb
+                _detail = mask_secrets(
+                    f"{type(e).__name__}: {e}\n--- traceback ---\n"
+                    + "".join(_tb.format_exception(type(e), e, e.__traceback__))
+                )
+                if len(_detail) > 8000:
+                    _detail = _detail[:7900] + "\n[... 截断于 8000 字符 ...]"
+                _elog = self.db.create_stage_log(
+                    self.run_id,
+                    "_pipeline_error",
+                    {"failed_at": datetime.now(timezone.utc).isoformat()},
+                )
+                self.db.update_stage_log(
+                    _elog["id"],
+                    status="failed",
+                    error_message=(
+                        "流水线在编排层抛出未被单个阶段捕获的错误（常见于策略/"
+                        "工部阶段的校验失败：重建 cell 为空、cell 数量对不上、"
+                        "六部有部执行失败等）。完整 traceback 见下：\n\n"
+                        + _detail
+                    ),
+                )
+            except Exception as _persist_err:
+                logger.warning(
+                    "[run] failed to persist _pipeline_error marker: %r",
+                    _persist_err,
+                )
             self.db.update_pipeline_run(
                 self.run_id,
                 status="failed",
@@ -833,11 +868,27 @@ class PipelineOrchestrator:
                 logger.exception(f"Ministry {name} failed: {e}")
                 raise RuntimeError(f"{name} 执行失败：{e}") from e
 
+        # return_exceptions=True so ALL 六部 settle before we decide —
+        # plain gather would propagate the first failure while the other
+        # ministries keep running in the background (leaking tokens + rate
+        # slots) and their real error is masked by whoever raised first.
         results = await asyncio.gather(
-            *[run_one(name) for name in self.ministries]
+            *[run_one(name) for name in self.ministries],
+            return_exceptions=True,
         )
+        pairs: list[tuple[str, Any]] = []
+        errors: list[str] = []
+        for name, res in zip(self.ministries, results):
+            if isinstance(res, BaseException):
+                errors.append(f"{name}: {res}")
+            else:
+                pairs.append(res)
+        if errors:
+            # Required stage — surface an aggregated error naming every部
+            # that failed (not just the first) so the failed run is diagnosable.
+            raise RuntimeError("六部并行执行失败：" + "；".join(errors))
 
-        return {name: output for name, output in results}
+        return {name: output for name, output in pairs}
 
     def _reconstruct_active_cells(self, plan: dict, brief: dict | None = None) -> list[dict]:
         """Compute the active cell list from the plan.
@@ -1174,8 +1225,16 @@ class PipelineOrchestrator:
                 return [merged_by_id[cid] for cid in expected_ids]
 
         results = await asyncio.gather(
-            *[plan_batch(b, i) for i, b in enumerate(batches)]
+            *[plan_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
+        _batch_errs = [str(r) for r in results if isinstance(r, BaseException)]
+        if _batch_errs:
+            # Let every batch settle before failing (no leaked in-flight
+            # calls) and aggregate all batch failures, not just the first.
+            raise RuntimeError(
+                "cell_planner 批次执行失败：" + "；".join(_batch_errs)
+            )
 
         # Merge newly-generated batches
         new_plans_by_id: dict[str, dict] = {}
@@ -1524,8 +1583,14 @@ class PipelineOrchestrator:
                 return [merged_by_id[cid] for cid in expected_ids], merged_demos
 
         results = await asyncio.gather(
-            *[build_batch(b, i) for i, b in enumerate(batches)]
+            *[build_batch(b, i) for i, b in enumerate(batches)],
+            return_exceptions=True,
         )
+        _batch_errs = [str(r) for r in results if isinstance(r, BaseException)]
+        if _batch_errs:
+            raise RuntimeError(
+                "works_builder 批次执行失败：" + "；".join(_batch_errs)
+            )
 
         # Collect newly-generated cells/demos from this run
         new_cells_by_id: dict[str, dict] = {}
