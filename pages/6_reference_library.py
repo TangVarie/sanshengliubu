@@ -26,9 +26,9 @@ from pipeline.agents.reference_pack_analyzer import (
 )
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="参考样本库", page_icon="📚", layout="wide")
+st.set_page_config(page_title="参考样本库", page_icon="省", layout="wide")
 show_version_badge()
-st.title("📚 参考样本库")
+st.title("参考样本库")
 
 st.caption(
     '录入"四位一体证据包"(封面 + 标题 + 正文 + top 评论)。'
@@ -50,7 +50,7 @@ _MAX_IMAGE_BYTES = 2 * 1024 * 1024
 # ── Tab 1: 录入 ═══════════════════════════════════════════════════════════
 # ── Tab 2: 浏览 / 删除 ═════════════════════════════════════════════════════
 
-tab_new, tab_browse = st.tabs(["➕ 新建证据包", "📖 浏览已有"])
+tab_new, tab_browse = st.tabs(["新建证据包", "浏览已有"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -119,7 +119,7 @@ with tab_new:
             )
             st.markdown("**Top 评论(推荐 3-10 条)**")
             st.caption(
-                "一行一条,按「👍 数字」前缀可记录点赞数(可选)。格式:"
+                "一行一条,按「数字」前缀可记录点赞数(可选)。格式:"
                 "`123 | 评论内容` 或直接一行一条评论不含点赞数。"
             )
             comments_raw = st.text_area(
@@ -138,7 +138,7 @@ with tab_new:
         )
 
         _save_clicked = st.button(
-            "🔍 AI 分析并保存",
+            "AI 分析并保存",
             type="primary",
             use_container_width=True,
             key="pack_save_btn",
@@ -200,7 +200,7 @@ with tab_new:
                     st.error(f"AI 分析失败,未入库:\n\n{e}")
                     st.stop()
 
-                st.write("✅ 分析完成,写入数据库...")
+                st.write("分析完成,写入数据库...")
                 pack["ai_analysis"] = analysis
                 try:
                     row = db.save_reference_pack(pack)
@@ -209,10 +209,10 @@ with tab_new:
                     st.error(f"入库失败:{e}")
                     st.stop()
 
-                status.update(label="✅ 已保存", state="complete")
+                status.update(label="已保存", state="complete")
 
             st.success(f"证据包 #{row['id']} 已入库")
-            with st.expander("🔎 查看 AI 分析结果", expanded=True):
+            with st.expander("查看 AI 分析结果", expanded=True):
                 st.json(analysis)
 
             # Clear form for the next entry — avoid accidental duplicates
@@ -243,7 +243,7 @@ with tab_browse:
             )
         with fc3:
             st.write("")
-            refresh_clicked = st.button("🔄 刷新", use_container_width=True)
+            refresh_clicked = st.button("刷新", use_container_width=True)
 
     try:
         packs = db.list_reference_packs(
@@ -256,7 +256,7 @@ with tab_browse:
         st.stop()
 
     if not packs:
-        st.info("还没有证据包匹配。到「➕ 新建证据包」录入第一条。")
+        st.info("还没有证据包匹配。到「新建证据包」录入第一条。")
     else:
         st.caption(f"共 {len(packs)} 条。quality_score 降序 + 创建时间降序。")
         for p in packs:
@@ -276,7 +276,7 @@ with tab_browse:
                     f"{p.get('post_title') or p.get('title') or '未命名'}"
                 )
                 st.markdown(header)
-                st.caption(f"🧠 {summary}")
+                st.caption(f"{summary}")
                 meta_bits = []
                 if tone:
                     meta_bits.append(f"语气: {tone}")
@@ -290,10 +290,10 @@ with tab_browse:
 
                 cA, cB, cC, cD = st.columns([1, 1, 1, 3])
                 with cA:
-                    if st.button("📖 查看", key=f"view_{pid}"):
+                    if st.button("查看", key=f"view_{pid}"):
                         st.session_state[f"show_detail_{pid}"] = True
                 with cB:
-                    if st.button("⭐ +1 分", key=f"up_{pid}", help="人工加分,优先检索"):
+                    if st.button("+1 分", key=f"up_{pid}", help="人工加分,优先检索"):
                         try:
                             db.update_reference_pack(
                                 pid,
@@ -303,7 +303,7 @@ with tab_browse:
                         except Exception as e:
                             st.error(f"更新失败:{e}")
                 with cC:
-                    if st.button("🗑️ 删除", key=f"del_{pid}"):
+                    if st.button("删除", key=f"del_{pid}"):
                         st.session_state[f"confirm_del_{pid}"] = True
 
                 if st.session_state.get(f"confirm_del_{pid}"):
@@ -337,7 +337,7 @@ with tab_browse:
                     comments = p.get("top_comments") or []
                     if comments:
                         for c in comments:
-                            prefix = f"👍 {c.get('likes')} " if c.get("likes") else ""
+                            prefix = f"{c.get('likes')} " if c.get("likes") else ""
                             st.markdown(f"- {prefix}{c.get('text', '')}")
                     else:
                         st.caption("(无评论)")
