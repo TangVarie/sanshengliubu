@@ -15,6 +15,45 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_WRITE_RETRIES = 2
+_WRITE_BACKOFF_SECONDS = (0.4, 1.0)
+
+
+def _with_write_retry(fn):
+    """Run a DB write with bounded retry on transient network errors. The
+    write methods had NO retry: a single httpx.ReadError on update_stage_log
+    would bubble up — and in the agent retry loop it was even misclassified
+    as a model failure and re-ran an expensive LLM call. Wrapping the write
+    itself keeps a transient blip from becoming a run failure / re-billed
+    call. Non-network errors (RLS, 4xx) are NOT retried — they won't heal."""
+    import time as _time
+
+    import httpx
+
+    _TRANSIENT = (
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.PoolTimeout,
+        httpx.WriteError,
+    )
+    last: Exception | None = None
+    for i in range(1 + _WRITE_RETRIES):
+        try:
+            return fn()
+        except _TRANSIENT as e:
+            last = e
+            if i < _WRITE_RETRIES:
+                _time.sleep(
+                    _WRITE_BACKOFF_SECONDS[min(i, len(_WRITE_BACKOFF_SECONDS) - 1)]
+                )
+                continue
+            raise
+    if last is not None:  # pragma: no cover — loop always returns/raises
+        raise last
+
+
 def _parse_ts(raw: Any) -> datetime | None:
     """Parse a Supabase ISO timestamp into an aware datetime, or None.
     Tolerant of trailing 'Z' and missing tz (assumes UTC)."""
@@ -149,8 +188,10 @@ class SupabaseClient:
         return _first_row(resp, op="insert", table="pipeline_runs")
 
     def update_pipeline_run(self, run_id: str, **fields) -> dict:
-        resp = self.client.table("pipeline_runs").update(fields).eq("id", run_id).execute()
-        return _first_row(resp, op="update", table="pipeline_runs")
+        def _do():
+            resp = self.client.table("pipeline_runs").update(fields).eq("id", run_id).execute()
+            return _first_row(resp, op="update", table="pipeline_runs")
+        return _with_write_retry(_do)
 
     def get_pipeline_run(self, run_id: str) -> dict:
         resp = self.client.table("pipeline_runs").select("*").eq("id", run_id).single().execute()
@@ -258,22 +299,26 @@ class SupabaseClient:
     # ── Stage Logs ─────────────────────────────────────────────────────
 
     def create_stage_log(self, run_id: str, stage_name: str, input_data: dict | None = None) -> dict:
-        resp = (
-            self.client.table("stage_logs")
-            .insert({
-                "run_id": run_id,
-                "stage_name": stage_name,
-                "status": "running",
-                "input_data": input_data,
-            })
-            .execute()
-        )
-        return _first_row(resp, op="insert", table="stage_logs")
+        def _do():
+            resp = (
+                self.client.table("stage_logs")
+                .insert({
+                    "run_id": run_id,
+                    "stage_name": stage_name,
+                    "status": "running",
+                    "input_data": input_data,
+                })
+                .execute()
+            )
+            return _first_row(resp, op="insert", table="stage_logs")
+        return _with_write_retry(_do)
 
     def update_stage_log(self, log_id: str, **fields) -> dict:
         fields["updated_at"] = _now()
-        resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
-        return _first_row(resp, op="update", table="stage_logs")
+        def _do():
+            resp = self.client.table("stage_logs").update(fields).eq("id", log_id).execute()
+            return _first_row(resp, op="update", table="stage_logs")
+        return _with_write_retry(_do)
 
     def get_stage_logs(
         self, run_id: str, stage_name: str | None = None

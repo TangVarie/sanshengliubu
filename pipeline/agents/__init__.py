@@ -1788,14 +1788,30 @@ class BaseAgent:
                         log_id=log_id,
                     )
 
-                db.update_stage_log(
-                    log_id,
-                    status="completed",
-                    output_data=output,
-                    model_used=model_label,
-                    tokens_used=total_input_tokens + total_output_tokens,
-                    duration_seconds=round(duration, 2),
-                )
+                # The model call + parse already SUCCEEDED — `output` is in
+                # hand. A DB write failure here must NOT bubble into the retry
+                # loop below (its except would misclassify it and re-run the
+                # expensive model call). update_stage_log self-retries transient
+                # errors now; if it still fails, log and return the output
+                # anyway — losing one stage_log row is far cheaper than
+                # re-billing or failing a good run.
+                try:
+                    db.update_stage_log(
+                        log_id,
+                        status="completed",
+                        output_data=output,
+                        model_used=model_label,
+                        tokens_used=total_input_tokens + total_output_tokens,
+                        duration_seconds=round(duration, 2),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] completion stage_log write failed after retries "
+                        "— returning output anyway (model call succeeded, not "
+                        "re-running)",
+                        self.stage_name,
+                        exc_info=True,
+                    )
                 # Push the run-level cost + token totals to pipeline_runs so
                 # the UI can display current spend without needing access to
                 # the in-process _run_totals dict. Swallow DB errors — cost
