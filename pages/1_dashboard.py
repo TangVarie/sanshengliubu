@@ -8,7 +8,7 @@ from db.supabase_client import SupabaseClient
 from utils.theme import eyebrow, status_tag_html
 from utils.version_badge import show_version_badge
 
-st.set_page_config(page_title="项目总览", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="项目总览", page_icon="省", layout="wide")
 show_version_badge()
 st.title("项目总览")
 

@@ -12,7 +12,7 @@ install_secret_masking_on_root_logger()
 
 st.set_page_config(
     page_title="三省六部 · Prompt Engineering",
-    page_icon="🏛️",
+    page_icon="省",
     layout="wide",
     initial_sidebar_state="expanded",
 )
