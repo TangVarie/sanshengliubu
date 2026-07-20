@@ -3598,12 +3598,20 @@ def _assert_project_not_running(
     and the project isn't in that state. Returns the fresh project dict on
     success.
 
-    The race window between this check and the caller's own "status=running"
-    write is small (ms) but not zero. For full correctness we'd need an
-    atomic compare-and-swap in Supabase, which the Python client doesn't
-    expose cleanly. Combined with the UI-level session_state lock, this
-    closes the practical failure modes (user double-clicks, two tabs).
+    Uses an ATOMIC compare-and-swap (try_claim_project_running) rather than
+    a read-then-check: the old read-only guard had a TOCTOU window because
+    the status only flips to 'running' much later inside the run thread, so
+    two racing starts both read a non-running status and both proceeded —
+    two orchestrators clobbering the same run (duplicate output / doubled
+    tokens / whoever-writes-last-wins). The claim flips the project to
+    'running' as its side effect, so this MUST be immediately followed by
+    launching the run (both callers do).
     """
+    allowed = [required_status] if required_status else None
+    claimed = db.try_claim_project_running(project_id, allowed_from=allowed)
+    if claimed is not None:
+        return claimed
+    # Claim failed — read the current status to produce a precise message.
     project = db.get_project(project_id) or {}
     current = (project.get("status") or "").strip()
     if current == "running":
@@ -3616,7 +3624,10 @@ def _assert_project_not_running(
             f"项目 {project_id[:8]} 当前状态是 {current!r}，不满足触发条件 "
             f"{required_status!r}。请刷新页面查看最新状态。"
         )
-    return project
+    raise PipelineAlreadyRunningError(
+        f"项目 {project_id[:8]} 无法占用为 running（可能有并发启动抢先一步）。"
+        f"请刷新页面后重试。"
+    )
 
 
 def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
@@ -3712,9 +3723,18 @@ def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
     return summary
 
 
-def start_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
-    """Launch pipeline in a background thread (for Streamlit compatibility)."""
-    _assert_project_not_running(project_id, db)
+def start_pipeline_in_background(
+    project_id: str, run_id: str, db: SupabaseClient, *, claim: bool = True
+):
+    """Launch pipeline in a background thread (for Streamlit compatibility).
+
+    claim=True (default) atomically claims the project as 'running' first.
+    Callers that ALREADY claimed it (resume: revise_and_resume claims it up
+    front so its destructive stage_log deletion is race-protected) pass
+    claim=False to avoid a double-claim that would raise AlreadyRunning.
+    """
+    if claim:
+        _assert_project_not_running(project_id, db)
 
     def _thread_target():
         loop = asyncio.new_event_loop()
@@ -4337,11 +4357,17 @@ def revise_and_resume_pipeline_in_background(
     Preserves: crown_prince, secretariat, chancellery_*, dispatcher, 五部.
     These are upstream of works and don't need to re-run.
     """
-    # 0. Guard: only allow this from needs_revision state. The check happens
-    # BEFORE any destructive action (stage_logs deletion, _revision_context
-    # write) because if two clicks race here, the loser would destroy the
-    # winner's still-valid stage_logs. Raising early keeps the DB consistent.
+    # 0. Guard: atomically claim needs_revision → running BEFORE any
+    # destructive action (stage_logs deletion, _revision_context write). Two
+    # racing "apply revision" clicks: only one wins the CAS; the loser raises
+    # here instead of destroying the winner's still-valid stage_logs.
     _assert_project_not_running(project_id, db, required_status="needs_revision")
+
+    # 0.5 Flip the RUN to running immediately, BEFORE the destructive
+    # deletion below. If this resume crashes/gets killed mid-deletion, a
+    # running run with a stale heartbeat is reaper-collectable; a project
+    # stuck 'running' with a non-running run would NOT be.
+    db.update_pipeline_run(run_id, status="running", completed_at=None)
 
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
@@ -4509,9 +4535,8 @@ def revise_and_resume_pipeline_in_background(
         f"[revise] Deleted {deleted} stage_logs: {stages_to_redo}"
     )
 
-    # 4. Reset pipeline_run status so the UI shows it as running again;
-    # project.status gets flipped by orchestrator.run() as its first action,
-    # so don't pre-empt it here (doing so would break the guard in
-    # start_pipeline_in_background).
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
-    return start_pipeline_in_background(project_id, run_id, db)
+    # 4. Launch. The project was already atomically claimed as 'running' in
+    # step 0 and the run set running in step 0.5, so tell
+    # start_pipeline_in_background NOT to claim again (that would raise
+    # AlreadyRunning against the status we ourselves just set).
+    return start_pipeline_in_background(project_id, run_id, db, claim=False)

@@ -166,6 +166,33 @@ class SupabaseClient:
         )
         return resp.data
 
+    def try_claim_project_running(
+        self, project_id: str, allowed_from: list[str] | None = None
+    ) -> dict | None:
+        """Atomically flip a project to 'running' IFF it isn't already running
+        (or, when allowed_from is given, IFF its current status is in that
+        set). Returns the updated project dict if we claimed it, else None.
+
+        This is the authoritative gate against two clicks / two tabs racing
+        to start the SAME project: a read-then-write guard has a TOCTOU
+        window (the status only flips much later inside the run thread), so
+        both racers pass and start two orchestrators that clobber each other.
+        A conditional UPDATE ... WHERE status <> 'running' is atomic in
+        Postgres — exactly one racer's update affects a row.
+        """
+        q = (
+            self.client.table("projects")
+            .update({"status": "running"})
+            .eq("id", project_id)
+        )
+        if allowed_from:
+            q = q.in_("status", list(allowed_from))
+        else:
+            q = q.neq("status", "running")
+        resp = q.execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+
     def get_running_runs(self, limit: int = 200) -> list[dict]:
         resp = (
             self.client.table("pipeline_runs")
