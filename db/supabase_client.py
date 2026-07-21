@@ -618,7 +618,11 @@ class SupabaseClient:
             .select(
                 "id, title, post_title, post_body, cover_image_b64, "
                 "top_comments, platform, category, ai_analysis, "
-                "quality_score, tags, created_at"
+                "quality_score, tags, created_at, "
+                # 必须选出这列:_shape_for_rewriter 用它算 source_type
+                # (非空=飞轮 TV 样本,空=manual)。漏选会让所有样本恒判 manual、
+                # R-022 飞轮审计 tv_synced 恒为 0。
+                "source_truth_vault_note_id"
             )
             .eq("source_type", "pack")
         )

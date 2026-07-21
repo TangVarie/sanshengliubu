@@ -686,6 +686,33 @@ class PipelineOrchestrator:
             # references 一起持久化。
             await self._run_gemini_trend_scout_post(final_system, plan)
 
+            # 6.95 (#12) 同步 demo_outputs。demo_outputs 是 works 阶段建的**并列
+            # 列表**,但 vibe_loop / red_blue / 叙事导演精炼改的是
+            # prompt_matrix[i].demo_output —— 不同步这个列表会让产出中心/导出显示
+            # 精炼**前**的陈旧示例(且修订/重试会重复追加)。save_output 前直接从
+            # (已精炼的)prompt_matrix 重建它:一 cell 一条(天然去重),output_content
+            # 取精炼后的 demo_output,persona_used 从旧列表按 cell_id/方向保留。
+            _old_demos = final_system.get("demo_outputs") or []
+            def _demo_key(_o):
+                return _o.get("cell_id") or f"{_o.get('direction_id')}|{_o.get('platform')}"
+            _persona_by_key = {
+                _demo_key(_d): _d.get("persona_used", "") for _d in _old_demos
+            }
+            _rebuilt_demos = []
+            for _c in (final_system.get("prompt_matrix") or []):
+                _demo_txt = (_c.get("demo_output") or "").strip()
+                if not _demo_txt:
+                    continue
+                _rebuilt_demos.append({
+                    "cell_id": _c.get("cell_id", ""),
+                    "direction_id": _c.get("direction_id", ""),
+                    "direction_name": _c.get("direction_name", ""),
+                    "platform": _c.get("platform", ""),
+                    "persona_used": _persona_by_key.get(_demo_key(_c), ""),
+                    "output_content": _demo_txt,
+                })
+            final_system["demo_outputs"] = _rebuilt_demos
+
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
 
@@ -2230,25 +2257,33 @@ class PipelineOrchestrator:
         # 3 个画像的 action,全 skip = weak。
         try:
             _personas = (result or {}).get("personas") or []
-            _actions_per_cell: dict[str, list[str]] = {}
+            # 按 (cell_id, _source) 分桶,不把 Claude 与 DeepSeek 两个 backend 的
+            # 票**池化**。池化有两个错:(a) DeepSeek 一票非-skip 就能吞掉 Claude
+            # 3 画像的一致否决(fail-open,漏掉真弱 cell);(b) "全 skip" 阈值随是否
+            # 配置 DEEPSEEK_API_KEY 在 3 票与 6 票间漂移。改为:**任一** backend 对
+            # 某 cell 的画像全部 skip 即判 weak(并集),阈值恒为该 backend 的画像数。
+            _actions_by_cell_src: dict[tuple, list[str]] = {}
             _reactions_per_cell: dict[str, list[str]] = {}
             for _p in _personas:
                 _pid = _p.get("id", "?")
+                _src = _p.get("_source", "?")
                 for _r in (_p.get("reactions") or []):
                     _cid = _r.get("cell_id")
                     if not _cid:
                         continue
-                    _actions_per_cell.setdefault(_cid, []).append(
+                    _actions_by_cell_src.setdefault((_cid, _src), []).append(
                         (_r.get("action") or "").lower()
                     )
                     _reactions_per_cell.setdefault(_cid, []).append(
                         f"{_pid}: {(_r.get('reaction') or '')[:60]}"
                     )
 
-            _weak_cell_ids = [
-                _cid for _cid, _acts in _actions_per_cell.items()
-                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts)
-            ]
+            _weak_set: set[str] = set()
+            for (_cid, _src), _acts in _actions_by_cell_src.items():
+                # 该 backend 至少给了 3 个画像判决且全 skip → 这个 backend 一致否决
+                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts):
+                    _weak_set.add(_cid)
+            _weak_cell_ids = sorted(_weak_set)
 
             if _weak_cell_ids:
                 _matrix = final_system.get("prompt_matrix") or []
@@ -2356,12 +2391,19 @@ class PipelineOrchestrator:
             )
             return
 
-        brief["_reference_posts"] = {
+        _rp = {
             "posts": result.get("posts", []),
             "summary_stats": result.get("_summary_stats", {}),
             "verdict": verdict,
         }
-        self.db.update_project(self.project_id, brief=brief)
+        brief["_reference_posts"] = _rp  # in-memory,供本 run 下游读取
+        # 持久化用 read-modify-merge,不整列覆写。resume/revise 时 brief 是
+        # 不含 _revision_context / _reference_post_urls 的 crown_prince 快照,
+        # 整列覆写会把库里这些持久字段抹掉 → 终审 round 计数丢失、force-pass
+        # 永不触发(无限往返)+ 用户手贴对标 URL 永久丢失。镜像 699-703 写法。
+        _fresh = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+        _fresh["_reference_posts"] = _rp
+        self.db.update_project(self.project_id, brief=_fresh)
 
         self.db.update_stage_log(
             log_id,
@@ -2554,13 +2596,19 @@ class PipelineOrchestrator:
         # Inject raw posts into brief so secretariat sees them. Store
         # both the structured list (for UI + downstream programmatic
         # access) and a formatted block (for direct prompt injection).
-        brief["_trend_intel"] = {
+        _ti = {
             "posts": result.get("posts", []),
             "queries_used": result.get("queries_used", []),
             "grounding_urls": result.get("grounding_urls", []),
             "formatted_block": format_trend_intel_for_prompt(result),
         }
-        self.db.update_project(self.project_id, brief=brief)
+        brief["_trend_intel"] = _ti  # in-memory,供本 run 下游读取
+        # 持久化用 read-modify-merge,不整列覆写(同 _reference_posts:resume 时
+        # brief 是 crown_prince 快照,整列覆写会抹掉 _revision_context /
+        # _reference_post_urls 等持久字段)。镜像 699-703 写法。
+        _fresh = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+        _fresh["_trend_intel"] = _ti
+        self.db.update_project(self.project_id, brief=_fresh)
 
         self.db.update_stage_log(
             log_id,
@@ -4610,7 +4658,15 @@ def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], st
     for dim_name, dim_data in dims.items():
         if not isinstance(dim_data, dict):
             continue
-        score = dim_data.get("score", 5)
+        _raw_score = dim_data.get("score", 5)
+        try:
+            score = float(_raw_score)
+        except (TypeError, ValueError):
+            # 畸形 score(JSON null / 字符串 / 缺失)绝不能让合成崩溃:本函数在
+            # run() 的 6.5 fail-closed 安全网里被调用,一旦抛 TypeError 会冒泡到
+            # 顶层 except、跳过 save_output,把整份已组装好的 prompt_matrix 连同
+            # 这次 run 一起判 failed(零产出)。畸形分视作满分=不为该维度合成。
+            score = 5.0
         issues = (dim_data.get("issues") or "").strip()
         if issues and score < 5:
             synthetic_revs.append(
