@@ -170,8 +170,13 @@ class SupabaseClient:
                 f"Allowed: {sorted(self._PROJECT_UPDATABLE_FIELDS)}"
             )
         fields["updated_at"] = _now()
-        resp = self.client.table("projects").update(fields).eq("id", project_id).execute()
-        return _first_row(resp, op="update", table="projects")
+        # Write-retry: update_project carries the brief overwrite (crown_prince
+        # output, revision context, etc.). A transient httpx blip here must not
+        # bubble up and fail the whole run — mirror update_pipeline_run.
+        def _do():
+            resp = self.client.table("projects").update(fields).eq("id", project_id).execute()
+            return _first_row(resp, op="update", table="projects")
+        return _with_write_retry(_do)
 
     def delete_project(self, project_id: str) -> None:
         """Delete a project and all associated runs/logs/outputs (CASCADE)."""
@@ -474,20 +479,41 @@ class SupabaseClient:
     # ── Outputs ────────────────────────────────────────────────────────
 
     def save_output(self, run_id: str, prompt_system: dict, final_review: dict, version: int = 1) -> dict:
-        resp = (
-            self.client.table("outputs")
-            .insert({
-                "run_id": run_id,
-                "prompt_system": prompt_system,
-                "final_review": final_review,
-                "version": version,
-            })
-            .execute()
-        )
-        return _first_row(resp, op="insert", table="outputs")
+        # Revision reruns REUSE the same run_id (revise_and_resume only deletes
+        # downstream stage_logs, never the outputs row) and reach save_output
+        # again. outputs(run_id) is NOT unique, so a plain insert left TWO rows
+        # for one run_id — and get_output returned data[0] with no ordering, so
+        # the STALE pre-revision output could win and the user would never see
+        # the revised result (silent data loss). Delete any prior row for this
+        # run_id first so exactly one (latest) row survives. Wrapped in
+        # write-retry: this is the heaviest write in the pipeline (full
+        # prompt_system jsonb) and a transient httpx blip must not fail the run.
+        def _do():
+            self.client.table("outputs").delete().eq("run_id", run_id).execute()
+            resp = (
+                self.client.table("outputs")
+                .insert({
+                    "run_id": run_id,
+                    "prompt_system": prompt_system,
+                    "final_review": final_review,
+                    "version": version,
+                })
+                .execute()
+            )
+            return _first_row(resp, op="insert", table="outputs")
+        return _with_write_retry(_do)
 
     def get_output(self, run_id: str) -> dict | None:
-        resp = self.client.table("outputs").select("*").eq("run_id", run_id).execute()
+        # order+limit is defensive: even if legacy duplicate rows exist for a
+        # run_id (from before save_output deduped), always return the latest.
+        resp = (
+            self.client.table("outputs")
+            .select("*")
+            .eq("run_id", run_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         return resp.data[0] if resp.data else None
 
     # ── Reference Samples ───────────────────────────────────────────

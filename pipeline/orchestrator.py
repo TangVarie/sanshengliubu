@@ -444,28 +444,49 @@ class PipelineOrchestrator:
                     ],
                     reverse=True,
                 )
+                # 只重建**已批准**的策略方案。辩论结构:偶数轮=中书省提案、
+                # 奇数轮=门下省审议(verdict=approved 才收敛,见 _strategy_loop)。
+                # 之前直接取最后一个偶数轮 = 拿一份门下省还没批(甚至正要驳回)的
+                # 中途方案当最终稿,跳过剩余对抗轮 → 交付未批准方案。改为:找到
+                # verdict==approved 的门下省(奇数)轮,取它前一个偶数轮的中书省
+                # 方案(那正是被批准的那份;强制通过也写 approved,同样成立)。
+                # 找不到已批准方案 → 不放进 done,让 _strategy_loop 重跑辩论
+                # (重跑安全,只是多花 token,远好过交付未经审议的方案)。
+                _approved_plan = None
                 for _turn_num, _turn_key in _debate_turns:
-                    if _turn_num % 2 != 0:
-                        continue  # 奇数轮是门下省,跳过
-                    _turn_out = done.get(_turn_key) or {}
-                    _candidate_plan = (
-                        _turn_out.get("current_plan") or _turn_out
-                    )
+                    if _turn_num % 2 == 0:
+                        continue  # 偶数轮是中书省提案,这里要找门下省的批准判词
+                    _verdict = (
+                        (done.get(_turn_key) or {}).get("verdict") or ""
+                    ).strip().lower()
+                    if _verdict != "approved":
+                        continue
+                    # 被批准的方案 = 该门下省轮**前一轮**(偶数)的中书省提案
+                    _sec_key = f"strategy_debate_{_turn_num - 1}"
+                    _sec_out = done.get(_sec_key) or {}
+                    _candidate_plan = _sec_out.get("current_plan") or _sec_out
                     if not isinstance(_candidate_plan, dict):
                         continue
                     if not _candidate_plan.get("tactical_directions"):
                         continue
-                    done["secretariat"] = _candidate_plan
+                    _approved_plan = _candidate_plan
                     logger.info(
-                        "[resume] strategy_loop reconstructed from %s "
-                        "(turn %d) — directions=%s",
-                        _turn_key, _turn_num,
+                        "[resume] strategy_loop reconstructed APPROVED plan from "
+                        "%s(被 %s 批准)— directions=%s",
+                        _sec_key, _turn_key,
                         [
                             d.get("direction_id")
                             for d in _candidate_plan.get("tactical_directions", [])
                         ],
                     )
                     break
+                if _approved_plan is not None:
+                    done["secretariat"] = _approved_plan
+                else:
+                    logger.info(
+                        "[resume] 未找到已批准的 strategy_debate 方案 —— "
+                        "重跑策略辩论,而不是复活一份未经审议的中途方案"
+                    )
 
             if "secretariat" in done:
                 logger.info("Resuming: skipping strategy loop (already completed)")
@@ -942,7 +963,11 @@ class PipelineOrchestrator:
 
         Returns the final active_cells list (may be empty).
         """
-        active_cells = plan.get("matrix_skeleton", {}).get("active_cells", []) or []
+        # `or {}` guards a JSON-null matrix_skeleton: plan.get(key, {}) returns
+        # None (not the default) when the key exists with value null, so a bare
+        # .get() would AttributeError and hard-fail the whole run instead of
+        # falling through to the D×P rebuild below. Mirrors line 949.
+        active_cells = (plan.get("matrix_skeleton", {}) or {}).get("active_cells", []) or []
 
         directions = plan.get("tactical_directions", []) or []
         platforms = plan.get("target_platforms", []) or []
@@ -1046,7 +1071,7 @@ class PipelineOrchestrator:
         logger.info(
             f"[cell_planners] plan keys: {list(plan.keys())}, "
             f"matrix_skeleton type: {type(plan.get('matrix_skeleton'))}, "
-            f"active_cells: {plan.get('matrix_skeleton', {}).get('active_cells', 'MISSING')!r:.200s}, "
+            f"active_cells: {(plan.get('matrix_skeleton', {}) or {}).get('active_cells', 'MISSING')!r:.200s}, "
             f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
             f"target_platforms: {plan.get('target_platforms', [])}"
         )
@@ -1820,7 +1845,12 @@ class PipelineOrchestrator:
                         ),
                     } if brief else {}
                     rebuild_input = {
-                        "active_cells": [cell_plan],
+                        # KEY 必须是 cell_plans —— works_builder 的硬契约(见
+                        # works_builder.md)数的是 cell_plans 数组长度做 1:1 自检。
+                        # 之前误写 active_cells(那是 D×P skeleton 的术语),builder
+                        # 收到 0 个 cell_plans → 输出空 prompt_cells → splice-back
+                        # 匹配不到 cell_id → 修订被静默丢弃。
+                        "cell_plans": [cell_plan],
                         "shared_skeleton": shared_skeleton,
                         "brief": _brief_for_rebuild,
                         "_batch_info": {
@@ -1830,9 +1860,10 @@ class PipelineOrchestrator:
                         },
                         "_narrative_directive": fix,
                         "_strict_contract": (
-                            f"叙事导演要求修改这个 cell：{fix}\n"
-                            f"在保留原有合规/关键词/人设的前提下，按指令调整 "
-                            f"demo_output 的钩子结构或叙事方式。"
+                            f"叙事导演要求修改 cell {cid}：{fix}\n"
+                            f"你的 prompt_cells 必须有且只有 1 个 cell,其 cell_id "
+                            f"必须严格等于 {cid}。在保留原有合规/关键词/人设的前提下,"
+                            f"按指令调整 demo_output 的钩子结构或叙事方式。"
                         ),
                     }
                     rebuilt = await self.works_builder.run(
@@ -1859,6 +1890,15 @@ class PipelineOrchestrator:
             _cid, _nc = _r
             _i = _idx_by_id.get(_cid)
             if _i is not None:
+                # 校验后才覆盖:截断/缺字段的重建 cell 不能盖掉一个已验证的原 cell
+                # (否则修订反而把好 cell 换成残缺 cell)。无效则保留原 cell + warn。
+                _valid, _reasons = _validate_prompt_cell(_nc)
+                if not _valid:
+                    logger.warning(
+                        "[narrative_director] rebuilt %s 未过校验 %s,保留原 cell 不覆盖",
+                        _cid, _reasons,
+                    )
+                    continue
                 prompt_cells[_i] = _nc
                 logger.info("[narrative_director] rebuilt %s OK", _cid)
 
@@ -1914,6 +1954,8 @@ class PipelineOrchestrator:
                     red_result = await self.red_blue_red.run(
                         _common_input, self.run_id, self.db,
                     )
+                except RunBudgetExceededError:
+                    raise  # 预算熔断必须冒泡到顶层硬停,不能被下面的通用 except 吞成单 cell 错误
                 except Exception as e:
                     logger.warning("[red_blue] cell %s 红队失败: %r", cid, e)
                     return None, f"red:{type(e).__name__}: {e}"
@@ -1945,22 +1987,18 @@ class PipelineOrchestrator:
                     blue_result = await self.red_blue_blue.run(
                         blue_input, self.run_id, self.db,
                     )
+                except RunBudgetExceededError:
+                    raise  # 同上:预算熔断冒泡到顶层
                 except Exception as e:
                     logger.warning("[red_blue] cell %s 蓝队失败: %r", cid, e)
-                    # Red 跑通了但 Blue 挂了。返回 Red 的 attacks 让 UI 能看到,
-                    # 但不修改 demo。
-                    return ({
-                        "cell_id": cid,
-                        "attacks": attacks,
-                        "fixes": [],
-                        "refined_demo_output": "",
-                        "refined_system_prompt": "",
-                        "changes_summary": (
-                            f"红队找到 {len(attacks)} 个问题但蓝队修复失败: "
-                            f"{type(e).__name__}: {e}"
-                        ),
-                        "_red_summary": red_summary,
-                    }, None)
+                    # 红队找到了 attacks 但蓝队没修好 —— 这 cell 的问题**未被解决**,
+                    # 绝不能当成 unchanged/通过。返回 err(非 None)让聚合循环计入
+                    # stats['failed'],cell 保留原 demo 并标 _red_blue_status=failed,
+                    # 避免 pages/4 误显示"全部通过 Red Team 检查"。
+                    return None, (
+                        f"blue:{type(e).__name__}: {e} "
+                        f"(红队找到 {len(attacks)} 个问题但蓝队修复失败)"
+                    )
 
                 # 合并红蓝输出,保持和老 RedBlueRefiner 同样的字段结构
                 merged = {
@@ -2103,6 +2141,8 @@ class PipelineOrchestrator:
                 _res = await agent.run(_common_input, self.run_id, self.db)
                 logger.info("[persona_sim] %s 跑通", label)
                 return _res, None
+            except RunBudgetExceededError:
+                raise  # 预算熔断冒泡到顶层硬停,不被吞成单 backend 失败
             except Exception as _e:
                 logger.exception("[persona_sim] %s 失败", label)
                 return None, f"{type(_e).__name__}: {_e}"
@@ -2994,8 +3034,13 @@ class PipelineOrchestrator:
             # 让"3 个画像里有 2 个划走"这种信号真的影响判决,而不是只在
             # 全 skip 的 weak_cells 边缘场景才触发 strategic_warnings。
             # 压缩成 {cell_id: [{persona, action, reason}, ...]} 紧凑形式。
+            #
+            # 仅 iteration==0 注入:persona 反应是在 vibe_loop 之前对**原始 demo**
+            # 跑的(见 run() 5d 顺序)。round2+ 只复检被改写过的 cell,那些 cell 的
+            # demo 已变,旧反应变陈旧——继续按 cell_id 注入会拿"对旧文案的划走"去
+            # 判新文案,污染质量闸、阻碍收敛。round2+ 一律不注入。
             _persona_pkg = final_system.get("_persona_reactions") or {}
-            if _persona_pkg.get("status") == "ok":
+            if iteration == 0 and _persona_pkg.get("status") == "ok":
                 _per_cell_reactions: dict = {}
                 for _p in (_persona_pkg.get("personas") or []):
                     _pid = _p.get("id", "?")
@@ -4595,7 +4640,17 @@ def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClie
     don't duplicate it here.
     """
     # Reset run status so UI shows it as running again
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    # Refresh heartbeat_at when reviving a reused run row: its heartbeat is
+    # stale from the previous attempt, and the heartbeat daemon only starts
+    # ticking once start_pipeline_in_background's thread spins up. Without this,
+    # a reaper pass in that startup window would see status=running + a stale
+    # heartbeat and kill the healthy run we just resumed.
+    db.update_pipeline_run(
+        run_id,
+        status="running",
+        completed_at=None,
+        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+    )
     return start_pipeline_in_background(project_id, run_id, db)
 
 
@@ -4627,7 +4682,17 @@ def revise_and_resume_pipeline_in_background(
     # deletion below. If this resume crashes/gets killed mid-deletion, a
     # running run with a stale heartbeat is reaper-collectable; a project
     # stuck 'running' with a non-running run would NOT be.
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    # Refresh heartbeat_at when reviving a reused run row: its heartbeat is
+    # stale from the previous attempt, and the heartbeat daemon only starts
+    # ticking once start_pipeline_in_background's thread spins up. Without this,
+    # a reaper pass in that startup window would see status=running + a stale
+    # heartbeat and kill the healthy run we just resumed.
+    db.update_pipeline_run(
+        run_id,
+        status="running",
+        completed_at=None,
+        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+    )
 
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
