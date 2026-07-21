@@ -2,9 +2,25 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.30.13"
-VERSION_DATE = "2026-06-10"
+VERSION = "v0.31.0"
+VERSION_DATE = "2026-07-21"
 VERSION_NOTES = (
+    "v0.31.0 feature+reliability: SocialDataX 直连 + 全链路卡死/低质量硬化。"
+    "(1) #33 趋势取样从 Gemini 网搜切到 SocialDataX MCP 直连小红书(REQUIRED/"
+    "fail-fast:取不到样提前终止,避免少关键素材导致产出差)。"
+    "(2) #34 可靠性大修:心跳+reaper 收割僵尸 run、自适应 RPM 安全阀(60 起跑撞 "
+    "429 回落 15)、GPT→Claude 跨厂商兜底、gather return_exceptions+聚合、原子 CAS "
+    "启动守卫、st.fragment 非阻塞刷新、DB 写重试。"
+    "(3) #35 前端重设计(去 emoji + 统一品牌 favicon)。"
+    "(4) #36 三轮 8 维审计 + 对抗验证共 29 处修复(含 2 P0):终审驳回后卡死"
+    "(修订态 _revision_context 跨 run 泄漏 / brief 快照覆写抹掉 round 计数)、"
+    "save_output 复用 run_id 致修订产出被旧版盖、网感闸门 fail-open→fail-closed、"
+    "resume 复活未批准策略方案、蓝队失败当'全过'出货、review_dimensions.score "
+    "畸形致零产出、reaper 扩到 paused 僵尸、resume/revise 刷心跳防误杀、五部截断"
+    "可见化、demo_outputs 与精炼后 prompt_matrix 同步 等。#9 限流器 reconfigure "
+    "按决定不改。⚠️ gpt-5.5/deepseek-v4-pro 成本单价为估算值,待按账单校准。"
+)
+_VERSION_NOTES_LEGACY = (
     "v0.30.13 fix: 回退 strategy-debate thinking(修 v0.30.12 引入的崩溃)+ "
     "cell 重建加 brief 平台兜底。"
     "(1) 根因:v0.30.12 让 secretariat 在 strategy_debate_* 期间开 adaptive "
