@@ -245,21 +245,45 @@ class SupabaseClient:
         )
         return resp.data or []
 
+    # Statuses whose row a killed process strands as a permanent zombie.
+    # 'paused_for_review' is included because a run waiting on human
+    # clarification keeps ticking its heartbeat (the beat is an INDEPENDENT
+    # daemon thread, not gated on stage progress) — so a *stale* heartbeat on
+    # a paused run means the process died mid-wait (a zombie the reaper must
+    # collect), while a *fresh* heartbeat means it is legitimately still
+    # waiting for the user and must NOT be reaped (enforced by the cutoff
+    # check in reap_stale_runs).
+    _REAPABLE_STATUSES = ("running", "paused_for_review")
+
+    def get_reapable_runs(self, limit: int = 200) -> list[dict]:
+        resp = (
+            self.client.table("pipeline_runs")
+            .select("*")
+            .in_("status", list(self._REAPABLE_STATUSES))
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
     def reap_stale_runs(self, stale_seconds: int) -> int:
-        """Mark 'running' runs whose heartbeat (or start time when heartbeat
-        is absent, e.g. rows from before the column existed) is older than
-        stale_seconds as failed. Returns the count reaped.
+        """Mark reapable runs ('running' or 'paused_for_review') whose
+        heartbeat (or start time when heartbeat is absent, e.g. rows from
+        before the column existed) is older than stale_seconds as failed.
+        Returns the count reaped.
 
         This is the ONLY thing that cleans up zombie runs: when Streamlit
         Cloud SIGKILLs the process, the background thread dies without
-        running its except/finally, so the DB stays 'running' forever. Call
-        this on app load. Heartbeat ticks every PIPELINE_HEARTBEAT_INTERVAL
-        while a run is genuinely alive, so a stale heartbeat means the
-        process is dead, not that a stage is just slow.
+        running its except/finally, so the DB stays 'running'/'paused' forever.
+        Call this on app load. The heartbeat ticks every
+        PIPELINE_HEARTBEAT_INTERVAL from an INDEPENDENT daemon while a run is
+        genuinely alive — even while it is paused_for_review waiting on human
+        clarification — so a stale heartbeat means the process is dead, not
+        that a stage is slow or the user is slow to answer.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
         reaped = 0
-        for run in self.get_running_runs():
+        for run in self.get_reapable_runs():
             ts = _parse_ts(
                 run.get("heartbeat_at")
                 or run.get("started_at")
@@ -270,6 +294,7 @@ class SupabaseClient:
             rid = run.get("id")
             if not rid:
                 continue
+            _was_paused = run.get("status") == "paused_for_review"
             try:
                 self.update_pipeline_run(
                     rid, status="failed", completed_at=_now()
@@ -279,21 +304,32 @@ class SupabaseClient:
                 log = self.create_stage_log(
                     rid, "_pipeline_error", {"reaped_at": _now()}
                 )
-                self.update_stage_log(
-                    log["id"],
-                    status="failed",
-                    error_message=(
+                if _was_paused:
+                    _msg = (
+                        "⛔ 这条 run 被自动收割:它停在 paused_for_review(等待"
+                        "澄清补充)但心跳已停止"
+                        f"（超过 {stale_seconds}s 无更新）,说明运行进程在等待期间"
+                        "已被 Cloud 回收/重启,后台线程当场中断、无法再自动恢复。"
+                        "状态已重置为 failed —— 若你此前已提交澄清答复,请点"
+                        "「重跑流水线」重来并重新补充。"
+                    )
+                else:
+                    _msg = (
                         "⛔ 这条 run 被自动收割:它标记为 running 但心跳已停止"
                         f"（超过 {stale_seconds}s 无更新）,说明运行进程已被 "
                         "Cloud 回收/重启,后台线程当场中断、来不及自己落库。"
                         "状态已重置为 failed,可以点「重跑流水线」重来。"
-                    ),
+                    )
+                self.update_stage_log(
+                    log["id"], status="failed", error_message=_msg
                 )
                 reaped += 1
             except Exception as e:
                 logger.warning("[reap] failed to reap run %s: %r", rid, e)
         if reaped:
-            logger.info("[reap] reaped %d stale (zombie) running run(s)", reaped)
+            logger.info(
+                "[reap] reaped %d stale (zombie) run(s) [running/paused]", reaped
+            )
         return reaped
 
     # ── Stage Logs ─────────────────────────────────────────────────────
