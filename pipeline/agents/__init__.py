@@ -1542,6 +1542,12 @@ class BaseAgent:
                 logger.warning(
                     f"JSON was truncated (len={len(response_text)}), repaired by closing brackets"
                 )
+                if isinstance(repaired, dict):
+                    # 让下游知道"这是被 max_tokens 截断后修补的残缺产出",而非静默
+                    # 当完整结果吞下。无下游质量闸的 stage(尤其五部 personnel/
+                    # revenue/rites/war/justice)据此可告警,不再把砍短的 persona
+                    # 池当完整交付。
+                    repaired["_json_truncated"] = True
                 return repaired
 
         # v0.29.12: 老错误只报 last 200 chars,debug 时还得翻 stage_log
@@ -1769,6 +1775,17 @@ class BaseAgent:
 
                 output = self._extract_json(text)
                 duration = time.time() - start_time
+
+                # 截断可见化(#3):_extract_json 修补过截断 JSON 时会打
+                # _json_truncated 标记。这里按 stage 名再报一次 warning(便于定位
+                # 是哪个阶段被截断),标记随 output 一并写进 stage_log.output_data
+                # 持久化(下面 update_stage_log 原样写 output),UI/SQL 可查。
+                if isinstance(output, dict) and output.get("_json_truncated"):
+                    logger.warning(
+                        "[%s] 输出被 max_tokens 截断,已用闭合括号修补 —— 产出可能"
+                        "残缺(如画像池被砍短)。建议调高该 stage 的 max_tokens 或分块。",
+                        self.stage_name,
+                    )
 
                 # ── Check if agent is requesting clarification ─────────
                 if output.get("status") == "needs_clarification":

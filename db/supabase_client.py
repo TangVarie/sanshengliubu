@@ -170,8 +170,13 @@ class SupabaseClient:
                 f"Allowed: {sorted(self._PROJECT_UPDATABLE_FIELDS)}"
             )
         fields["updated_at"] = _now()
-        resp = self.client.table("projects").update(fields).eq("id", project_id).execute()
-        return _first_row(resp, op="update", table="projects")
+        # Write-retry: update_project carries the brief overwrite (crown_prince
+        # output, revision context, etc.). A transient httpx blip here must not
+        # bubble up and fail the whole run — mirror update_pipeline_run.
+        def _do():
+            resp = self.client.table("projects").update(fields).eq("id", project_id).execute()
+            return _first_row(resp, op="update", table="projects")
+        return _with_write_retry(_do)
 
     def delete_project(self, project_id: str) -> None:
         """Delete a project and all associated runs/logs/outputs (CASCADE)."""
@@ -245,21 +250,45 @@ class SupabaseClient:
         )
         return resp.data or []
 
+    # Statuses whose row a killed process strands as a permanent zombie.
+    # 'paused_for_review' is included because a run waiting on human
+    # clarification keeps ticking its heartbeat (the beat is an INDEPENDENT
+    # daemon thread, not gated on stage progress) — so a *stale* heartbeat on
+    # a paused run means the process died mid-wait (a zombie the reaper must
+    # collect), while a *fresh* heartbeat means it is legitimately still
+    # waiting for the user and must NOT be reaped (enforced by the cutoff
+    # check in reap_stale_runs).
+    _REAPABLE_STATUSES = ("running", "paused_for_review")
+
+    def get_reapable_runs(self, limit: int = 200) -> list[dict]:
+        resp = (
+            self.client.table("pipeline_runs")
+            .select("*")
+            .in_("status", list(self._REAPABLE_STATUSES))
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+
     def reap_stale_runs(self, stale_seconds: int) -> int:
-        """Mark 'running' runs whose heartbeat (or start time when heartbeat
-        is absent, e.g. rows from before the column existed) is older than
-        stale_seconds as failed. Returns the count reaped.
+        """Mark reapable runs ('running' or 'paused_for_review') whose
+        heartbeat (or start time when heartbeat is absent, e.g. rows from
+        before the column existed) is older than stale_seconds as failed.
+        Returns the count reaped.
 
         This is the ONLY thing that cleans up zombie runs: when Streamlit
         Cloud SIGKILLs the process, the background thread dies without
-        running its except/finally, so the DB stays 'running' forever. Call
-        this on app load. Heartbeat ticks every PIPELINE_HEARTBEAT_INTERVAL
-        while a run is genuinely alive, so a stale heartbeat means the
-        process is dead, not that a stage is just slow.
+        running its except/finally, so the DB stays 'running'/'paused' forever.
+        Call this on app load. The heartbeat ticks every
+        PIPELINE_HEARTBEAT_INTERVAL from an INDEPENDENT daemon while a run is
+        genuinely alive — even while it is paused_for_review waiting on human
+        clarification — so a stale heartbeat means the process is dead, not
+        that a stage is slow or the user is slow to answer.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
         reaped = 0
-        for run in self.get_running_runs():
+        for run in self.get_reapable_runs():
             ts = _parse_ts(
                 run.get("heartbeat_at")
                 or run.get("started_at")
@@ -270,6 +299,7 @@ class SupabaseClient:
             rid = run.get("id")
             if not rid:
                 continue
+            _was_paused = run.get("status") == "paused_for_review"
             try:
                 self.update_pipeline_run(
                     rid, status="failed", completed_at=_now()
@@ -279,21 +309,32 @@ class SupabaseClient:
                 log = self.create_stage_log(
                     rid, "_pipeline_error", {"reaped_at": _now()}
                 )
-                self.update_stage_log(
-                    log["id"],
-                    status="failed",
-                    error_message=(
+                if _was_paused:
+                    _msg = (
+                        "⛔ 这条 run 被自动收割:它停在 paused_for_review(等待"
+                        "澄清补充)但心跳已停止"
+                        f"（超过 {stale_seconds}s 无更新）,说明运行进程在等待期间"
+                        "已被 Cloud 回收/重启,后台线程当场中断、无法再自动恢复。"
+                        "状态已重置为 failed —— 若你此前已提交澄清答复,请点"
+                        "「重跑流水线」重来并重新补充。"
+                    )
+                else:
+                    _msg = (
                         "⛔ 这条 run 被自动收割:它标记为 running 但心跳已停止"
                         f"（超过 {stale_seconds}s 无更新）,说明运行进程已被 "
                         "Cloud 回收/重启,后台线程当场中断、来不及自己落库。"
                         "状态已重置为 failed,可以点「重跑流水线」重来。"
-                    ),
+                    )
+                self.update_stage_log(
+                    log["id"], status="failed", error_message=_msg
                 )
                 reaped += 1
             except Exception as e:
                 logger.warning("[reap] failed to reap run %s: %r", rid, e)
         if reaped:
-            logger.info("[reap] reaped %d stale (zombie) running run(s)", reaped)
+            logger.info(
+                "[reap] reaped %d stale (zombie) run(s) [running/paused]", reaped
+            )
         return reaped
 
     # ── Stage Logs ─────────────────────────────────────────────────────
@@ -438,20 +479,41 @@ class SupabaseClient:
     # ── Outputs ────────────────────────────────────────────────────────
 
     def save_output(self, run_id: str, prompt_system: dict, final_review: dict, version: int = 1) -> dict:
-        resp = (
-            self.client.table("outputs")
-            .insert({
-                "run_id": run_id,
-                "prompt_system": prompt_system,
-                "final_review": final_review,
-                "version": version,
-            })
-            .execute()
-        )
-        return _first_row(resp, op="insert", table="outputs")
+        # Revision reruns REUSE the same run_id (revise_and_resume only deletes
+        # downstream stage_logs, never the outputs row) and reach save_output
+        # again. outputs(run_id) is NOT unique, so a plain insert left TWO rows
+        # for one run_id — and get_output returned data[0] with no ordering, so
+        # the STALE pre-revision output could win and the user would never see
+        # the revised result (silent data loss). Delete any prior row for this
+        # run_id first so exactly one (latest) row survives. Wrapped in
+        # write-retry: this is the heaviest write in the pipeline (full
+        # prompt_system jsonb) and a transient httpx blip must not fail the run.
+        def _do():
+            self.client.table("outputs").delete().eq("run_id", run_id).execute()
+            resp = (
+                self.client.table("outputs")
+                .insert({
+                    "run_id": run_id,
+                    "prompt_system": prompt_system,
+                    "final_review": final_review,
+                    "version": version,
+                })
+                .execute()
+            )
+            return _first_row(resp, op="insert", table="outputs")
+        return _with_write_retry(_do)
 
     def get_output(self, run_id: str) -> dict | None:
-        resp = self.client.table("outputs").select("*").eq("run_id", run_id).execute()
+        # order+limit is defensive: even if legacy duplicate rows exist for a
+        # run_id (from before save_output deduped), always return the latest.
+        resp = (
+            self.client.table("outputs")
+            .select("*")
+            .eq("run_id", run_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
         return resp.data[0] if resp.data else None
 
     # ── Reference Samples ───────────────────────────────────────────
@@ -556,7 +618,11 @@ class SupabaseClient:
             .select(
                 "id, title, post_title, post_body, cover_image_b64, "
                 "top_comments, platform, category, ai_analysis, "
-                "quality_score, tags, created_at"
+                "quality_score, tags, created_at, "
+                # 必须选出这列:_shape_for_rewriter 用它算 source_type
+                # (非空=飞轮 TV 样本,空=manual)。漏选会让所有样本恒判 manual、
+                # R-022 飞轮审计 tv_synced 恒为 0。
+                "source_truth_vault_note_id"
             )
             .eq("source_type", "pack")
         )

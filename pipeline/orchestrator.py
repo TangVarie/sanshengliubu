@@ -290,7 +290,28 @@ class PipelineOrchestrator:
             # deleted the downstream stage_logs. Load it here so we can inject
             # it into the works agents' inputs.
             _project_brief = (self.db.get_project(self.project_id) or {}).get("brief") or {}
-            self._revision_context: dict | None = _project_brief.get("_revision_context")
+            _rc_raw = _project_brief.get("_revision_context")
+            # Only honor revision context created FOR THIS run. A fresh "重跑"
+            # mints a NEW run_id; a context left behind by a previous run must
+            # not silently drag this run into revision mode — that injects stale
+            # _revision_directives into 工部 and makes 终审 do a *delta* review
+            # against a prior_review describing a prompt_matrix that no longer
+            # exists, so it keeps rejecting and never converges ("从来没通过 +
+            # 变得非常奇怪"). Legacy contexts written before this guard carry no
+            # run_id; those are also cleared at the fresh-start trigger sites.
+            if (
+                _rc_raw
+                and _rc_raw.get("run_id")
+                and _rc_raw.get("run_id") != self.run_id
+            ):
+                logger.info(
+                    "[revise] ignoring stale _revision_context (belongs to run "
+                    "%s, this run is %s)",
+                    str(_rc_raw.get("run_id"))[:8],
+                    str(self.run_id)[:8],
+                )
+                _rc_raw = None
+            self._revision_context: dict | None = _rc_raw
             if self._revision_context:
                 logger.info(
                     f"[revise] revision mode active, "
@@ -337,6 +358,10 @@ class PipelineOrchestrator:
                     "strategic_warnings",
                     "_strategic_escalation_history",
                     "_prior_strategic_warnings",
+                    # 机器抓取的当前爆款样本 — 上一轮的 _trend_intel 若不剥离,
+                    # 会以陈旧"当前爆款"身份混进 crown_prince 输入并扩散到下游。
+                    # 趋势取样(step 1b)会用当前值重填,这里剥离保证不吃旧数据。
+                    "_trend_intel",
                 )
                 _clean_brief = {
                     k: v for k, v in _brief_dict.items()
@@ -368,6 +393,18 @@ class PipelineOrchestrator:
                 if _free_text:
                     structured_brief["_user_raw_input"] = _free_text
                     structured_brief["_raw_input_text"] = _free_text  # 兼容
+                # crown_prince 的输出会整体覆写 project.brief。它的结构化 schema
+                # 不回显这些"用户原始高信号输入"字段,若不并回,update_project 会把
+                # 它们静默丢弃 —— 尤其 _reference_post_urls(用户手贴的对标爆文
+                # URL),丢了之后参考分析器(step 1a)永远拿不到 URL。setdefault:
+                # 只在 crown_prince 没自己产出同名字段时补,不覆盖它的输出。
+                for _k in (
+                    "_reference_post_urls",
+                    "_library_sample_analyses",
+                    "_screenshot_analysis_text",
+                ):
+                    if _k in _brief_dict:
+                        structured_brief.setdefault(_k, _brief_dict[_k])
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             # 1a. User-pasted reference posts (B) — if page 2 recorded
@@ -407,28 +444,49 @@ class PipelineOrchestrator:
                     ],
                     reverse=True,
                 )
+                # 只重建**已批准**的策略方案。辩论结构:偶数轮=中书省提案、
+                # 奇数轮=门下省审议(verdict=approved 才收敛,见 _strategy_loop)。
+                # 之前直接取最后一个偶数轮 = 拿一份门下省还没批(甚至正要驳回)的
+                # 中途方案当最终稿,跳过剩余对抗轮 → 交付未批准方案。改为:找到
+                # verdict==approved 的门下省(奇数)轮,取它前一个偶数轮的中书省
+                # 方案(那正是被批准的那份;强制通过也写 approved,同样成立)。
+                # 找不到已批准方案 → 不放进 done,让 _strategy_loop 重跑辩论
+                # (重跑安全,只是多花 token,远好过交付未经审议的方案)。
+                _approved_plan = None
                 for _turn_num, _turn_key in _debate_turns:
-                    if _turn_num % 2 != 0:
-                        continue  # 奇数轮是门下省,跳过
-                    _turn_out = done.get(_turn_key) or {}
-                    _candidate_plan = (
-                        _turn_out.get("current_plan") or _turn_out
-                    )
+                    if _turn_num % 2 == 0:
+                        continue  # 偶数轮是中书省提案,这里要找门下省的批准判词
+                    _verdict = (
+                        (done.get(_turn_key) or {}).get("verdict") or ""
+                    ).strip().lower()
+                    if _verdict != "approved":
+                        continue
+                    # 被批准的方案 = 该门下省轮**前一轮**(偶数)的中书省提案
+                    _sec_key = f"strategy_debate_{_turn_num - 1}"
+                    _sec_out = done.get(_sec_key) or {}
+                    _candidate_plan = _sec_out.get("current_plan") or _sec_out
                     if not isinstance(_candidate_plan, dict):
                         continue
                     if not _candidate_plan.get("tactical_directions"):
                         continue
-                    done["secretariat"] = _candidate_plan
+                    _approved_plan = _candidate_plan
                     logger.info(
-                        "[resume] strategy_loop reconstructed from %s "
-                        "(turn %d) — directions=%s",
-                        _turn_key, _turn_num,
+                        "[resume] strategy_loop reconstructed APPROVED plan from "
+                        "%s(被 %s 批准)— directions=%s",
+                        _sec_key, _turn_key,
                         [
                             d.get("direction_id")
                             for d in _candidate_plan.get("tactical_directions", [])
                         ],
                     )
                     break
+                if _approved_plan is not None:
+                    done["secretariat"] = _approved_plan
+                else:
+                    logger.info(
+                        "[resume] 未找到已批准的 strategy_debate 方案 —— "
+                        "重跑策略辩论,而不是复活一份未经审议的中途方案"
+                    )
 
             if "secretariat" in done:
                 logger.info("Resuming: skipping strategy loop (already completed)")
@@ -627,6 +685,33 @@ class PipelineOrchestrator:
             # prompt_matrix 的内容——纯观察。跑在 save_output 之前好让
             # references 一起持久化。
             await self._run_gemini_trend_scout_post(final_system, plan)
+
+            # 6.95 (#12) 同步 demo_outputs。demo_outputs 是 works 阶段建的**并列
+            # 列表**,但 vibe_loop / red_blue / 叙事导演精炼改的是
+            # prompt_matrix[i].demo_output —— 不同步这个列表会让产出中心/导出显示
+            # 精炼**前**的陈旧示例(且修订/重试会重复追加)。save_output 前直接从
+            # (已精炼的)prompt_matrix 重建它:一 cell 一条(天然去重),output_content
+            # 取精炼后的 demo_output,persona_used 从旧列表按 cell_id/方向保留。
+            _old_demos = final_system.get("demo_outputs") or []
+            def _demo_key(_o):
+                return _o.get("cell_id") or f"{_o.get('direction_id')}|{_o.get('platform')}"
+            _persona_by_key = {
+                _demo_key(_d): _d.get("persona_used", "") for _d in _old_demos
+            }
+            _rebuilt_demos = []
+            for _c in (final_system.get("prompt_matrix") or []):
+                _demo_txt = (_c.get("demo_output") or "").strip()
+                if not _demo_txt:
+                    continue
+                _rebuilt_demos.append({
+                    "cell_id": _c.get("cell_id", ""),
+                    "direction_id": _c.get("direction_id", ""),
+                    "direction_name": _c.get("direction_name", ""),
+                    "platform": _c.get("platform", ""),
+                    "persona_used": _persona_by_key.get(_demo_key(_c), ""),
+                    "output_content": _demo_txt,
+                })
+            final_system["demo_outputs"] = _rebuilt_demos
 
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
@@ -905,7 +990,11 @@ class PipelineOrchestrator:
 
         Returns the final active_cells list (may be empty).
         """
-        active_cells = plan.get("matrix_skeleton", {}).get("active_cells", []) or []
+        # `or {}` guards a JSON-null matrix_skeleton: plan.get(key, {}) returns
+        # None (not the default) when the key exists with value null, so a bare
+        # .get() would AttributeError and hard-fail the whole run instead of
+        # falling through to the D×P rebuild below. Mirrors line 949.
+        active_cells = (plan.get("matrix_skeleton", {}) or {}).get("active_cells", []) or []
 
         directions = plan.get("tactical_directions", []) or []
         platforms = plan.get("target_platforms", []) or []
@@ -1009,7 +1098,7 @@ class PipelineOrchestrator:
         logger.info(
             f"[cell_planners] plan keys: {list(plan.keys())}, "
             f"matrix_skeleton type: {type(plan.get('matrix_skeleton'))}, "
-            f"active_cells: {plan.get('matrix_skeleton', {}).get('active_cells', 'MISSING')!r:.200s}, "
+            f"active_cells: {(plan.get('matrix_skeleton', {}) or {}).get('active_cells', 'MISSING')!r:.200s}, "
             f"tactical_directions count: {len(plan.get('tactical_directions', []))}, "
             f"target_platforms: {plan.get('target_platforms', [])}"
         )
@@ -1783,7 +1872,12 @@ class PipelineOrchestrator:
                         ),
                     } if brief else {}
                     rebuild_input = {
-                        "active_cells": [cell_plan],
+                        # KEY 必须是 cell_plans —— works_builder 的硬契约(见
+                        # works_builder.md)数的是 cell_plans 数组长度做 1:1 自检。
+                        # 之前误写 active_cells(那是 D×P skeleton 的术语),builder
+                        # 收到 0 个 cell_plans → 输出空 prompt_cells → splice-back
+                        # 匹配不到 cell_id → 修订被静默丢弃。
+                        "cell_plans": [cell_plan],
                         "shared_skeleton": shared_skeleton,
                         "brief": _brief_for_rebuild,
                         "_batch_info": {
@@ -1793,9 +1887,10 @@ class PipelineOrchestrator:
                         },
                         "_narrative_directive": fix,
                         "_strict_contract": (
-                            f"叙事导演要求修改这个 cell：{fix}\n"
-                            f"在保留原有合规/关键词/人设的前提下，按指令调整 "
-                            f"demo_output 的钩子结构或叙事方式。"
+                            f"叙事导演要求修改 cell {cid}：{fix}\n"
+                            f"你的 prompt_cells 必须有且只有 1 个 cell,其 cell_id "
+                            f"必须严格等于 {cid}。在保留原有合规/关键词/人设的前提下,"
+                            f"按指令调整 demo_output 的钩子结构或叙事方式。"
                         ),
                     }
                     rebuilt = await self.works_builder.run(
@@ -1822,6 +1917,15 @@ class PipelineOrchestrator:
             _cid, _nc = _r
             _i = _idx_by_id.get(_cid)
             if _i is not None:
+                # 校验后才覆盖:截断/缺字段的重建 cell 不能盖掉一个已验证的原 cell
+                # (否则修订反而把好 cell 换成残缺 cell)。无效则保留原 cell + warn。
+                _valid, _reasons = _validate_prompt_cell(_nc)
+                if not _valid:
+                    logger.warning(
+                        "[narrative_director] rebuilt %s 未过校验 %s,保留原 cell 不覆盖",
+                        _cid, _reasons,
+                    )
+                    continue
                 prompt_cells[_i] = _nc
                 logger.info("[narrative_director] rebuilt %s OK", _cid)
 
@@ -1877,6 +1981,8 @@ class PipelineOrchestrator:
                     red_result = await self.red_blue_red.run(
                         _common_input, self.run_id, self.db,
                     )
+                except RunBudgetExceededError:
+                    raise  # 预算熔断必须冒泡到顶层硬停,不能被下面的通用 except 吞成单 cell 错误
                 except Exception as e:
                     logger.warning("[red_blue] cell %s 红队失败: %r", cid, e)
                     return None, f"red:{type(e).__name__}: {e}"
@@ -1908,22 +2014,18 @@ class PipelineOrchestrator:
                     blue_result = await self.red_blue_blue.run(
                         blue_input, self.run_id, self.db,
                     )
+                except RunBudgetExceededError:
+                    raise  # 同上:预算熔断冒泡到顶层
                 except Exception as e:
                     logger.warning("[red_blue] cell %s 蓝队失败: %r", cid, e)
-                    # Red 跑通了但 Blue 挂了。返回 Red 的 attacks 让 UI 能看到,
-                    # 但不修改 demo。
-                    return ({
-                        "cell_id": cid,
-                        "attacks": attacks,
-                        "fixes": [],
-                        "refined_demo_output": "",
-                        "refined_system_prompt": "",
-                        "changes_summary": (
-                            f"红队找到 {len(attacks)} 个问题但蓝队修复失败: "
-                            f"{type(e).__name__}: {e}"
-                        ),
-                        "_red_summary": red_summary,
-                    }, None)
+                    # 红队找到了 attacks 但蓝队没修好 —— 这 cell 的问题**未被解决**,
+                    # 绝不能当成 unchanged/通过。返回 err(非 None)让聚合循环计入
+                    # stats['failed'],cell 保留原 demo 并标 _red_blue_status=failed,
+                    # 避免 pages/4 误显示"全部通过 Red Team 检查"。
+                    return None, (
+                        f"blue:{type(e).__name__}: {e} "
+                        f"(红队找到 {len(attacks)} 个问题但蓝队修复失败)"
+                    )
 
                 # 合并红蓝输出,保持和老 RedBlueRefiner 同样的字段结构
                 merged = {
@@ -2066,6 +2168,8 @@ class PipelineOrchestrator:
                 _res = await agent.run(_common_input, self.run_id, self.db)
                 logger.info("[persona_sim] %s 跑通", label)
                 return _res, None
+            except RunBudgetExceededError:
+                raise  # 预算熔断冒泡到顶层硬停,不被吞成单 backend 失败
             except Exception as _e:
                 logger.exception("[persona_sim] %s 失败", label)
                 return None, f"{type(_e).__name__}: {_e}"
@@ -2153,25 +2257,33 @@ class PipelineOrchestrator:
         # 3 个画像的 action,全 skip = weak。
         try:
             _personas = (result or {}).get("personas") or []
-            _actions_per_cell: dict[str, list[str]] = {}
+            # 按 (cell_id, _source) 分桶,不把 Claude 与 DeepSeek 两个 backend 的
+            # 票**池化**。池化有两个错:(a) DeepSeek 一票非-skip 就能吞掉 Claude
+            # 3 画像的一致否决(fail-open,漏掉真弱 cell);(b) "全 skip" 阈值随是否
+            # 配置 DEEPSEEK_API_KEY 在 3 票与 6 票间漂移。改为:**任一** backend 对
+            # 某 cell 的画像全部 skip 即判 weak(并集),阈值恒为该 backend 的画像数。
+            _actions_by_cell_src: dict[tuple, list[str]] = {}
             _reactions_per_cell: dict[str, list[str]] = {}
             for _p in _personas:
                 _pid = _p.get("id", "?")
+                _src = _p.get("_source", "?")
                 for _r in (_p.get("reactions") or []):
                     _cid = _r.get("cell_id")
                     if not _cid:
                         continue
-                    _actions_per_cell.setdefault(_cid, []).append(
+                    _actions_by_cell_src.setdefault((_cid, _src), []).append(
                         (_r.get("action") or "").lower()
                     )
                     _reactions_per_cell.setdefault(_cid, []).append(
                         f"{_pid}: {(_r.get('reaction') or '')[:60]}"
                     )
 
-            _weak_cell_ids = [
-                _cid for _cid, _acts in _actions_per_cell.items()
-                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts)
-            ]
+            _weak_set: set[str] = set()
+            for (_cid, _src), _acts in _actions_by_cell_src.items():
+                # 该 backend 至少给了 3 个画像判决且全 skip → 这个 backend 一致否决
+                if len(_acts) >= 3 and all(_a == "skip" for _a in _acts):
+                    _weak_set.add(_cid)
+            _weak_cell_ids = sorted(_weak_set)
 
             if _weak_cell_ids:
                 _matrix = final_system.get("prompt_matrix") or []
@@ -2279,12 +2391,19 @@ class PipelineOrchestrator:
             )
             return
 
-        brief["_reference_posts"] = {
+        _rp = {
             "posts": result.get("posts", []),
             "summary_stats": result.get("_summary_stats", {}),
             "verdict": verdict,
         }
-        self.db.update_project(self.project_id, brief=brief)
+        brief["_reference_posts"] = _rp  # in-memory,供本 run 下游读取
+        # 持久化用 read-modify-merge,不整列覆写。resume/revise 时 brief 是
+        # 不含 _revision_context / _reference_post_urls 的 crown_prince 快照,
+        # 整列覆写会把库里这些持久字段抹掉 → 终审 round 计数丢失、force-pass
+        # 永不触发(无限往返)+ 用户手贴对标 URL 永久丢失。镜像 699-703 写法。
+        _fresh = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+        _fresh["_reference_posts"] = _rp
+        self.db.update_project(self.project_id, brief=_fresh)
 
         self.db.update_stage_log(
             log_id,
@@ -2477,13 +2596,19 @@ class PipelineOrchestrator:
         # Inject raw posts into brief so secretariat sees them. Store
         # both the structured list (for UI + downstream programmatic
         # access) and a formatted block (for direct prompt injection).
-        brief["_trend_intel"] = {
+        _ti = {
             "posts": result.get("posts", []),
             "queries_used": result.get("queries_used", []),
             "grounding_urls": result.get("grounding_urls", []),
             "formatted_block": format_trend_intel_for_prompt(result),
         }
-        self.db.update_project(self.project_id, brief=brief)
+        brief["_trend_intel"] = _ti  # in-memory,供本 run 下游读取
+        # 持久化用 read-modify-merge,不整列覆写(同 _reference_posts:resume 时
+        # brief 是 crown_prince 快照,整列覆写会抹掉 _revision_context /
+        # _reference_post_urls 等持久字段)。镜像 699-703 写法。
+        _fresh = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+        _fresh["_trend_intel"] = _ti
+        self.db.update_project(self.project_id, brief=_fresh)
 
         self.db.update_stage_log(
             log_id,
@@ -2957,8 +3082,13 @@ class PipelineOrchestrator:
             # 让"3 个画像里有 2 个划走"这种信号真的影响判决,而不是只在
             # 全 skip 的 weak_cells 边缘场景才触发 strategic_warnings。
             # 压缩成 {cell_id: [{persona, action, reason}, ...]} 紧凑形式。
+            #
+            # 仅 iteration==0 注入:persona 反应是在 vibe_loop 之前对**原始 demo**
+            # 跑的(见 run() 5d 顺序)。round2+ 只复检被改写过的 cell,那些 cell 的
+            # demo 已变,旧反应变陈旧——继续按 cell_id 注入会拿"对旧文案的划走"去
+            # 判新文案,污染质量闸、阻碍收敛。round2+ 一律不注入。
             _persona_pkg = final_system.get("_persona_reactions") or {}
-            if _persona_pkg.get("status") == "ok":
+            if iteration == 0 and _persona_pkg.get("status") == "ok":
                 _per_cell_reactions: dict = {}
                 for _p in (_persona_pkg.get("personas") or []):
                     _pid = _p.get("id", "?")
@@ -2999,7 +3129,56 @@ class PipelineOrchestrator:
                 })
                 break
 
-            failed = critic_result.get("failed_cells", [])
+            failed = critic_result.get("failed_cells", []) or []
+            # Fail-CLOSED cross-check. vibe_critic.md 的契约:failed_cells 必须
+            # 包含每个 severity != pass 的 cell,且任一 cell 失败时 verdict 必为
+            # "some_failed"。但中转/模型截断可能只写了尾部空的 failed_cells(而
+            # cell_reviews 里明明有 borderline/fail),此时只信 failed_cells 就是
+            # fail-open —— AI 腔 cell 被当"全过"静默发货。这里交叉校验:凡
+            # cell_reviews 中 severity∈{borderline,fail} 但没进 failed_cells 的,
+            # 补回;并在 verdict=some_failed 却一个都补不出时留告警(闸门不可信)。
+            _declared_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
+            _cr = critic_result.get("cell_reviews") or []
+            _recovered = []
+            for _rv in _cr:
+                _sev = (_rv.get("severity") or "").strip().lower()
+                _cid = _rv.get("cell_id")
+                if _cid and _sev in ("borderline", "fail") and _cid not in _declared_ids:
+                    _recovered.append({
+                        "cell_id": _cid,
+                        "platform": _rv.get("platform", ""),
+                        "severity": _sev,
+                        "root_cause_kind": _rv.get("root_cause_kind"),
+                        "root_cause_explanation": _rv.get("root_cause_explanation", ""),
+                        "rewrite_directives": _rv.get("rewrite_directives", ""),
+                        "_flagged_by": "gate_reconcile",
+                    })
+            if _recovered:
+                logger.warning(
+                    "[vibe_loop] fail-closed 补回:%d 个 cell 在 cell_reviews 里 "
+                    "severity!=pass 但没进 failed_cells(critic 输出疑似截断)——"
+                    "补回复检:%s",
+                    len(_recovered),
+                    sorted(r["cell_id"] for r in _recovered),
+                )
+                failed = failed + _recovered
+            _verdict = (critic_result.get("verdict") or "").strip().lower()
+            if _verdict == "some_failed" and not failed:
+                # 判了 some_failed 却连一个可定位的失败 cell 都没有(两个数组都被
+                # 截断)——不能当通过。留告警让交付前可见,不静默放行。
+                final_system.setdefault("strategic_warnings", []).append({
+                    "type": "quality_gate_untrusted",
+                    "stage": "vibe_critic",
+                    "message": (
+                        "⚠️ 网感闸门判定 some_failed 但未返回任何可定位的失败 cell"
+                        "(critic 输出疑似被截断)。本轮无法据此修复,产出**未获可信"
+                        "网感校验**,交付前请人工复核或重跑。"
+                    ),
+                })
+                logger.warning(
+                    "[vibe_loop] verdict=some_failed 但 failed/cell_reviews 均为空"
+                    " — 闸门不可信,已记 strategic_warning"
+                )
             failed_ids = {f.get("cell_id") for f in failed if f.get("cell_id")}
 
             # ── Gemini arbitration (Plan B: 分歧仲裁) ──────────────────
@@ -3166,6 +3345,10 @@ class PipelineOrchestrator:
                 if c.get("cell_id") in failed_ids
             ]
 
+            # #14: 若本轮 vibe_rewriter 抛异常,critic 判不合格的 surface/template
+            # cell 会原样保留(未修复)。用这个 flag 在应用完(可能部分成功的)结构
+            # 重写结果后跳出循环,并记 strategic_warning,不让失败静默混成 completed。
+            _vibe_rewriter_broke = False
             # v0.29.0: 按 root_cause_kind 分流 — critic-rewriter 责任边界划分
             # 的具体落地点。关闭 flag 时回到老行为(全部给 vibe_rewriter)。
             if ENABLE_STRUCTURAL_REWRITER:
@@ -3262,10 +3445,26 @@ class PipelineOrchestrator:
                             c["cell_id"]: c
                             for c in rewritten.get("prompt_cells", [])
                         }
-                    except Exception:
+                    except Exception as _rw_err:
                         logger.exception(
                             "Vibe rewriter failed, keeping original cells for this batch"
                         )
+                        # #14: 镜像 legacy 路径 —— rewriter 失败 → 这批 cell
+                        # (含回落到 surface 桶的 structural cell)未经修复直接保留。
+                        # 记 strategic_warning 让它在 UI 红色 surface,并置 flag
+                        # 在应用完已成功的 structural 结果后跳出循环(rewriter 坏了
+                        # 再转下一轮 critic 也没意义)。
+                        final_system.setdefault("strategic_warnings", []).append({
+                            "type": "quality_gate_failed",
+                            "stage": "vibe_rewriter",
+                            "message": (
+                                "⚠️ 网感修复（vibe_rewriter）执行失败,被 critic 判"
+                                "不合格的 cell **未经修复直接保留**。交付前请人工复核"
+                                "这些 cell 或排查错误后重跑。"
+                                f"（{type(_rw_err).__name__}: {_rw_err}）"
+                            ),
+                        })
+                        _vibe_rewriter_broke = True
 
                 # Merge both rewriter outputs. If both emitted the same cell_id
                 # (shouldn't happen — we bucket disjointly — but defend anyway),
@@ -3318,6 +3517,21 @@ class PipelineOrchestrator:
                 f"{sorted(rewritten_ids)}"
             )
 
+            # 数量对账:critic 判 fail 但 rewriter 没返回的 cell(LLM 漏返/截断)。
+            # 若不管:round2+ 只复检 rewritten_ids(见循环头 2909-2915),这些被
+            # 漏掉的 fail cell 会**掉出复检集**、保留原失败内容静默发货。把它们并回
+            # rewritten_ids,保证下一轮继续盯着它们(再给一次重写机会);循环耗尽时
+            # 由下面的 exhaustion 告警兜底,不静默放行。
+            _missing_rewrites = failed_ids - rewritten_ids
+            if _missing_rewrites:
+                logger.warning(
+                    "[vibe_loop] rewriter 漏返 %d 个已判 fail 的 cell:%s —— "
+                    "保留在复检集里,下一轮再试",
+                    len(_missing_rewrites),
+                    sorted(_missing_rewrites),
+                )
+                rewritten_ids = rewritten_ids | _missing_rewrites
+
             # R-022 follow-up: 运行时审计 rewrite_summary 的"源:..."标记。
             # 这是飞轮 ROI 唯一的可观测信号 — LLM 没按 prompt 写标记时,
             # 运营会以为飞轮没在工作。logger.warning 不阻断流水线(LLM
@@ -3338,10 +3552,25 @@ class PipelineOrchestrator:
                     reference_packs_summary=reference_packs_summary,
                 )
 
-            prompt_cells = [
-                new_cells_by_id.get(c["cell_id"], c) for c in prompt_cells
-            ]
+            # 字段 MERGE,不是整体替换。rewriter 的输出 schema 只覆盖
+            # system_prompt/demo_output 等网感字段,不含 builder 产出的
+            # media_brief / comment_seeds。整体替换(旧写法 .get(id, c))会让被重写
+            # 的 cell 丢掉这两个字段 → 交付物残缺(下游 4240-4243 校验会报缺失)。
+            # 把重写结果叠加到 builder cell 之上:网感修复落地,builder-only 字段存活。
+            _merged_cells = []
+            for _c in prompt_cells:
+                _cid = _c.get("cell_id")
+                if _cid in new_cells_by_id:
+                    _merged_cells.append({**_c, **new_cells_by_id[_cid]})
+                else:
+                    _merged_cells.append(_c)
+            prompt_cells = _merged_cells
             final_system["prompt_matrix"] = prompt_cells
+
+            # #14: 结构重写结果已应用完(见上),此刻若 vibe_rewriter 本轮抛过异常,
+            # 停止循环 —— rewriter 坏了继续转下一轮 critic 无意义,且 warning 已记。
+            if _vibe_rewriter_broke:
+                break
 
             iteration += 1
 
@@ -4429,7 +4658,15 @@ def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], st
     for dim_name, dim_data in dims.items():
         if not isinstance(dim_data, dict):
             continue
-        score = dim_data.get("score", 5)
+        _raw_score = dim_data.get("score", 5)
+        try:
+            score = float(_raw_score)
+        except (TypeError, ValueError):
+            # 畸形 score(JSON null / 字符串 / 缺失)绝不能让合成崩溃:本函数在
+            # run() 的 6.5 fail-closed 安全网里被调用,一旦抛 TypeError 会冒泡到
+            # 顶层 except、跳过 save_output,把整份已组装好的 prompt_matrix 连同
+            # 这次 run 一起判 failed(零产出)。畸形分视作满分=不为该维度合成。
+            score = 5.0
         issues = (dim_data.get("issues") or "").strip()
         if issues and score < 5:
             synthetic_revs.append(
@@ -4459,7 +4696,17 @@ def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClie
     don't duplicate it here.
     """
     # Reset run status so UI shows it as running again
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    # Refresh heartbeat_at when reviving a reused run row: its heartbeat is
+    # stale from the previous attempt, and the heartbeat daemon only starts
+    # ticking once start_pipeline_in_background's thread spins up. Without this,
+    # a reaper pass in that startup window would see status=running + a stale
+    # heartbeat and kill the healthy run we just resumed.
+    db.update_pipeline_run(
+        run_id,
+        status="running",
+        completed_at=None,
+        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+    )
     return start_pipeline_in_background(project_id, run_id, db)
 
 
@@ -4491,7 +4738,17 @@ def revise_and_resume_pipeline_in_background(
     # deletion below. If this resume crashes/gets killed mid-deletion, a
     # running run with a stale heartbeat is reaper-collectable; a project
     # stuck 'running' with a non-running run would NOT be.
-    db.update_pipeline_run(run_id, status="running", completed_at=None)
+    # Refresh heartbeat_at when reviving a reused run row: its heartbeat is
+    # stale from the previous attempt, and the heartbeat daemon only starts
+    # ticking once start_pipeline_in_background's thread spins up. Without this,
+    # a reaper pass in that startup window would see status=running + a stale
+    # heartbeat and kill the healthy run we just resumed.
+    db.update_pipeline_run(
+        run_id,
+        status="running",
+        completed_at=None,
+        heartbeat_at=datetime.now(timezone.utc).isoformat(),
+    )
 
     # 1. Load the latest chancellery_final output
     logs = db.get_stage_logs(run_id)
@@ -4561,10 +4818,18 @@ def revise_and_resume_pipeline_in_background(
     project = db.get_project(project_id)
     brief = project.get("brief") or {}
     prior_rc = (brief or {}).get("_revision_context") or {}
-    next_round = int(prior_rc.get("round", 1)) + 1
+    # Only inherit the round counter when the lingering context belongs to THIS
+    # run. A stale context from an abandoned run would otherwise let a run that
+    # has only been rejected once jump straight to (or past) the force-pass
+    # round — or, worse, never advance because plain "重跑" pinned it.
+    if prior_rc.get("run_id") == run_id:
+        next_round = int(prior_rc.get("round", 1)) + 1
+    else:
+        next_round = 2  # round 1 was this run's fresh final review
     logger.info(f"[revise] advancing final-review round to {next_round}")
 
     revision_context = {
+        "run_id": run_id,
         "round": next_round,
         "prior_verdict": final_review.get("verdict", "unknown"),
         "mandatory_revisions": stored_revs,

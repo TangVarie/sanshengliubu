@@ -278,7 +278,15 @@ async def open_session(
             timeout=timeout_td,
             sse_read_timeout=timeout_td,
         ) as (read_stream, write_stream, _get_session_id):
-            async with ClientSession(read_stream, write_stream) as session:
+            # read_timeout_seconds is the session-level default deadline for
+            # EVERY request, including initialize(). Without it, the handshake
+            # can hang indefinitely under an SSE keepalive (transport-level
+            # timeout/sse_read_timeout don't bound the app-level request) — the
+            # heartbeat keeps ticking so the reaper thinks the run is alive
+            # while the PRE 取样 stage never advances.
+            async with ClientSession(
+                read_stream, write_stream, read_timeout_seconds=timeout_td
+            ) as session:
                 await session.initialize()
 
                 async def _call(
@@ -300,8 +308,36 @@ async def open_session(
                                 read_timeout_seconds=timeout_td,
                             )
                             return _unwrap_result(platform_id, tool, result)
-                        except SocialDataXCallFailed:
-                            raise  # tool-level error — not transient
+                        except SocialDataXCallFailed as e:
+                            # A tool-level error (result.isError) can STILL be a
+                            # transient upstream throttle (429/503/rate limit)
+                            # surfaced as error CONTENT rather than a transport
+                            # exception. Retry those exactly like a transport
+                            # transient; a real auth/quota/bad-arg tool error is
+                            # not transient and raises immediately. Matters most
+                            # under REQUIRED/fail-fast: a retryable blip must not
+                            # kill the whole pipeline run.
+                            last_exc = e
+                            if attempt < _TRANSIENT_RETRIES and _is_transient(e):
+                                delay = _TRANSIENT_BACKOFF_SECONDS[
+                                    min(
+                                        attempt,
+                                        len(_TRANSIENT_BACKOFF_SECONDS) - 1,
+                                    )
+                                ]
+                                logger.warning(
+                                    "[socialdatax] transient tool-level error on "
+                                    "%s/%s (attempt %d/%d), retrying in %.0fs: %s",
+                                    platform_id,
+                                    tool,
+                                    attempt + 1,
+                                    1 + _TRANSIENT_RETRIES,
+                                    delay,
+                                    mask_secrets(str(e)),
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            raise  # non-transient tool error, or retries exhausted
                         except Exception as e:
                             last_exc = e
                             if (

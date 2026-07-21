@@ -749,6 +749,12 @@ COST_PER_1M_INPUT: dict[str, float] = {
     "claude-opus-4-7": 15.0,
     "claude-opus-4-6": 15.0,
     "claude-sonnet-4-6": 3.0,
+    # 默认 premium_multi_vendor preset 下门下省/兵部走 gpt-5.5、画像·alt 走
+    # deepseek-v4-pro。不列进来 _estimate_call_cost_usd 会按 $0 计,total_cost_usd
+    # 系统性低报。⚠️ 下面是**估算值**(走中转,实际单价以你的中转/厂商账单为准),
+    # 请按实际计费校准。仅影响成本展示,不影响 token 熔断。
+    "gpt-5.5": 2.5,          # 估算,GPT-5 档;按中转实际单价校准
+    "deepseek-v4-pro": 0.5,  # 估算,DeepSeek 档;按实际单价校准
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
@@ -756,6 +762,9 @@ COST_PER_1M_OUTPUT: dict[str, float] = {
     "claude-opus-4-7": 75.0,
     "claude-opus-4-6": 75.0,
     "claude-sonnet-4-6": 15.0,
+    # ⚠️ 估算值,同上,按实际账单校准。
+    "gpt-5.5": 10.0,         # 估算,GPT-5 档
+    "deepseek-v4-pro": 2.0,  # 估算,DeepSeek 档
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────

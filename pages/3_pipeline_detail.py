@@ -1992,6 +1992,15 @@ with c3:
         from pipeline.agents import init_api_config
         init_api_config()
         try:
+            # A from-scratch restart must NOT inherit the previous run's
+            # revision state — otherwise this "new" run silently runs in
+            # revision mode against a prompt_matrix that no longer exists
+            # (stale directives + a delta 终审 → never converges). Mirror the
+            # append-rerun (追加并重跑) and post-approval clears.
+            _pb = dict((db.get_project(project_id) or {}).get("brief") or {})
+            if "_revision_context" in _pb:
+                _pb.pop("_revision_context", None)
+                db.update_project(project_id, brief=_pb)
             # create_pipeline_run + start — orchestrator sets project.status
             # internally, so we skip the pre-emptive update that would
             # trip our own guard.

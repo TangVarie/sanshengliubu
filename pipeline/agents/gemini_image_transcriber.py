@@ -127,8 +127,12 @@ def transcribe_image_for_brief(
         return _format_fallback(filename, len(image_bytes), f"未知异常({type(e).__name__})")
 
     analysis = result.get("data") or {}
-    if not isinstance(analysis, dict) or not analysis:
-        # JSON 解析失败时 call_gemini_json 会塞 _raw_text + _parse_error
+    # 关键:JSON 解析失败时 call_gemini_json 塞的是一个**非空 dict**
+    # {_raw_text, _parse_error},若只判 `not analysis` 这分支永远进不来(死代码),
+    # 会把 parse-error dict 当正常 analysis 交给 _format_for_brief → 往 brief 注入
+    # 一个没有实际 OCR 内容的误导性识别块。显式判 _parse_error 让 _raw_text 抢救
+    # 分支生效(对齐 gemini_critic / structure_reviewer 的处理)。
+    if not isinstance(analysis, dict) or not analysis or "_parse_error" in analysis:
         raw_text = (result.get("data") or {}).get("_raw_text") if isinstance(result.get("data"), dict) else ""
         if raw_text:
             # 起码把模型的原始回答塞进去,总比纯占位符好
