@@ -18,9 +18,14 @@ token 成本,所以整个 LLM 环节直接去掉,抽取改成确定性代码。
 副作用是这条路比原来更可靠:不再有"抓到 og:title 就当抓到了"的半吊子结果,
 fetch_status 由真实的 API 结果决定而不是由模型自述。
 
-⚠️ detail 工具名待核对 —— 见 config.SOCIALDATAX_NOTE_DETAIL_TOOLS 的注释。
-名字不对不会炸:该 stage 是 advisory-only,工具不存在时 MCP 报错 → 这条 URL
-记 fetch_status="not_accessible",其余照常,流水线不受影响。
+调用策略:优先 by-URL 变体(手上本来就是完整 URL,小红书的 xsec_token 访问
+凭证也在 URL 里,整条传过去比拆出来再拼稳);失败才退回 by-ID —— 从 path 抠
+出 note_id 再试一次。两个变体的工具名见 config.SOCIALDATAX_NOTE_DETAIL_TOOLS。
+
+⚠️ 字段名的坑:XHS detail 返回的正文字段是 `content`(不是搜索结果里的
+`desc`),标签是 `topic_tags`(不是 `tag_list`)。按后者取值会静默拿到空正文
++ 空标签 —— 不报错,只是内容全空,很难查。`_normalize_note` 的 `_DESC_KEYS`
+里已经含 `content`,标签则由本模块的 `_TAG_KEYS` 单独处理。
 
 Advisory-only failure semantics —— 所有错误都表现为 skipped / 单条失败,
 流水线在没有参考帖数据的情况下继续。
@@ -31,7 +36,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from pipeline.agents.socialdatax_client import (
     SocialDataXCallFailed,
@@ -41,6 +46,7 @@ from pipeline.agents.socialdatax_client import (
 )
 from pipeline.agents.socialdatax_trend_scout import (
     _find_note_list,
+    _looks_like_note,
     _normalize_note,
     _usage,
 )
@@ -95,24 +101,53 @@ def _extract_note_id(url: str) -> str:
     return ""
 
 
-def _detail_arguments(url: str, note_id: str, platform_id: str) -> dict[str, Any]:
-    """拼 detail 工具的入参。
+# 话题标签的字段名候选。**XHS detail 用 `topic_tags`** —— 搜索结果那边常见的
+# `tag_list` 在 detail 返回里不存在,按 `tag_list` 取会静默拿到空列表。
+# 元素可能是字符串,也可能是 {"name": "..."} / {"tag": "..."} 这样的对象。
+_TAG_KEYS = ("topic_tags", "tag_list", "tags", "topics", "hash_tags")
+_TAG_NAME_KEYS = ("name", "tag", "title", "text", "topic_name")
+# 一条帖子最多保留几个标签 —— 防止个别帖子挂几十个话题把 brief 撑爆。
+_TAG_MAX = 20
 
-    xsec_token 必须带上 —— 小红书的分享链接里那个 query 参数是访问凭证,
-    丢了它就算 note_id 正确也取不到内容。其它平台没有这个概念,带上也无害
-    (未知参数由服务端忽略),但只在真的存在时才塞进去。
+
+def _extract_tags(raw: dict) -> list[str]:
+    """从 detail 返回里抠话题标签,统一成字符串列表。
+
+    容忍三种形状:纯字符串列表、对象列表(取 name/tag/...)、以及逗号/空格
+    分隔的单个字符串。取不到就返回空列表 —— 标签是锦上添花,没有不影响主流程。
     """
-    args: dict[str, Any] = {"note_id": note_id}
-    qs = parse_qs(urlparse(url).query or "")
-    for key in ("xsec_token", "xsec_source"):
-        vals = qs.get(key) or []
-        if vals and vals[0]:
-            args[key] = vals[0]
-    # 多数平台的 detail 工具用 note_id;视频类平台常用 video_id。两个都给,
-    # 服务端取它认识的那个 —— 比按平台维护一张参数名映射表更耐得住改版。
-    if platform_id in ("douyin", "kuaishou", "wechat"):
-        args["video_id"] = note_id
-    return args
+    for key in _TAG_KEYS:
+        val = raw.get(key)
+        if not val:
+            continue
+        items: list[Any]
+        if isinstance(val, str):
+            items = [p for p in re.split(r"[,，\s]+", val) if p]
+        elif isinstance(val, (list, tuple)):
+            items = list(val)
+        else:
+            continue
+
+        out: list[str] = []
+        for it in items:
+            if isinstance(it, str):
+                s = it.strip().lstrip("#")
+            elif isinstance(it, dict):
+                s = ""
+                for nk in _TAG_NAME_KEYS:
+                    v = it.get(nk)
+                    if isinstance(v, str) and v.strip():
+                        s = v.strip().lstrip("#")
+                        break
+            else:
+                continue
+            if s and s not in out:
+                out.append(s)
+            if len(out) >= _TAG_MAX:
+                break
+        if out:
+            return out
+    return []
 
 
 def _record(
@@ -122,10 +157,18 @@ def _record(
     title: str = "",
     body_fragment: str = "",
     cover_image_url: str = "",
+    topic_tags: list[str] | None = None,
     notes: str = "",
 ) -> dict[str, Any]:
-    """统一的单条输出记录。字段名和 v0.31 保持一致 —— 下游(orchestrator 注
-    入 brief、pages/3 展示)都按这个 schema 读。"""
+    """统一的单条输出记录。
+
+    前 6 个字段和 v0.31 完全一致 —— 下游(orchestrator 注入 brief、pages/3
+    展示)都按这个 schema 读,不能动。
+
+    `topic_tags` 是 v0.32.0 新增:走 SocialDataX 之后能拿到帖子的真实话题标签,
+    这对户部(关键词策略)是直接有用的信号,Gemini url_context 时代根本拿不到。
+    纯新增字段,老消费方读不到它也不受影响。
+    """
     return {
         "url": url,
         "title": title,
@@ -133,6 +176,7 @@ def _record(
         "cover_image_url": cover_image_url,
         "fetch_status": fetch_status,
         "notes": notes,
+        "topic_tags": topic_tags or [],
     }
 
 
@@ -199,36 +243,59 @@ async def run_reference_analyzer(
 
     api_calls = 0
     for pid, plat_urls in by_platform.items():
-        tool = SOCIALDATAX_NOTE_DETAIL_TOOLS[pid]
+        spec = SOCIALDATAX_NOTE_DETAIL_TOOLS[pid]
+        url_tool, url_arg = spec["by_url"]
+        id_tool, id_arg = spec["by_id"]
         try:
             async with open_session(pid) as call:
                 for url in plat_urls:
-                    note_id = _extract_note_id(url)
-                    if not note_id:
-                        posts_by_url[url] = _record(
-                            url,
-                            fetch_status="not_accessible",
-                            notes="URL 里解析不出 note_id(短链请先展开成完整链接)",
-                        )
-                        continue
+                    # ── 主路径:by-URL ────────────────────────────────
+                    # 直接把用户粘的整条 URL 传过去。小红书的 xsec_token 在
+                    # query 里,不拆就不会拆错。
                     try:
                         api_calls += 1
-                        payload = await call(
-                            tool, _detail_arguments(url, note_id, pid)
-                        )
-                    except SocialDataXCallFailed as e:
-                        # 单条失败不影响同批其它条 —— 帖子被删/仅粉丝可见/
-                        # 工具名不对,都是这一条的事。
-                        logger.warning(
-                            "[ref_analyzer] %s 抓取失败 (%s): %s",
-                            url, tool, str(e)[:200],
-                        )
-                        posts_by_url[url] = _record(
-                            url,
-                            fetch_status="not_accessible",
-                            notes=f"SocialDataX 调用失败: {str(e)[:160]}",
-                        )
-                        continue
+                        payload = await call(url_tool, {url_arg: url})
+                    except SocialDataXCallFailed as url_err:
+                        # ── 兜底:by-ID ──────────────────────────────
+                        # by-URL 可能因为短链、URL 被改写、或者带了奇怪的
+                        # 追踪参数而失败。能从 path 抠出 ID 就再试一次。
+                        note_id = _extract_note_id(url)
+                        if not note_id:
+                            logger.warning(
+                                "[ref_analyzer] %s by-URL 失败且解析不出 ID "
+                                "(%s): %s",
+                                url, url_tool, str(url_err)[:200],
+                            )
+                            posts_by_url[url] = _record(
+                                url,
+                                fetch_status="not_accessible",
+                                notes=(
+                                    f"by-URL 调用失败且 URL 里解析不出 ID"
+                                    f"(短链请先展开): {str(url_err)[:120]}"
+                                ),
+                            )
+                            continue
+                        try:
+                            api_calls += 1
+                            payload = await call(id_tool, {id_arg: note_id})
+                            logger.info(
+                                "[ref_analyzer] %s by-URL 失败,by-ID 兜底成功",
+                                url,
+                            )
+                        except SocialDataXCallFailed as id_err:
+                            # 单条失败不影响同批其它条 —— 帖子被删 / 仅粉丝
+                            # 可见 / 工具名对不上,都是这一条的事。
+                            logger.warning(
+                                "[ref_analyzer] %s 两个变体都失败 "
+                                "(%s / %s): %s",
+                                url, url_tool, id_tool, str(id_err)[:200],
+                            )
+                            posts_by_url[url] = _record(
+                                url,
+                                fetch_status="not_accessible",
+                                notes=f"SocialDataX 调用失败: {str(id_err)[:160]}",
+                            )
+                            continue
 
                     posts_by_url[url] = _payload_to_record(url, payload, pid)
         except SocialDataXNotConfigured as e:
@@ -299,16 +366,76 @@ async def run_reference_analyzer(
     }
 
 
+# detail 返回里包着帖子对象的常见外层 key,按优先级试。
+_DETAIL_CONTAINER_KEYS = (
+    "note", "note_detail", "noteDetail", "note_info", "noteInfo",
+    "video", "video_detail", "videoDetail", "video_info",
+    "post", "post_detail", "postDetail",
+    "item", "item_info", "detail", "result", "data",
+)
+_DETAIL_MAX_DEPTH = 4
+
+
+def _find_note_dict(payload: Any, _depth: int = 0) -> dict | None:
+    """从 detail 返回里定位那个【单个】帖子对象。
+
+    ⚠️ 不能直接复用 trend_scout 的 `_find_note_list`:那个是给【搜索结果】
+    写的,只认"list of note dicts"。detail 返回的是单个对象,通常还裹一层
+    外壳(实测 XHS 是 {"data": {...}}),`_find_note_list` 在这种形状上返回
+    空列表 —— 于是整条帖子被判成"接口形状变了",正文标签全空但不报错。
+    这正是最难查的那类 bug,所以单独写一个走 dict 的定位函数。
+
+    策略:先看当前 dict 本身像不像帖子(有 title/desc/url 任一),不像就按
+    _DETAIL_CONTAINER_KEYS 的顺序往里钻,限深 4 层。顺带兜住"某些实现返回
+    单元素 list"的情况。
+    """
+    if _depth > _DETAIL_MAX_DEPTH:
+        return None
+
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_note_dict(item, _depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    if _looks_like_note(payload):
+        return payload
+
+    # 先钻已知外壳,再退一步扫所有 dict/list 值 —— 已知 key 优先保证结果确定。
+    for key in _DETAIL_CONTAINER_KEYS:
+        if key in payload:
+            found = _find_note_dict(payload[key], _depth + 1)
+            if found is not None:
+                return found
+    for key, val in payload.items():
+        if key in _DETAIL_CONTAINER_KEYS:
+            continue
+        if isinstance(val, (dict, list)):
+            found = _find_note_dict(val, _depth + 1)
+            if found is not None:
+                return found
+
+    # 最后的兜底:搜索结果那套 list 定位法,万一某平台 detail 真的返回列表。
+    if _depth == 0:
+        candidates = _find_note_list(payload)
+        if candidates:
+            return candidates[0]
+    return None
+
+
 def _payload_to_record(url: str, payload: Any, platform_id: str) -> dict[str, Any]:
     """把 detail 工具的返回归一化成一条 post 记录。
 
-    detail 返回的形状没有正式文档,可能是 {note: {...}}、{data: {...}}、
-    直接一个 note dict,或者(某些实现)一个只有一个元素的 list。复用
-    trend_scout 的 _find_note_list 做同一套容错遍历,拿不到就退回把 payload
-    本身当 note 试一次。
+    detail 返回的形状没有正式文档,实测 XHS 是 {"data": {...}};其它平台可能
+    是 {note: {...}} / 直接一个 note dict / 单元素 list。定位交给
+    _find_note_dict,字段抽取复用 trend_scout 的 _normalize_note(它的
+    _DESC_KEYS 里含 `content`,所以 XHS detail 的正文取得到)。
     """
-    candidates = _find_note_list(payload)
-    raw = candidates[0] if candidates else (payload if isinstance(payload, dict) else None)
+    raw = _find_note_dict(payload)
     note = _normalize_note(raw, platform_id) if raw is not None else None
 
     if not note:
@@ -317,6 +444,10 @@ def _payload_to_record(url: str, payload: Any, platform_id: str) -> dict[str, An
             fetch_status="not_accessible",
             notes="detail 返回里找不到可用的帖子字段(接口形状可能变了)",
         )
+
+    # 标签单独抠 —— _normalize_note 是给搜索结果写的,不认 detail 的
+    # `topic_tags`。原始 dict 还在手上,直接从它取。
+    tags = _extract_tags(raw) if isinstance(raw, dict) else []
 
     body = note.get("snippet") or ""
     title = note.get("title") or ""
@@ -341,5 +472,6 @@ def _payload_to_record(url: str, payload: Any, platform_id: str) -> dict[str, An
         title=title,
         body_fragment=body,
         cover_image_url=note.get("cover_image_url") or "",
+        topic_tags=tags,
         notes=notes,
     )

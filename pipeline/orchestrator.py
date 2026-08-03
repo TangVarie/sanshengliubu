@@ -2320,7 +2320,12 @@ class PipelineOrchestrator:
             )
 
     async def _run_gemini_reference_analyzer(self, brief: dict) -> None:
-        """B: fetch user-pasted xiaohongshu post URLs via Gemini url_context.
+        """B: fetch user-pasted post URLs via SocialDataX detail tools.
+
+        v0.32.0: 换厂前这一步走 Gemini 的 url_context(模型自己去取 URL);
+        Kimi 没有等价能力,改走 SocialDataX 的第一方 detail 接口,顺带把
+        LLM 环节整个去掉(返回的已经是结构化数据,再转述只会引入幻觉)。
+        stage 名保留 "gemini_reference_analyzer" 是为了 DB 兼容。
 
         URL list is pulled from either:
           - project.brief._reference_post_urls (set by page 2 at create

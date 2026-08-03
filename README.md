@@ -130,7 +130,15 @@ DEEPSEEK_API_KEY = "sk-..."
 #### SocialDataX（趋势取样必填）
 
 两个用途：(1) 跑策略前抓真实小红书爆款当校准样本——默认 **REQUIRED**，取不到样会
-直接终止 run；(2) 把用户粘贴的对标帖 URL 取成结构化正文（advisory，失败只跳过）。
+直接终止 run；(2) 把用户粘贴的对标帖 URL 取成结构化正文 + 真实话题标签（advisory，
+失败只跳过）。
+
+参考帖抓取走各平台的 detail 工具，优先 by-URL 变体（`xhs_get_note_detail_by_note_url`
+等），失败才退回 by-ID。工具名和参数名在 `pipeline/config.py::SOCIALDATAX_NOTE_DETAIL_TOOLS`。
+
+> 踩过的坑：XHS detail 返回的正文字段是 **`content`**、标签是 **`topic_tags`**，
+> 跟搜索结果那边的 `desc` / `tag_list` 不一样。按后者取值不会报错，只会静默拿到
+> 空正文 + 空标签。代码里已经两边都认，改这块时留意别改回去。
 
 ```toml
 SOCIALDATAX_API_KEY = "..."

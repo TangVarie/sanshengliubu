@@ -16,8 +16,9 @@ VERSION_NOTES = (
     "secrets.toml 新增 MOONSHOT_API_KEY / MOONSHOT_BASE_URL。"
     "(3) Gemini 辅助层整体下线:新增 pipeline/agents/kimi_client.py 接管"
     "网感二审 / 结构审 / 识图 / 截图分析四个岗位 (K2.6 原生多模态);"
-    "参考帖抓取改走 SocialDataX note-detail (Gemini url_context 无对应物),"
-    "google-genai 依赖移除。"
+    "参考帖抓取改走 SocialDataX detail (Gemini url_context 无对应物);优先 "
+    "by-URL 变体,失败退 by-ID。整条链去掉 LLM —— SocialDataX 返回的本来就是"
+    "第一方结构化数据,再让模型转述一遍只是徒增幻觉。google-genai 依赖移除。"
     "(4) thinking 按厂家分流:kimi-* 走 {\"type\":\"adaptive\"} (Moonshot "
     "anthropic 端点支持),deepseek-* 不发 thinking 字段 (端点静默忽略,"
     "发了只是浪费);Claude 的 adaptive 判定保留供历史 preset 用。"
@@ -491,6 +492,13 @@ CELL_PLANNER_CONCURRENCY = 5    # parallel cell-planner calls
 # adaptive thinking JSON 参数,保证合规审查仍有深推理(安全/法务把关不能
 # 悄悄变弱)。
 
+# ⚠️ v0.32.0: chancellery(门下省)留在这个集合里,但它现在跑 deepseek-v4-flash,
+# 而 DeepSeek 的 anthropic-compat 端点不认 thinking 参数 —— 所以它【实际上没有】
+# extended thinking,stage_log 会如实显示 thinking ✗。
+# 这是明知的取舍:门下省的价值主要来自"跟中书省不同厂家、不同 distribution"的
+# 对抗性,而不是推理深度;深推理那一侧由中书省的 kimi-k3 承担。哪天想换回来,
+# 把 KIMI_DEEPSEEK_MAP["chancellery"] 改成 PRIMARY_MODEL/FLAGSHIP_MODEL 即可,
+# thinking 会自动恢复(_call_model 按厂家判断,不需要动这个集合)。
 THINKING_STAGES: frozenset[str] = frozenset({
     "crown_prince",
     "secretariat",
@@ -703,19 +711,50 @@ SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10
 # 副作用是比 Gemini 那条路更好 —— url_context 面对 JS 渲染 / 登录墙的小红书
 # 经常只拿到 og:title,SocialDataX 拿的是真正文 + 真互动量。
 #
-# ⚠️ 工具名待你按自己的 SocialDataX 套餐核对。socialdatax-skills v0.2.30 的
-# CLI 里已验证的只有各平台的 *_search_* 工具(见 socialdatax_trend_scout.py
-# 的 _SEARCH_SPEC),detail 类工具没在那份 CLI 里出现过,所以下面这张表是
-# 按同一套命名规律推的。名字不对不会炸 —— 该 stage 是 advisory-only,
-# 工具不存在时 MCP 报错 → 整个 stage 记 skipped,流水线照常往下走
-# (和 v0.31 里 Gemini 抓不到时的行为一致)。
-# 核对方法:设置页 →「SocialDataX」区有「列出可用工具」按钮。
-SOCIALDATAX_NOTE_DETAIL_TOOLS: dict[str, str] = {
-    "xhs": "xhs_get_note_detail",
-    "douyin": "douyin_get_video_detail",
-    "kuaishou": "kuaishou_get_video_detail",
-    "weibo": "weibo_get_post_detail",
-    "wechat": "wechat_get_video_detail",
+# 工具名已按实际调用返回体里的 `tool` 字段核实(XHS 直接验过
+# xhs_get_note_detail_by_note_id;其余平台同一套命名规律)。
+#
+# 每个平台都有 by-ID 和 by-URL 两个变体。**默认走 by-URL**:
+#   - 我们手上本来就是用户粘贴的完整 URL,不需要先解析 ID
+#   - 小红书链接里的 xsec_token 是访问凭证,留在 URL 里整条传过去最稳,
+#     手工拆出来再拼回参数只是给自己找 bug
+# by-ID 是兜底:by-URL 调不通(短链、URL 变形)时,从 path 里抠出 ID 再试一次。
+#
+# 值的形状:(工具名, 参数名)。参数名跟工具名 `_by_` 后面那截一致 ——
+# 这是 SocialDataX 自己的命名规律,不是巧合,但仍然显式写出来,免得哪天
+# 对不上时只能靠猜。
+#
+# MCP 工具名和 CLI 是同一套接口:
+#   npx -y socialdatax-skills@latest xhs detail --url <url>
+#   npx -y socialdatax-skills@latest xhs detail --note-id <id>
+# CLI 内部就是转发到下面这些工具。
+#
+# 名字万一对不上也不会炸:该 stage 是 advisory-only,工具不存在时 MCP 报错
+# → 该条 URL 记 not_accessible,其余照常,流水线不受影响。
+SOCIALDATAX_NOTE_DETAIL_TOOLS: dict[str, dict[str, tuple[str, str]]] = {
+    "xhs": {
+        "by_url": ("xhs_get_note_detail_by_note_url", "note_url"),
+        "by_id": ("xhs_get_note_detail_by_note_id", "note_id"),
+    },
+    "douyin": {
+        "by_url": ("douyin_get_video_detail_by_url", "url"),
+        "by_id": ("douyin_get_video_detail_by_aweme_id", "aweme_id"),
+    },
+    "kuaishou": {
+        "by_url": ("kuaishou_get_video_detail_by_url", "url"),
+        "by_id": ("kuaishou_get_video_detail_by_photo_id", "photo_id"),
+    },
+    "weibo": {
+        "by_url": ("weibo_get_post_detail_by_post_url", "post_url"),
+        "by_id": ("weibo_get_post_detail_by_post_id", "post_id"),
+    },
+    "wechat": {
+        "by_url": ("wechat_get_video_detail_by_url", "url"),
+        "by_id": (
+            "wechat_get_video_detail_by_encrypted_object_id",
+            "encrypted_object_id",
+        ),
+    },
 }
 
 # 单次参考帖分析最多抓几条,防止用户粘 50 个链接把 run 拖死 + 烧配额。
