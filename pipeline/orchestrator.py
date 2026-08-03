@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 import logging
 import re
 import threading
@@ -4578,14 +4579,42 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
     # Principle: only hard-fail on items chancellery explicitly flags.
     # Stylistic nits (tone/naturalness) still belong to the reviewer.
     if sp:
-        essential_keywords = {
-            "合规": "合规/compliance 规则",
-            "关键词": "关键词植入指令",
-            "禁止": "反 AI 腔禁用清单",
+        # ⚠️ 必须用别名表,不能单字面量匹配 —— 这是本函数里唯一一处曾经漏掉
+        # 别名的检查,而它是【硬失败】。现场日志实测:模型把禁用清单写成
+        # 「不要写…」「避免…」「❌…」而不是「禁止…」时,这条就误判,触发
+        # 批次重试 + 单 cell 重试;如果模型的措辞习惯稳定,三轮都过不了 →
+        # 整条 run 报 "三轮尝试后仍缺失" 挂掉。
+        # 紧邻的 pool_aliases / batch_rule_aliases 早就是别名表了,后者的注释
+        # 原话就是"别让 builder 因为措辞差异陷入三轮重试地狱"——这里补齐。
+        #
+        # 判定目标是"这段 prompt 里到底有没有这个板块",不是"有没有这个词",
+        # 所以收同义写法;真的整段缺失时仍然抓得到。
+        essential_keyword_aliases = {
+            "合规/compliance 规则": [
+                "合规", "compliance", "违禁词", "敏感词", "广告法",
+                "风险提示", "不可宣称", "禁用词",
+            ],
+            "关键词植入指令": [
+                "关键词", "keyword", "核心词", "搜索词", "蓝词", "埋词",
+                "词包",
+            ],
+            # ⚠️ 这一组只收【明确是禁用清单】的写法。别加 "不得" / "避免" /
+            # "不要" 这类裸词 —— 合规段里就有"不得宣称疗效"、五池规则里有
+            # "不得与上一篇重复",裸词会命中它们,于是 system_prompt 里压根
+            # 没有反 AI 腔清单也能判过(实测踩过)。宁可偶尔误报要求重试,
+            # 也不能让这条检查变成永远为真的摆设。
+            "反 AI 腔禁用清单": [
+                "禁止", "禁用", "严禁", "忌用", "❌",
+                "不要写", "不要出现", "不要用", "避免使用", "少用",
+                "黑名单", "black list", "blacklist",
+            ],
         }
-        for keyword, description in essential_keywords.items():
-            if keyword not in sp:
-                issues.append(f"{cid}: system_prompt 缺少「{description}」（找不到 '{keyword}'）")
+        for description, aliases in essential_keyword_aliases.items():
+            if not any(a in sp for a in aliases):
+                issues.append(
+                    f"{cid}: system_prompt 缺少「{description}」"
+                    f"（这些写法一个都没找到: {'/'.join(aliases[:4])}…）"
+                )
 
         # 5 differentiation pools — works_builder.md:17-23 explicitly says
         # "5 个池必须全部内置，缺一个都算不合格". We accept either the
