@@ -2,9 +2,26 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.32.1"
+VERSION = "v0.32.2"
 VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.2 fix: 流水线详情页的『构建批次 N』一直在骗人。"
+    "(1) 那个 N 是【第 N 次调用】的流水号,不是格子数 —— 每个格子至少 1 次"
+    "(Round 1),失败还有批次重试 + 单 cell 重试,最多 3 次,所以看上去像"
+    "有 66 个格子实际可能只有 22 个。pages/3 的 _batch_label() 本来设计成"
+    "显示 '批次 15 · initial [D6_xiaohongshu]',数据源是 input_data 里的"
+    "_batch_info;但 get_stage_logs 为了控 payload 把整个 input_data 从"
+    "select 里去掉了,于是这条分支从那次优化落地起就是死代码,所有行永远"
+    "退回流水号。"
+    "(2) 修法:不捞整个 input_data(每条几十 KB),只用 PostgREST 的 JSON"
+    "路径投影把 _batch_info 单独取出来(别名 batch_info)。三级降级:带投影"
+    "→ 去投影 → 去 output_data;第一级对任何异常都静默降级,PostgREST 语法"
+    "万一不认也只是标签退回流水号,不会把详情页打挂。"
+    "(3) 标题行现在直接报真实格子数:『工部·构建（22 个格子 · 共 66 次调用,"
+    "含 batch/cell 重试）』—— cell_ids 去重得来。拿不到 batch_info 时只报"
+    "调用数,不瞎猜格子数。"
+)
+_VERSION_NOTES_V0321 = (
     "v0.32.1 fix: 预算熔断误杀 + 熔断错误被重试逻辑吞掉。"
     "(1) MAX_TOKENS_PER_RUN 2M → 8M。v0.32.0 换厂时把这个值留着没动,"
     "判断错了 —— 它一直是【成本容忍度】旋钮(v0.31 原注释 'Tune to your "

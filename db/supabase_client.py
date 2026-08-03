@@ -364,7 +364,9 @@ class SupabaseClient:
     def get_stage_logs(
         self, run_id: str, stage_name: str | None = None
     ) -> _StageLogsList:
-        """Load stage_logs for a run, EXCLUDING input_data to keep payload small.
+        """Load stage_logs for a run, EXCLUDING input_data to keep payload small
+        (except for the small `_batch_info` sub-object, projected out separately
+        — see the comment on select_batchinfo below).
 
         input_data contains the full shared_skeleton + ministry_outputs +
         cell_plans for every builder/cell_planner call — easily 50-100KB per
@@ -383,6 +385,25 @@ class SupabaseClient:
             stage_name: Optional filter — only return logs for this stage.
                         When set, avoids loading all stages into memory.
         """
+        # ── 为什么要单独捞 _batch_info ────────────────────────────────
+        # 工部构建/格子规划一个 run 会产生几十条 stage_log(每个格子 1 条,
+        # 加上 batch 重试和单 cell 重试)。pages/3 的 _batch_label() 本来设计
+        # 成显示 "批次 15 · initial [D6_xiaohongshu]" 这种自带批次号 + 轮次 +
+        # 格子 id 的标签,数据源是 input_data["_batch_info"]。
+        #
+        # 但上面那条"排除 input_data"的优化把整列去掉了,于是 _batch_label
+        # 永远读不到 _batch_info,永远退回 fallback 的 "构建批次 {i+1}" ——
+        # 一个跨所有调用(含重试)的流水号。用户看到 "构建批次 66" 会以为
+        # 有 66 个格子,实际那是第 66 次调用。这条 label 分支从优化落地那天
+        # 起就是死代码。
+        #
+        # 修法:不捞整个 input_data(几十 KB/条),只用 PostgREST 的 JSON 路径
+        # 投影把 _batch_info 这一个小对象取出来,别名成 batch_info。
+        select_batchinfo = (
+            "id, run_id, stage_name, status, output_data, error_message, "
+            "model_used, tokens_used, duration_seconds, human_intervention, "
+            "created_at, updated_at, batch_info:input_data->_batch_info"
+        )
         select_full = (
             "id, run_id, stage_name, status, output_data, error_message, "
             "model_used, tokens_used, duration_seconds, human_intervention, "
@@ -406,7 +427,14 @@ class SupabaseClient:
             httpx.PoolTimeout,
         )
         import time as _time
-        for attempt, columns in enumerate([select_full, select_light]):
+        # 三级降级:带 _batch_info 投影 → 去掉投影 → 再去掉 output_data。
+        # 第一级额外吞掉【任何】异常:JSON 路径投影是 PostgREST 的语法,万一
+        # 部署的版本不认(或以后语法变了)会返回 4xx 而不是网络错误,那种情况
+        # 下应该静默退回今天的行为,而不是把整个流水线详情页打挂 —— 标签好不
+        # 好看远不如页面能打开重要。
+        for attempt, columns in enumerate(
+            [select_batchinfo, select_full, select_light]
+        ):
             try:
                 query = (
                     self.client.table("stage_logs")
@@ -417,15 +445,31 @@ class SupabaseClient:
                     query = query.eq("stage_name", stage_name)
                 resp = query.order("created_at").execute()
                 result = _StageLogsList(resp.data or [])
-                result.partial = attempt > 0
-                if attempt > 0:
+                # partial 的语义是"output_data 没捞到,页面会渲染空" —— 只有
+                # 退到第 3 级才成立。第 2 级只是少了 batch 标签,内容完整。
+                result.partial = attempt >= 2
+                if attempt == 1:
+                    logging.getLogger(__name__).info(
+                        "get_stage_logs: _batch_info JSON 投影不可用,批次标签"
+                        "退回流水号(不影响内容渲染)"
+                    )
+                elif attempt >= 2:
                     logging.getLogger(__name__).warning(
                         "get_stage_logs: full query failed, using lightweight "
                         "fallback (no output_data). Stage outputs won't render."
                     )
                 return result
-            except _FALLBACK_EXC:
+            except Exception as _e:
+                # 第一级(JSON 投影)对任何异常都降级 —— 见上面的注释。
                 if attempt == 0:
+                    logging.getLogger(__name__).info(
+                        "get_stage_logs: 带 _batch_info 的查询失败(%s),降级重试",
+                        type(_e).__name__,
+                    )
+                    continue
+                if not isinstance(_e, _FALLBACK_EXC):
+                    raise
+                if attempt == 1:
                     # Brief pause so the second attempt doesn't hit the same
                     # TCP reset / server-side hiccup. 500ms is enough for most
                     # transient supabase pool blips without noticeably slowing
