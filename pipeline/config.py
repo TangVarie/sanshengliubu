@@ -2,9 +2,69 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.32.1"
+VERSION = "v0.32.4"
 VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.4 hardening: 卡死/空烧排查的第二轮,拆两颗同类雷。"
+    "(1) _validate_prompt_cell 的 essential_keywords(合规/关键词/反 AI 腔"
+    "禁用清单)是【硬失败】却单字面量匹配,是全函数唯一没有别名表的检查 ——"
+    "紧邻的 pool_aliases / batch_rule_aliases 都有,后者注释原话就是'别让 "
+    "builder 因为措辞差异陷入三轮重试地狱'。现场日志里它已在放炮"
+    "('找不到 禁止',D2/D6/D7/D8);模型措辞习惯稳定的话三轮都过不了,"
+    "整条 run 直接报'三轮尝试后仍缺失'挂掉。补齐别名表。反 AI 腔那组特意"
+    "只收明确是禁用清单的写法,不收'不得'/'避免'这类裸词 —— 合规段里就有"
+    "'不得宣称疗效',裸词会让这条检查变成永远为真的摆设(实测踩过)。"
+    "(2) MAX_TOKENS_STRATEGY 32000 → 48000。v0.30.12 踩过 thinking 挤占"
+    "max_tokens 导致 secretariat 大 plan 被截断、cell 重建得 0 个、"
+    "'工部·格子规划产出为空'崩溃的坑,v0.30.13 靠关掉辩论期 thinking 绕开。"
+    "换厂后这颗雷重新装上:四个策略阶段都在 THINKING_STAGES 且跑 kimi-k3 "
+    "走 adaptive,Moonshot 是否把 thinking 计入 max_tokens 无明确文档。"
+    "max_tokens 是上限不是预付费(K2.6 标称可到 262144),抬天花板几乎不"
+    "花钱,而截断的代价是三轮重试甚至整条 run 崩。"
+    "(3) 补 `from typing import Any`。orchestrator 有一处局部变量注解用了"
+    "未导入的 Any —— PEP 526 下局部注解不求值所以从没崩过,但那行一旦被挪到"
+    "模块/类作用域就会 NameError。基线(fba746e)就存在,顺手拆掉。"
+    "另:本轮复核了所有循环边界(辩论 8 轮 / 终审 3 轮 / 网感 3 轮 / 策略升级 "
+    "1 轮 / 澄清 2 次且有 1 小时超时 / 限流器窗口必然老化 / 心跳 10s vs "
+    "reaper 75s),均有界,未发现真正的死循环。"
+)
+_VERSION_NOTES_V0323 = (
+    "v0.32.3 fix: 工部构建 3 倍空烧的两个真因(这才是撞 token 上限的根)。"
+    "(A) _validate_prompt_cell 的结尾完整性检查在小红书上 100% 误判。"
+    "小红书笔记本来就以话题标签收尾('...下月再汇报。 #按摩椅 #中秋送礼'),"
+    "但检查只认句末标点,于是每个格子都被判'demo_output 结尾不完整'→ hard "
+    "fail → 批次重试 → 单 cell 重试,三轮后拿到同样的合法内容,只好 "
+    "'accepting anyway (best effort)' 收下。等于每格固定烧 3 倍 token 换回"
+    "同一个结果。修法:判定前先剥掉尾部话题标签(半角#和全角＃都认),剥完"
+    "按正文结尾判 —— 真正停在半句话上的截断仍然抓得到。resume 时那句"
+    "'rejected 45 cells ... will be rebuilt' 也是同一个误判,一并消失。"
+    "(B) _reconstruct_active_cells 会把同一个格子 splice 两遍。中书省把 "
+    "platform 写成'小红书'而 brief 的 target_platforms 是'xiaohongshu'时,"
+    "两边 _platform_key 不相等 → 所有 pair 判为缺失 → 原样再补一遍,"
+    "active_cells 里出现完全重复的 cell_id(D1_xiaohongshu 两次),工部把每个"
+    "格子建两遍。日志指纹:missing dirs 是空的却说 missing N pairs。修法:"
+    "splice 时同时按 cell_id 去重 + 末尾统一去重一次 + 命名不一致时"
+    "显式 warning 指出根因。"
+    "两者叠加:9 个格子 → 18 次(重复) → 最多 54 次(三轮) 调用。"
+)
+_VERSION_NOTES_V0322 = (
+    "v0.32.2 fix: 流水线详情页的『构建批次 N』一直在骗人。"
+    "(1) 那个 N 是【第 N 次调用】的流水号,不是格子数 —— 每个格子至少 1 次"
+    "(Round 1),失败还有批次重试 + 单 cell 重试,最多 3 次,所以看上去像"
+    "有 66 个格子实际可能只有 22 个。pages/3 的 _batch_label() 本来设计成"
+    "显示 '批次 15 · initial [D6_xiaohongshu]',数据源是 input_data 里的"
+    "_batch_info;但 get_stage_logs 为了控 payload 把整个 input_data 从"
+    "select 里去掉了,于是这条分支从那次优化落地起就是死代码,所有行永远"
+    "退回流水号。"
+    "(2) 修法:不捞整个 input_data(每条几十 KB),只用 PostgREST 的 JSON"
+    "路径投影把 _batch_info 单独取出来(别名 batch_info)。三级降级:带投影"
+    "→ 去投影 → 去 output_data;第一级对任何异常都静默降级,PostgREST 语法"
+    "万一不认也只是标签退回流水号,不会把详情页打挂。"
+    "(3) 标题行现在直接报真实格子数:『工部·构建（22 个格子 · 共 66 次调用,"
+    "含 batch/cell 重试）』—— cell_ids 去重得来。拿不到 batch_info 时只报"
+    "调用数,不瞎猜格子数。"
+)
+_VERSION_NOTES_V0321 = (
     "v0.32.1 fix: 预算熔断误杀 + 熔断错误被重试逻辑吞掉。"
     "(1) MAX_TOKENS_PER_RUN 2M → 8M。v0.32.0 换厂时把这个值留着没动,"
     "判断错了 —— 它一直是【成本容忍度】旋钮(v0.31 原注释 'Tune to your "
@@ -461,7 +521,27 @@ MAX_FINAL_REJECTIONS = 3
 # max_tokens must accommodate (thinking_budget + actual_output) for thinking stages.
 
 MAX_TOKENS_DEFAULT = 16000
-MAX_TOKENS_STRATEGY = 32000  # strategy/review stages need most room
+# ⚠️ v0.32.3: 32000 → 48000。这是在拆一颗换厂后被重新装上的雷。
+#
+# 历史:v0.30.12 给 secretariat 在策略辩论期间开了 thinking,结果 plan JSON 被
+# 截断 —— thinking 和正文共享同一个 max_tokens 预算,而 secretariat 每轮要吐
+# 完整大 plan(5-7 个 tactical_directions + 十几个 active_cells 的
+# matrix_skeleton)。截断后 target_platforms / matrix_skeleton 丢失,cell 重建
+# 得 0 个 → "工部·格子规划产出为空" 直接崩。v0.30.13 的修法是【关掉】辩论期
+# 的 thinking,把 32K 全留给输出。
+#
+# 换厂后这颗雷被重新装上:secretariat / crown_prince / ministry_works /
+# chancellery_final 都在 THINKING_STAGES 里,现在跑 kimi-k3 且走
+# {"type":"adaptive"} —— Moonshot 是否把 thinking 计入 max_tokens 没有明确
+# 文档,如果计入,32K 又会被挤占,同一个崩溃模式复现。
+#
+# 与其赌它不计入,不如把天花板抬到 48K:K2.6/K3 的输出上限远高于此(K2.6 标称
+# 262144),max_tokens 只是【上限】不是预付费,没用到就不花钱。而截断的代价是
+# 三轮重试甚至整条 run 崩 —— 两边期望值差得很远。
+#
+# 不抬得更高是因为上限太松会让模型倾向写更长的 plan,反而拖慢下游;48K 相对
+# 32K 已经给 thinking 留出足够余量。
+MAX_TOKENS_STRATEGY = 48000  # strategy/review stages need most room
 
 STAGE_MAX_TOKENS: dict[str, int] = {
     "crown_prince": MAX_TOKENS_STRATEGY,

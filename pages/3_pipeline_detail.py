@@ -1251,10 +1251,24 @@ with tabs[4]:
             # Works tab also shows cell planner + builder logs
             if mk == "ministry_works":
                 def _batch_label(log: dict, fallback_prefix: str, idx: int) -> str:
-                    """Read _batch_info from log.input_data for human-friendly label.
-                    Falls back to legacy sequential numbering."""
-                    input_data = log.get("input_data") or {}
-                    info = input_data.get("_batch_info") or {}
+                    """Human-friendly label: "批次 15 · initial [D6_xiaohongshu]"。
+
+                    数据源是 stage_log 的 `_batch_info`,由 orchestrator 在发起
+                    每次 builder / cell_planner 调用时写进 input_data。
+
+                    ⚠️ 读 `batch_info`(get_stage_logs 用 PostgREST JSON 投影单独
+                    捞出来的别名)优先,`input_data` 只是兜底 —— get_stage_logs
+                    为了控制 payload 不返回整个 input_data(每条几十 KB),所以
+                    直接读 input_data 永远是空。这条路径曾经因此静默失效,让所有
+                    行都退回 "构建批次 N" 的流水号,看上去像"有 N 个格子",
+                    实际 N 是【第 N 次调用】(含 batch 重试和单 cell 重试)。
+
+                    投影不可用时仍然会退回流水号,那时至少标题行的
+                    "共 N 次调用，含 batch/cell 重试" 还在说实话。
+                    """
+                    info = log.get("batch_info") or {}
+                    if not info:
+                        info = (log.get("input_data") or {}).get("_batch_info") or {}
                     label = info.get("label")
                     cell_ids = info.get("cell_ids") or []
                     status = log.get("status", "pending")
@@ -1270,10 +1284,36 @@ with tabs[4]:
                         return f"{label}{cells_str}{status_tag}"
                     return f"{fallback_prefix} {idx + 1}{status_tag}"
 
+                def _distinct_cells(logs: list[dict]) -> int:
+                    """这批调用一共覆盖了几个【不重复的格子】。
+
+                    调用次数 ≠ 格子数:每个格子至少 1 次(Round 1),失败时还有
+                    批次重试和单 cell 重试,最多 3 次。所以光看调用条数会把
+                    格子数高估最多 3 倍 —— 这正是"构建批次 66"看着吓人的原因。
+                    把 cell_ids 去重才是真实格子数。
+                    """
+                    seen: set[str] = set()
+                    for lg in logs:
+                        info = lg.get("batch_info") or {}
+                        for cid in (info.get("cell_ids") or []):
+                            if cid:
+                                seen.add(str(cid))
+                    return len(seen)
+
+                def _calls_caption(logs: list[dict], name: str) -> str:
+                    n_cells = _distinct_cells(logs)
+                    if n_cells:
+                        return (
+                            f"**{name}**（{n_cells} 个格子 · 共 {len(logs)} 次调用，"
+                            f"含 batch/cell 重试）"
+                        )
+                    # 拿不到 cell_ids(JSON 投影不可用)时只报调用数,不瞎猜格子数
+                    return f"**{name}**（共 {len(logs)} 次调用，含 batch/cell 重试）"
+
                 cell_planner_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_cell_planner"]
                 if cell_planner_logs:
                     st.divider()
-                    st.markdown(f"**工部·格子规划**（共 {len(cell_planner_logs)} 次调用，含 batch/cell 重试）")
+                    st.markdown(_calls_caption(cell_planner_logs, "工部·格子规划"))
                     for idx, cl in enumerate(cell_planner_logs):
                         with st.expander(_batch_label(cl, "格子规划批次", idx), expanded=False):
                             if cl.get("output_data"):
@@ -1283,7 +1323,7 @@ with tabs[4]:
                 builder_logs = [l for l in stage_logs if l["stage_name"] == "ministry_works_builder"]
                 if builder_logs:
                     st.divider()
-                    st.markdown(f"**工部·构建**（共 {len(builder_logs)} 次调用，含 batch/cell 重试）")
+                    st.markdown(_calls_caption(builder_logs, "工部·构建"))
                     for idx, bl in enumerate(builder_logs):
                         with st.expander(_batch_label(bl, "构建批次", idx), expanded=False):
                             if bl.get("output_data"):

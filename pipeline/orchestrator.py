@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 import logging
 import re
 import threading
@@ -1064,10 +1065,27 @@ class PipelineOrchestrator:
                 for c in active_cells
                 if isinstance(c, dict)
             }
+            # ⚠️ 必须同时按 cell_id 去重,不能只比 (direction, platform_key)。
+            #
+            # 踩过的坑:中书省把 platform 写成「小红书」,而 brief 的
+            # target_platforms 里是 "xiaohongshu"(或反过来)。两边
+            # _platform_key 出来不相等 → 所有 pair 都被判成"缺失" → 9 个方向
+            # 原样再 splice 一遍 → active_cells 变成 18 条,而且【cell_id 完全
+            # 重复】(D1_xiaohongshu 出现两次)。下游 builder 老老实实把每个
+            # 格子建两遍,token 直接翻倍。
+            #
+            # 日志上的指纹很好认:missing dirs 是空的(方向一个不缺),却说
+            # "missing N pairs" —— 方向都在,只是平台名对不上。
+            existing_ids = {
+                str(c.get("cell_id"))
+                for c in active_cells
+                if isinstance(c, dict) and c.get("cell_id")
+            }
             splice_in = [
                 cell for cell in expected_cells
                 if (cell["direction_id"], _platform_key(cell["platform"]))
                 not in existing_pairs
+                and cell["cell_id"] not in existing_ids
             ]
             if splice_in:
                 missing_dirs = sorted(expected_dir_set - active_dir_set)
@@ -1079,6 +1097,46 @@ class PipelineOrchestrator:
                     f"Secretariat's original cells are preserved."
                 )
                 active_cells = list(active_cells) + splice_in
+            elif expected_cells and not (
+                {(c["direction_id"], _platform_key(c["platform"]))
+                 for c in expected_cells} & existing_pairs
+            ):
+                # pair 一个都对不上但 cell_id 全对得上 = 平台命名不一致。
+                # 上面的 cell_id 去重已经挡住了重复建格子,这里只是把根因
+                # 喊出来,免得下次又要靠翻日志反推。
+                logger.warning(
+                    "active_cells 与 D×P 重建的 platform 命名不一致"
+                    "(中书省: %s / target_platforms: %s),已按 cell_id 去重避免"
+                    "重复建格。建议统一 brief.target_platforms 和 secretariat "
+                    "输出里的平台写法。",
+                    sorted({str(c.get("platform")) for c in active_cells
+                            if isinstance(c, dict)})[:5],
+                    sorted({str(c["platform"]) for c in expected_cells})[:5],
+                )
+
+        # 最后再按 cell_id 去一次重(保序)。上面的 splice 已经防住了主要来源,
+        # 但中书省自己也可能在 active_cells 里写出重复 cell_id —— 重复一条就
+        # 意味着整格子多建一次,是最贵的一类脏数据,兜住成本极低。
+        _seen_ids: set[str] = set()
+        _deduped: list[dict] = []
+        _dupes: list[str] = []
+        for c in active_cells:
+            if not isinstance(c, dict):
+                continue
+            _cid = str(c.get("cell_id") or "")
+            if _cid and _cid in _seen_ids:
+                _dupes.append(_cid)
+                continue
+            if _cid:
+                _seen_ids.add(_cid)
+            _deduped.append(c)
+        if _dupes:
+            logger.warning(
+                "active_cells 里有 %d 个重复 cell_id,已去重(重复的: %s)。"
+                "每个重复项都会让工部把同一个格子多建一遍。",
+                len(_dupes), sorted(set(_dupes))[:10],
+            )
+        active_cells = _deduped
 
         return active_cells
 
@@ -4429,6 +4487,36 @@ def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
     return buckets
 
 
+# 一段文本"看起来是完整结尾"的判定,给 _validate_prompt_cell 用。
+#
+# ⚠️ 这里踩过一个把整条流水线拖垮的坑,别改回去:
+# 原版直接 `text.endswith(clean_endings)`,而 clean_endings 只有句末标点
+# (。！？」…)。小红书笔记【本来就以话题标签结尾】——
+#     "...我下个月再来汇报。  #西屋按摩椅GT33 #按摩椅 #中秋送礼 #上岸"
+# 这是完全正确的产出,却因为末尾是「内」而不是「。」被判成截断。
+#
+# 后果不是漏判而是【全中】:一个 run 里每个格子都触发 hard fail → 批次重试 →
+# 单 cell 重试,三轮之后拿到的还是同样的合法内容,代码只好 "accepting anyway
+# (best effort)" 收下。等于每个格子固定烧 3 倍 token 换回同一个结果,
+# 直接把 run 顶到 MAX_TOKENS_PER_RUN 被熔断。
+#
+# 修法:先把结尾那串话题标签剥掉再判。剥完还剩正文就按正文的结尾判 ——
+# 真正的截断(停在半句话上)仍然抓得到。
+_TRAILING_HASHTAGS_RE = re.compile(r"(?:[#＃][^\s#＃]+[ 	　]*)+$")
+
+
+def _ending_looks_complete(text: str, clean_endings: tuple[str, ...]) -> bool:
+    """结尾是否完整。剥掉尾部话题标签后再按句末标点判。"""
+    t = (text or "").rstrip()
+    if not t:
+        return True  # 空内容由必填字段检查负责,不在这里重复报
+    stripped = _TRAILING_HASHTAGS_RE.sub("", t).rstrip()
+    if not stripped:
+        # 整段都是标签(极罕见)。长度检查会管它,这里不判截断。
+        return True
+    return stripped.endswith(clean_endings)
+
+
 def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
     """Validate a works_builder prompt_cell for quality issues that would
     otherwise only be caught by chancellery_final — shifting quality checks
@@ -4477,7 +4565,7 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             "。", "！", "？", "」", "』", "}", "】", "）", ")",
             ".", "!", "?", "\"", "'", "\u201d", "\u2019",
         )
-        if not sp.endswith(clean_endings):
+        if not _ending_looks_complete(sp, clean_endings):
             tail = sp[-40:].replace("\n", " ")
             issues.append(f"{cid}: system_prompt 结尾不完整（末尾: ...{tail!r}）")
 
@@ -4491,14 +4579,42 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
     # Principle: only hard-fail on items chancellery explicitly flags.
     # Stylistic nits (tone/naturalness) still belong to the reviewer.
     if sp:
-        essential_keywords = {
-            "合规": "合规/compliance 规则",
-            "关键词": "关键词植入指令",
-            "禁止": "反 AI 腔禁用清单",
+        # ⚠️ 必须用别名表,不能单字面量匹配 —— 这是本函数里唯一一处曾经漏掉
+        # 别名的检查,而它是【硬失败】。现场日志实测:模型把禁用清单写成
+        # 「不要写…」「避免…」「❌…」而不是「禁止…」时,这条就误判,触发
+        # 批次重试 + 单 cell 重试;如果模型的措辞习惯稳定,三轮都过不了 →
+        # 整条 run 报 "三轮尝试后仍缺失" 挂掉。
+        # 紧邻的 pool_aliases / batch_rule_aliases 早就是别名表了,后者的注释
+        # 原话就是"别让 builder 因为措辞差异陷入三轮重试地狱"——这里补齐。
+        #
+        # 判定目标是"这段 prompt 里到底有没有这个板块",不是"有没有这个词",
+        # 所以收同义写法;真的整段缺失时仍然抓得到。
+        essential_keyword_aliases = {
+            "合规/compliance 规则": [
+                "合规", "compliance", "违禁词", "敏感词", "广告法",
+                "风险提示", "不可宣称", "禁用词",
+            ],
+            "关键词植入指令": [
+                "关键词", "keyword", "核心词", "搜索词", "蓝词", "埋词",
+                "词包",
+            ],
+            # ⚠️ 这一组只收【明确是禁用清单】的写法。别加 "不得" / "避免" /
+            # "不要" 这类裸词 —— 合规段里就有"不得宣称疗效"、五池规则里有
+            # "不得与上一篇重复",裸词会命中它们,于是 system_prompt 里压根
+            # 没有反 AI 腔清单也能判过(实测踩过)。宁可偶尔误报要求重试,
+            # 也不能让这条检查变成永远为真的摆设。
+            "反 AI 腔禁用清单": [
+                "禁止", "禁用", "严禁", "忌用", "❌",
+                "不要写", "不要出现", "不要用", "避免使用", "少用",
+                "黑名单", "black list", "blacklist",
+            ],
         }
-        for keyword, description in essential_keywords.items():
-            if keyword not in sp:
-                issues.append(f"{cid}: system_prompt 缺少「{description}」（找不到 '{keyword}'）")
+        for description, aliases in essential_keyword_aliases.items():
+            if not any(a in sp for a in aliases):
+                issues.append(
+                    f"{cid}: system_prompt 缺少「{description}」"
+                    f"（这些写法一个都没找到: {'/'.join(aliases[:4])}…）"
+                )
 
         # 5 differentiation pools — works_builder.md:17-23 explicitly says
         # "5 个池必须全部内置，缺一个都算不合格". We accept either the
@@ -4570,7 +4686,7 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             )
 
         # demo truncation check
-        if len(demo) > 50 and not demo.endswith(clean_endings):
+        if len(demo) > 50 and not _ending_looks_complete(demo, clean_endings):
             tail = demo[-40:].replace("\n", " ")
             issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
 
