@@ -2,9 +2,23 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.32.0"
+VERSION = "v0.32.1"
 VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.1 fix: 预算熔断误杀 + 熔断错误被重试逻辑吞掉。"
+    "(1) MAX_TOKENS_PER_RUN 2M → 8M。v0.32.0 换厂时把这个值留着没动,"
+    "判断错了 —— 它一直是【成本容忍度】旋钮(v0.31 原注释 'Tune to your "
+    "cost tolerance',2M 在 Opus 单价下 ≈ $74/run)。换厂后单价掉一个数量级,"
+    "同一个 2M 只剩 ≈ $5,等于悄悄把容忍度砍到 1/14。实测后果:8 方向 × "
+    "2 平台 = 16 格子的正常 run,工部构建跑到第 14 个格子被强杀。"
+    "(2) RunBudgetExceededError 不再被 cell_planner / works_builder 的"
+    "重试逻辑吞掉。这两处的 Round 2(批次重试)和单 cell 重试都是裸 "
+    "`except Exception`,预算熔断一旦发生就被降级成'这个 cell 没返回',"
+    "于是每个剩余批次再白跑三轮,最后报一句误导的'works_builder 三轮尝试"
+    "后仍缺失'——真实死因(token 爆了)只出现在末尾一条 batch error 里。"
+    "改成和 red_blue / persona_simulator 一致:熔断先 re-raise 冒泡硬停。"
+)
+_VERSION_NOTES_V0320 = (
     "v0.32.0 breaking: 全链路换厂 —— Claude / GPT / Gemini 三家全部退场,"
     "改用 Kimi (Moonshot) + DeepSeek 两家。"
     "(1) 主链路 24 个 stage:策略核心 4 个 (太子/中书省/终审/工部·架构) 走 "
@@ -562,11 +576,27 @@ CLAUDE_RPM_RECOVERY_STEP = 3
 # Safety net against runaway retry loops — 14 stages × worst-case retries
 # × thinking budgets can compound quickly without a cap.
 #
-# v0.32.0 换厂后同样的 2M token 上限便宜了一个数量级:kimi-k2.6
-# ($0.95/M in + $4/M out) 下 2M token ≈ $5/run;即使全跑 kimi-k3
-# ($3/$15) 也就 ≈ $18(换厂前 Opus 4.7 是 ≈ $90)。上限保持 2M 不动 ——
-# 它的作用是"挡住重试风暴/死循环",不是控成本档位,按 token 计更稳。
-MAX_TOKENS_PER_RUN = 2_000_000
+# ⚠️ v0.32.1: 2M → 8M。v0.32.0 换厂时我把这个值留着没动,理由是"它是挡重试
+# 风暴的,不是成本档位"。这个判断是错的 —— 它一直都是【成本容忍度】旋钮
+# (v0.31 的原注释写的是 "Tune to your cost tolerance",2M 在 Opus 4.7
+# 单价下 ≈ $74/run)。换厂后单价掉了一个数量级,同一个 2M 只剩 ≈ $5,
+# 等于在没人决定的情况下把成本容忍度砍到了原来的 1/14。
+#
+# 后果是真实发生的:一条 8 方向 × 2 平台 = 16 格子的正常 run,在工部构建
+# 跑到第 14 个格子时撞上 2M 被强杀 —— 而那时它只花了大约 $5。
+#
+# 8M 的算法(按实测的 in/out 比例 ≈ 64/36 折算):
+#   8M ≈ 5.1M input + 2.9M output
+#   全 kimi-k2.6: 5.1×$0.95 + 2.9×$4  ≈ $16
+#   混 k3 策略层:                      ≈ $20–25
+# 仍然低于换厂前 2M 所代表的 ≈ $74,但足够跑完 16 格子的完整流水线
+# (构建 + 红蓝 + 画像 + 网感循环最多 3 轮 + 终审)。
+#
+# 它挡的是【重试失控】:单个 stage 反复重试、或格子数被策略升级刷到失控。
+# 如果你的 run 经常撞 8M,别急着再调高 —— 先去看格子数是不是不合理
+# (格子数 = 方向数 × 平台数,见 secretariat.md 的矩阵骨架段),
+# 那才是成本的乘数项。
+MAX_TOKENS_PER_RUN = 8_000_000
 
 # ── Liveness: heartbeat + stale-run reaper ───────────────────────────────
 # The pipeline runs in a daemon thread inside the Streamlit process. When

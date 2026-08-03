@@ -1208,6 +1208,10 @@ class PipelineOrchestrator:
                     return plans[0]
                 logger.error(f"[cell_planner cell-retry] {cid} returned empty plans")
                 return None
+            except RunBudgetExceededError:
+                raise  # 预算熔断必须冒泡到顶层硬停,不能被下面的通用 except
+                       # 吞成"这个 cell 没返回"——那会把真实死因(token 爆了)
+                       # 换成一句误导的"模型三轮都没返回",还白烧后续批次的重试。
             except Exception as e:
                 logger.error(f"[cell_planner cell-retry] {cid} failed: {e!r}")
                 return None
@@ -1279,6 +1283,8 @@ class PipelineOrchestrator:
                             if isinstance(p, dict) and p.get("cell_id") in expected_ids:
                                 merged_by_id[p["cell_id"]] = p
                         missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
+                    except RunBudgetExceededError:
+                        raise  # 同上:预算熔断不能被吞成"批次重试失败"
                     except Exception as e:
                         logger.error(
                             f"[cell_planner batch {batch_idx}] batch retry exception: {e!r}"
@@ -1539,6 +1545,10 @@ class PipelineOrchestrator:
                     return cells[0], demos
                 logger.error(f"[builder cell-retry] {cid} returned empty prompt_cells")
                 return None, demos
+            except RunBudgetExceededError:
+                raise  # 预算熔断必须冒泡到顶层硬停,不能被下面的通用 except
+                       # 吞成"这个 cell 没返回"——那会把真实死因(token 爆了)
+                       # 换成一句误导的"模型三轮都没返回",还白烧后续批次的重试。
             except Exception as e:
                 logger.error(f"[builder cell-retry] {cid} failed: {e!r}")
                 return None, []
@@ -1635,6 +1645,8 @@ class PipelineOrchestrator:
                         merged_by_id.update(new_candidates)
                         merged_demos.extend(retry_result.get("demo_outputs", []) or [])
                         missing_ids = [cid for cid in expected_ids if cid not in merged_by_id]
+                    except RunBudgetExceededError:
+                        raise  # 同上:预算熔断不能被吞成"批次重试失败"
                     except Exception as e:
                         logger.error(
                             f"[builder batch {batch_idx}] batch retry exception: {e!r}"
