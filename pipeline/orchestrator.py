@@ -1064,10 +1064,27 @@ class PipelineOrchestrator:
                 for c in active_cells
                 if isinstance(c, dict)
             }
+            # ⚠️ 必须同时按 cell_id 去重,不能只比 (direction, platform_key)。
+            #
+            # 踩过的坑:中书省把 platform 写成「小红书」,而 brief 的
+            # target_platforms 里是 "xiaohongshu"(或反过来)。两边
+            # _platform_key 出来不相等 → 所有 pair 都被判成"缺失" → 9 个方向
+            # 原样再 splice 一遍 → active_cells 变成 18 条,而且【cell_id 完全
+            # 重复】(D1_xiaohongshu 出现两次)。下游 builder 老老实实把每个
+            # 格子建两遍,token 直接翻倍。
+            #
+            # 日志上的指纹很好认:missing dirs 是空的(方向一个不缺),却说
+            # "missing N pairs" —— 方向都在,只是平台名对不上。
+            existing_ids = {
+                str(c.get("cell_id"))
+                for c in active_cells
+                if isinstance(c, dict) and c.get("cell_id")
+            }
             splice_in = [
                 cell for cell in expected_cells
                 if (cell["direction_id"], _platform_key(cell["platform"]))
                 not in existing_pairs
+                and cell["cell_id"] not in existing_ids
             ]
             if splice_in:
                 missing_dirs = sorted(expected_dir_set - active_dir_set)
@@ -1079,6 +1096,46 @@ class PipelineOrchestrator:
                     f"Secretariat's original cells are preserved."
                 )
                 active_cells = list(active_cells) + splice_in
+            elif expected_cells and not (
+                {(c["direction_id"], _platform_key(c["platform"]))
+                 for c in expected_cells} & existing_pairs
+            ):
+                # pair 一个都对不上但 cell_id 全对得上 = 平台命名不一致。
+                # 上面的 cell_id 去重已经挡住了重复建格子,这里只是把根因
+                # 喊出来,免得下次又要靠翻日志反推。
+                logger.warning(
+                    "active_cells 与 D×P 重建的 platform 命名不一致"
+                    "(中书省: %s / target_platforms: %s),已按 cell_id 去重避免"
+                    "重复建格。建议统一 brief.target_platforms 和 secretariat "
+                    "输出里的平台写法。",
+                    sorted({str(c.get("platform")) for c in active_cells
+                            if isinstance(c, dict)})[:5],
+                    sorted({str(c["platform"]) for c in expected_cells})[:5],
+                )
+
+        # 最后再按 cell_id 去一次重(保序)。上面的 splice 已经防住了主要来源,
+        # 但中书省自己也可能在 active_cells 里写出重复 cell_id —— 重复一条就
+        # 意味着整格子多建一次,是最贵的一类脏数据,兜住成本极低。
+        _seen_ids: set[str] = set()
+        _deduped: list[dict] = []
+        _dupes: list[str] = []
+        for c in active_cells:
+            if not isinstance(c, dict):
+                continue
+            _cid = str(c.get("cell_id") or "")
+            if _cid and _cid in _seen_ids:
+                _dupes.append(_cid)
+                continue
+            if _cid:
+                _seen_ids.add(_cid)
+            _deduped.append(c)
+        if _dupes:
+            logger.warning(
+                "active_cells 里有 %d 个重复 cell_id,已去重(重复的: %s)。"
+                "每个重复项都会让工部把同一个格子多建一遍。",
+                len(_dupes), sorted(set(_dupes))[:10],
+            )
+        active_cells = _deduped
 
         return active_cells
 
@@ -4429,6 +4486,36 @@ def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
     return buckets
 
 
+# 一段文本"看起来是完整结尾"的判定,给 _validate_prompt_cell 用。
+#
+# ⚠️ 这里踩过一个把整条流水线拖垮的坑,别改回去:
+# 原版直接 `text.endswith(clean_endings)`,而 clean_endings 只有句末标点
+# (。！？」…)。小红书笔记【本来就以话题标签结尾】——
+#     "...我下个月再来汇报。  #西屋按摩椅GT33 #按摩椅 #中秋送礼 #上岸"
+# 这是完全正确的产出,却因为末尾是「内」而不是「。」被判成截断。
+#
+# 后果不是漏判而是【全中】:一个 run 里每个格子都触发 hard fail → 批次重试 →
+# 单 cell 重试,三轮之后拿到的还是同样的合法内容,代码只好 "accepting anyway
+# (best effort)" 收下。等于每个格子固定烧 3 倍 token 换回同一个结果,
+# 直接把 run 顶到 MAX_TOKENS_PER_RUN 被熔断。
+#
+# 修法:先把结尾那串话题标签剥掉再判。剥完还剩正文就按正文的结尾判 ——
+# 真正的截断(停在半句话上)仍然抓得到。
+_TRAILING_HASHTAGS_RE = re.compile(r"(?:[#＃][^\s#＃]+[ 	　]*)+$")
+
+
+def _ending_looks_complete(text: str, clean_endings: tuple[str, ...]) -> bool:
+    """结尾是否完整。剥掉尾部话题标签后再按句末标点判。"""
+    t = (text or "").rstrip()
+    if not t:
+        return True  # 空内容由必填字段检查负责,不在这里重复报
+    stripped = _TRAILING_HASHTAGS_RE.sub("", t).rstrip()
+    if not stripped:
+        # 整段都是标签(极罕见)。长度检查会管它,这里不判截断。
+        return True
+    return stripped.endswith(clean_endings)
+
+
 def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
     """Validate a works_builder prompt_cell for quality issues that would
     otherwise only be caught by chancellery_final — shifting quality checks
@@ -4477,7 +4564,7 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             "。", "！", "？", "」", "』", "}", "】", "）", ")",
             ".", "!", "?", "\"", "'", "\u201d", "\u2019",
         )
-        if not sp.endswith(clean_endings):
+        if not _ending_looks_complete(sp, clean_endings):
             tail = sp[-40:].replace("\n", " ")
             issues.append(f"{cid}: system_prompt 结尾不完整（末尾: ...{tail!r}）")
 
@@ -4570,7 +4657,7 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             )
 
         # demo truncation check
-        if len(demo) > 50 and not demo.endswith(clean_endings):
+        if len(demo) > 50 and not _ending_looks_complete(demo, clean_endings):
             tail = demo[-40:].replace("\n", " ")
             issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
 

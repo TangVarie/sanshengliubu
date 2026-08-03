@@ -2,9 +2,28 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.32.2"
+VERSION = "v0.32.3"
 VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.3 fix: 工部构建 3 倍空烧的两个真因(这才是撞 token 上限的根)。"
+    "(A) _validate_prompt_cell 的结尾完整性检查在小红书上 100% 误判。"
+    "小红书笔记本来就以话题标签收尾('...下月再汇报。 #按摩椅 #中秋送礼'),"
+    "但检查只认句末标点,于是每个格子都被判'demo_output 结尾不完整'→ hard "
+    "fail → 批次重试 → 单 cell 重试,三轮后拿到同样的合法内容,只好 "
+    "'accepting anyway (best effort)' 收下。等于每格固定烧 3 倍 token 换回"
+    "同一个结果。修法:判定前先剥掉尾部话题标签(半角#和全角＃都认),剥完"
+    "按正文结尾判 —— 真正停在半句话上的截断仍然抓得到。resume 时那句"
+    "'rejected 45 cells ... will be rebuilt' 也是同一个误判,一并消失。"
+    "(B) _reconstruct_active_cells 会把同一个格子 splice 两遍。中书省把 "
+    "platform 写成'小红书'而 brief 的 target_platforms 是'xiaohongshu'时,"
+    "两边 _platform_key 不相等 → 所有 pair 判为缺失 → 原样再补一遍,"
+    "active_cells 里出现完全重复的 cell_id(D1_xiaohongshu 两次),工部把每个"
+    "格子建两遍。日志指纹:missing dirs 是空的却说 missing N pairs。修法:"
+    "splice 时同时按 cell_id 去重 + 末尾统一去重一次 + 命名不一致时"
+    "显式 warning 指出根因。"
+    "两者叠加:9 个格子 → 18 次(重复) → 最多 54 次(三轮) 调用。"
+)
+_VERSION_NOTES_V0322 = (
     "v0.32.2 fix: 流水线详情页的『构建批次 N』一直在骗人。"
     "(1) 那个 N 是【第 N 次调用】的流水号,不是格子数 —— 每个格子至少 1 次"
     "(Round 1),失败还有批次重试 + 单 cell 重试,最多 3 次,所以看上去像"
