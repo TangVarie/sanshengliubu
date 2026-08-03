@@ -1,16 +1,16 @@
 """Bounded exponential-backoff retry wrapper for LLM calls.
 
-Problem (2026-05-22 audit R-026): sanshengliubu's Gemini calls had no retry
+Problem (2026-05-22 audit R-026): sanshengliubu's 辅助层 calls had no retry
 on transient failures. Under load (rate limits, brief 5xx blips), a single
 transient error fails the whole pipeline run that's already burned 5-10×
-the cost upstream. This module brings Gemini and any other future
-non-Anthropic LLM backend to parity.
+the cost upstream. This module brings the assist layer and any other
+out-of-band LLM call to parity.
 
 Usage:
     from pipeline.llm_retry import call_with_retry
 
     def my_call():
-        return gemini_client.call_gemini_json(...)
+        return kimi_client.call_kimi_json(...)
 
     result = call_with_retry(my_call, max_attempts=3)
 
@@ -31,12 +31,12 @@ unified retry layer:
      source of truth.
 
    Quick recap so this file is still understandable in isolation:
-   - Claude / DeepSeek / OpenAI 路径 → BaseAgent._call_claude (has
+   - 主链路 (Kimi / DeepSeek / 历史 Claude·GPT) → BaseAgent._call_model (has
      retry + budget + limiter + cache-fallback all entangled). Don't
      migrate without a dedicated PR.
-   - Gemini 路径 (this module) → 薄重试,因为 Vertex 走自家配额,
-     不需要 limiter/budget/cache-fallback。max_wait=30s 比 TV 的 14s
-     宽是有意的(Vertex grounding 429 恢复 10-20s)。
+   - 辅助层 (this module,v0.32.0 起是 kimi_client) → 薄重试。辅助层
+     是 advisory,不该占用主链路的 run 预算/限流器,也不需要
+     cache-fallback。max_wait=30s 比 TV 的 14s 宽是有意的。
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ T = TypeVar("T")
 
 # Substrings we treat as "transient — worth retrying". Case-insensitive
 # match against str(exception). Lowercase keys so the lookup is cheap.
-# These cover Gemini (google-genai), Anthropic SDK, requests/httpx, and
+# These cover the Anthropic SDK (Kimi/DeepSeek anthropic-compat), requests/httpx, and
 # the typical OpenAI-compat relay error shapes.
 _RETRYABLE_SUBSTRINGS: tuple[str, ...] = (
     "429",
@@ -137,8 +137,8 @@ def call_with_retry(
 
 
 # Note: an async sibling `acall_with_retry` was deliberately NOT added.
-# All current LLM callers are synchronous (gemini_client.generate_content,
-# BaseAgent._call_claude); the BaseAgent's async run() crosses the boundary
+# All current LLM callers are synchronous (kimi_client.call_kimi_json,
+# BaseAgent._call_model); the BaseAgent's async run() crosses the boundary
 # via asyncio.to_thread, not by awaiting an async LLM call. Adding an unused
 # async wrapper invites misuse + maintenance burden — add it back the day
 # we actually have an `async def call_xxx_async` to wrap.

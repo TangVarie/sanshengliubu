@@ -7,39 +7,57 @@
 
 ## 1. 为什么有三套 LLM 重试 (R-026 设计选择)
 
-sanshengliubu 跑多家 LLM 后端,**目前是三套重试机制并存**,不打算强行统一。
-这是 2026-05-22 audit R-026 的明确权衡。
+sanshengliubu 跑多家 LLM 后端,**目前是两套重试机制并存**,不打算强行统一。
+这是 2026-05-22 audit R-026 的明确权衡(v0.32.0 换厂后更新)。
 
 ### 对照表
 
 | backend | retry 源 | 基底 | 最大尝试 | max_wait | 在哪里 |
 |---------|---------|------|---------|----------|--------|
-| **Claude** (Anthropic / Vertex / 中转) | `BaseAgent.run()` | 3s 普通 / 10s for 5xx | `MAX_RETRIES + 1` (默认 4) | `MAX_RETRIES` 控制 | `pipeline/agents/__init__.py:1379` |
-| **Gemini** (Vertex Express) | `call_with_retry()` | 2s | 3 | 30s | `pipeline/llm_retry.py` + `pipeline/agents/gemini_client.py` |
-| **DeepSeek** | `BaseAgent.run()` (anthropic-compat 路径) | 3s | `MAX_RETRIES + 1` | — | 复用 Claude 路径,见 `_call_claude` |
-| **OpenAI / GPT** | `BaseAgent.run()` (gpt branch in `_call_claude`) | 3s | `MAX_RETRIES + 1` | — | 复用 Claude 路径 |
+| **Kimi** (Moonshot anthropic-compat) | `BaseAgent.run()` | 3s 普通 / 10s for 5xx | `MAX_RETRIES + 1` (默认 4) | `MAX_RETRIES` 控制 | `pipeline/agents/__init__.py::_call_model` |
+| **DeepSeek** (官方 anthropic-compat) | `BaseAgent.run()` | 3s | `MAX_RETRIES + 1` | — | 同上,共用一条路径 |
+| **辅助层** (Kimi / DeepSeek,二审·结构审·Vision) | `call_with_retry()` | 2s | 3 | 30s | `pipeline/llm_retry.py` + `pipeline/agents/kimi_client.py` |
+| **SocialDataX** (MCP,非 LLM) | 自带 transient 重试 | 1s / 2s | 3 | — | `pipeline/agents/socialdatax_client.py` |
+| **Claude / GPT**(历史路径,默认不再使用) | `BaseAgent.run()` | 3s | `MAX_RETRIES + 1` | — | 路由仍在,靠 `model_overrides` 才会走到 |
+
+主链路的三家(Kimi / DeepSeek / 历史 Claude)都说 Anthropic Messages 协议,
+所以共用同一条 `_call_model`;GPT 走 `_call_openai_chat` 分支,返回同样的
+7-tuple,上层不分叉。
 
 ### 为什么不统一
 
-`BaseAgent._call_claude` 已包含 4 项耦合的状态机:
+`BaseAgent._call_model` 已包含 4 项耦合的状态机:
 1. **Retry** — 按异常类型分流可重试 / 不可重试,5xx 用更长退避
 2. **Per-run budget** — `_check_run_budget` 累计 token / cost,超 `MAX_TOKENS_PER_RUN` 强制终止
 3. **Sliding-window rate limiter** — `_SlidingWindowLimiter` 维护 RPM + concurrency 双约束
-4. **Cache-fallback** — 中转拒绝 `cache_control` 时自动降级重试
+4. **Cache-fallback** — 上游拒绝 `cache_control` 时自动降级重试
 
-把这套搬进 `llm_retry.py` 是另一个 PR 的工作量 (1-2 天 + e2e 测试),
-不在 R-026 (Gemini 跟齐) 的承诺范围。Gemini 调用 **没有** budget / limiter /
-cache-fallback (Vertex 走自家配额),所以独立薄重试就够用。
+把这套搬进 `llm_retry.py` 是另一个 PR 的工作量 (1-2 天 + e2e 测试)。
+
+更重要的是**辅助层本来就不该要这四项**:它是 advisory,二审挂了就当没二审。
+让它去占主链路的 run 预算、甚至触发 `RunBudgetExceededError` 把整条 run 判死,
+是明确的错误行为。所以"两套并存"不只是技术债,有一半是有意的隔离。
 
 ### 设计后果运维需要知道
 
-- "为什么 Claude 重试等了 10s, Gemini 等了 30s" — 不是 bug,是有意:
-  Vertex grounding 429 恢复周期 10-20s,Gemini 用 14s 还没到拐点就放弃
-  (truth-vault `annotate_essence_pass.py` 用 2+4+8=14s 是按 Anthropic 节奏
-  调的,对 Gemini 偏短)
-- 调 Claude 路径的退避参数 → 改 `pipeline/config.py::MAX_RETRIES / RETRY_BASE_DELAY_SECONDS`
-- 调 Gemini 退避参数 → 改 `pipeline/agents/gemini_client.py` 里 `call_with_retry(...)` 的
+- "为什么主链路重试等了 10s,辅助层等了 30s" — 不是 bug,是有意:主链路的
+  退避按 Anthropic 协议族的节奏调(3s/6s/12s),辅助层的 30s 上限更宽,
+  因为它慢一点没关系,失败才有关系
+- 调主链路退避参数 → 改 `pipeline/config.py::MAX_RETRIES / RETRY_BASE_DELAY_SECONDS`
+- 调辅助层退避参数 → 改 `pipeline/agents/kimi_client.py` 里 `call_with_retry(...)` 的
   `max_attempts / initial_wait / max_wait`
+- **辅助层的 token 不进 run 总账** —— 和 v0.31 的 Gemini 层一样。成本通过
+  返回值的 `cost_usd` 单独上报,`pipeline_run.total_cost_usd` 里看不到它
+
+### 跨厂家 fallback(v0.32.0 新增)
+
+`MODEL_FALLBACK_CHAIN = [kimi-k2.6, kimi-k3, deepseek-v4-flash]`。上游返回
+"无可用渠道"时按链降级。和 v0.31 的区别是这条链**跨厂家**:Moonshot 整体故障
+时仍能靠 DeepSeek 把流水线以降级质量跑完。
+
+代价是候选可能压根没配 key,所以 `_model_fallback_candidates` 会先用
+`backend_configured()` 过滤 —— 否则 "DEEPSEEK_API_KEY 没配" 这种配置错误会被
+fallback 循环当成一次普通失败,最后抛出的错跟真实原因对不上。
 
 ### 未来统一的触发条件
 

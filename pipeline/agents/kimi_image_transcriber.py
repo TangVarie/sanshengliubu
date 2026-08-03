@@ -1,19 +1,19 @@
-"""Gemini 图片预转写 — 在上传时把图片转成文字描述,塞进 free_text。
+"""Kimi 图片预转写 — 在上传时把图片转成文字描述,塞进 free_text。
 
 为什么要做这一层:
   Anthropic API 不会把 free_text 字符串里的 `[BASE64_IMAGE:...]` 当成
   图像理解,只会当成普通 token。Crown Prince + 下游六部都看不见图。
-  解决方案:在用户上传时,本地起一个 Gemini Vision 调用,把图片内容
+  解决方案:在用户上传时,本地起一个 Kimi Vision 调用,把图片内容
   (OCR + 视觉描述 + 关键数据)转成结构化文字块,替换原来的 base64
   占位符。下游 LLM 当文本读就能拿到图里的实质信息。
 
 为什么不直接走 Anthropic 多模态:
-  那需要重写 BaseAgent._call_claude 支持 image content blocks,
+  那需要重写 BaseAgent._call_model 支持 image content blocks,
   并且改 free_text -> messages 的拼装链路,4-6 小时工作量。
-  Gemini 预转写是 30 分钟级别的"取巧但有效"方案,先把信号通起来。
+  Kimi 预转写是 30 分钟级别的"取巧但有效"方案,先把信号通起来。
 
 失败降级:
-  Gemini 没配置 / 模型报错 / 解析失败 → 回退到原来的 base64 占位符
+  Kimi 没配置 / 模型报错 / 解析失败 → 回退到原来的 base64 占位符
   + 显式警告文字,让 Crown Prince 知道"这张图我看不见,只知道存在"。
 """
 
@@ -22,11 +22,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from pipeline.agents.gemini_client import (
-    GeminiCallFailed,
-    GeminiNotConfigured,
-    call_gemini_json,
-    resolve_gemini_model,
+from pipeline.agents.kimi_client import (
+    KimiCallFailed,
+    KimiNotConfigured,
+    call_kimi_json,
+    resolve_assist_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ _TRANSCRIBE_SYSTEM_PROMPT = """你是图片转文字助手。把用户上传的�
 
 
 def _format_for_brief(image_name: str, analysis: dict[str, Any]) -> str:
-    """把 Gemini 分析结果格式化成 Crown Prince 可读的文字块。
+    """把 Kimi 分析结果格式化成 Crown Prince 可读的文字块。
 
     与原来的 [BASE64_IMAGE:...] 占位符不同,这里直接把图里的内容
     打开成纯文本,LLM 当普通文档读就行。
@@ -81,12 +81,12 @@ def _format_for_brief(image_name: str, analysis: dict[str, Any]) -> str:
 
 
 def _format_fallback(image_name: str, b64_len: int, reason: str) -> str:
-    """Gemini 不可用时的降级文本。明确告诉下游 LLM"这张图没看见"。"""
+    """Kimi 不可用时的降级文本。明确告诉下游 LLM"这张图没看见"。"""
     return (
         f"[图片占位符: {image_name}]\n"
         f"⚠️ 该图片未经过视觉转写(原因: {reason}),"
         f"下游 LLM 无法看到图像内容,只知道有一张大小 {b64_len:,} 字节的图片存在。\n"
-        f"如需让模型实际看到图,请在「设置」配置 VERTEX_EXPRESS_API_KEY 后重新上传。\n"
+        f"如需让模型实际看到图,请在「设置」配置 MOONSHOT_API_KEY 后重新上传。\n"
         f"[/图片占位符]"
     )
 
@@ -96,42 +96,42 @@ def transcribe_image_for_brief(
     mime_type: str,
     filename: str,
 ) -> str:
-    """One-shot Gemini Vision 调用,把图片转成 Crown Prince 可读的文字块。
+    """One-shot Kimi Vision 调用,把图片转成 Crown Prince 可读的文字块。
 
     成功返回结构化文字描述。
-    Gemini 未配置 / 调用失败 / 解析失败 → 返回降级占位符(带原因说明),
+    Kimi 未配置 / 调用失败 / 解析失败 → 返回降级占位符(带原因说明),
     永远不抛异常——上传链路必须稳健,不能因为一张图挂掉整个项目创建。
     """
     if not image_bytes:
         return _format_fallback(filename, 0, "图片字节为空")
 
     try:
-        result = call_gemini_json(
+        result = call_kimi_json(
             system_prompt=_TRANSCRIBE_SYSTEM_PROMPT,
             user_message=(
                 f"请按 system prompt 的 JSON schema 转写下面这张图片(文件名: {filename})。"
             ),
             images=[(image_bytes, mime_type)],
             max_output_tokens=8000,  # OCR + 描述够用
-            model=resolve_gemini_model("image_transcriber"),
+            model=resolve_assist_model("image_transcriber"),
         )
-    except GeminiNotConfigured as e:
-        logger.info("[image_transcribe] Gemini not configured, using fallback: %s", e)
-        return _format_fallback(filename, len(image_bytes), f"Gemini 未配置({e})")
-    except GeminiCallFailed as e:
-        logger.warning("[image_transcribe] Gemini call failed: %s", e)
-        return _format_fallback(filename, len(image_bytes), f"Gemini 调用失败({e})")
+    except KimiNotConfigured as e:
+        logger.info("[image_transcribe] Kimi not configured, using fallback: %s", e)
+        return _format_fallback(filename, len(image_bytes), f"Kimi 未配置({e})")
+    except KimiCallFailed as e:
+        logger.warning("[image_transcribe] Kimi call failed: %s", e)
+        return _format_fallback(filename, len(image_bytes), f"Kimi 调用失败({e})")
     except Exception as e:
         # 任何意外异常都不能炸掉上传流程
         logger.exception("[image_transcribe] unexpected error")
         return _format_fallback(filename, len(image_bytes), f"未知异常({type(e).__name__})")
 
     analysis = result.get("data") or {}
-    # 关键:JSON 解析失败时 call_gemini_json 塞的是一个**非空 dict**
+    # 关键:JSON 解析失败时 call_kimi_json 塞的是一个**非空 dict**
     # {_raw_text, _parse_error},若只判 `not analysis` 这分支永远进不来(死代码),
     # 会把 parse-error dict 当正常 analysis 交给 _format_for_brief → 往 brief 注入
     # 一个没有实际 OCR 内容的误导性识别块。显式判 _parse_error 让 _raw_text 抢救
-    # 分支生效(对齐 gemini_critic / structure_reviewer 的处理)。
+    # 分支生效(对齐 kimi_critic / structure_reviewer 的处理)。
     if not isinstance(analysis, dict) or not analysis or "_parse_error" in analysis:
         raw_text = (result.get("data") or {}).get("_raw_text") if isinstance(result.get("data"), dict) else ""
         if raw_text:
@@ -140,6 +140,6 @@ def transcribe_image_for_brief(
                 f"[图片AI识别: {filename}](结构化解析失败,原始输出)\n"
                 f"{raw_text[:3000]}\n[/图片AI识别]"
             )
-        return _format_fallback(filename, len(image_bytes), "Gemini 输出非 JSON")
+        return _format_fallback(filename, len(image_bytes), "Kimi 输出非 JSON")
 
     return _format_for_brief(filename, analysis)

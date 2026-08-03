@@ -99,7 +99,7 @@ def _sanitize_freetext_for_display(text: str) -> str:
     """折叠 free_text 里的 base64 图片原文,便于人阅读。
 
     v0.26.0 之前的项目把整张图的 base64 直接塞进 free_text,单张图就能
-    吃掉几百行"乱码"。新数据走 Gemini Vision OCR 不会有,但历史项目
+    吃掉几百行"乱码"。新数据走 Kimi Vision OCR 不会有,但历史项目
     每次 re-run 都继承老 free_text → base64 一直在。
     这里只动显示,不动存储:实际喂给 agent 的 input_data 保持原样。
     """
@@ -127,8 +127,8 @@ def _extract_file_summary_from_freetext(text: str) -> list[dict]:
     统一的外层包装是 page 2 的 process_uploaded_files 产的
     `[参考文件: name]...[/参考文件]` 块,包括 txt/md/json/pdf/docx/图片
     所有类型。从 body 内容推断具体 kind + status:
-    - 内含 `[图片AI识别:` → Gemini OCR 成功的图片
-    - 内含 `[图片占位符:` → Gemini 未配置/失败的图片占位
+    - 内含 `[图片AI识别:` → Kimi OCR 成功的图片
+    - 内含 `[图片占位符:` → 辅助层未配置/失败的图片占位
     - 内含 `[BASE64_IMAGE:` 或 `base64长度:` → v0.26 前的 base64 残留
     - 都不含 → 普通文本/Word/PDF 提取文本
 
@@ -150,7 +150,7 @@ def _extract_file_summary_from_freetext(text: str) -> list[dict]:
         # 按扩展名 + body 内容推断类型
         _ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if "[图片AI识别:" in body:
-            kind = "图片(Gemini OCR)"
+            kind = "图片(Kimi OCR)"
             status = "transcribed"
         elif "[图片占位符:" in body:
             kind = "图片(占位符)"
@@ -536,7 +536,7 @@ for log in stage_logs:
 
 STAGE_DISPLAY_NAMES = {
     "crown_prince": "太子",
-    "gemini_reference_analyzer": "参考帖子·Gemini",
+    "gemini_reference_analyzer": "参考帖子·SocialDataX",
     "gemini_trend_scout_pre": "趋势取样·SocialDataX",
     "gemini_trend_scout_post": "网感对标·SocialDataX",
     "secretariat": "中书省",
@@ -552,7 +552,7 @@ STAGE_DISPLAY_NAMES = {
     "ministry_works_builder": "工部·构建",
     "red_blue_refiner": "红蓝精炼",
     "persona_simulator": "画像模拟",
-    "ministry_works_structure_review": "结构审·Gemini",
+    "ministry_works_structure_review": "结构审·Kimi",
     "vibe_critic": "网感复检",
     "vibe_rewriter": "网感重写",
     "chancellery_final": "终审",
@@ -602,9 +602,9 @@ for ni_log in needs_input_logs:
             _MAX_IMAGE_BYTES = 2 * 1024 * 1024
             _MAX_TEXT_BYTES = 1 * 1024 * 1024
             if uploaded_files:
-                # 图片走 Gemini Vision 预转写,与 pages/2_new_project.py 一致。
+                # 图片走 Kimi Vision 预转写,与 pages/2_new_project.py 一致。
                 # 旧版 base64 占位符让下游 LLM 看不见图,人工补充等于白补。
-                from pipeline.agents.gemini_image_transcriber import (
+                from pipeline.agents.kimi_image_transcriber import (
                     transcribe_image_for_brief,
                 )
                 _ext_to_mime = {
@@ -644,7 +644,7 @@ for ni_log in needs_input_logs:
                 file_texts: list[str] = []
                 if _has_imgs:
                     with st.spinner(
-                        f"正在用 Gemini Vision 转写补充图片(每张 ~5-15s)..."
+                        f"正在用 Kimi Vision 转写补充图片(每张 ~5-15s)..."
                     ):
                         for f in uploaded_files:
                             file_texts.append(_process_one(f))
@@ -669,7 +669,7 @@ for ni_log in needs_input_logs:
 # ── Stuck detection + force-cancel ────────────────────────────────────────
 # When status=running but no stage_log has updated_at in the last
 # STUCK_THRESHOLD_SECONDS, the daemon thread is almost certainly wedged
-# in an external call (relay hang, network timeout, Gemini deadlock).
+# in an external call (relay hang, network timeout, assist-layer deadlock).
 # We can't kill Python threads from outside, so instead we let the user
 # force-reset the project state — new runs can then be triggered and
 # the zombie thread is just ignored (its future writes land on a run
@@ -677,7 +677,7 @@ for ni_log in needs_input_logs:
 # Liveness is now judged by the run's HEARTBEAT (ticks every ~10s
 # independent of stage progress), not by stage_log.updated_at. That fixes
 # the old false-positive where a healthy multi-minute stage (extended
-# thinking / big output / grounded Gemini) looked "stuck" and scared users
+# thinking / big output / 辅助层慢调用) looked "stuck" and scared users
 # into force-killing a run that was fine. Only a genuinely dead process
 # (killed thread) stops the beat — and the reaper collects those.
 STUCK_THRESHOLD_SECONDS = 300  # fallback only, for runs with no heartbeat
@@ -805,7 +805,7 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
             st.error(f"{stage_icon}\n{stage_label}")
         elif s == "skipped":
             # Skipped may be either (a) a resume that intentionally jumped
-            # over an already-completed stage, or (b) a Gemini advisory
+            # over an already-completed stage, or (b) an assist-layer advisory
             # stage that couldn't run (not configured / API error / parse
             # error). Surface the underlying _skip_reason when present so
             # the user can distinguish. Abbreviate it to fit the box.
@@ -890,7 +890,7 @@ with tabs[0]:
             }
             _status_labels = {
                 "extracted": "已提取文本",
-                "transcribed": "Gemini 已转写",
+                "transcribed": "Kimi 已转写",
                 "placeholder_only": "仅占位符(未转写)",
                 "legacy_base64": "老版 base64 残留",
                 "empty": "body 为空(提取失败?)",
@@ -1291,13 +1291,13 @@ with tabs[4]:
                             elif bl.get("status") == "failed":
                                 render_stage_error(bl)
 
-                # Gemini structure review (advisory, between builder and vibe).
+                # Kimi structure review (advisory, between builder and vibe).
                 # Surface the skip reason prominently when skipped — that's
-                # how the operator finds out "Gemini isn't actually running".
+                # how the operator finds out "结构审 isn't actually running".
                 sr_log = log_map.get("ministry_works_structure_review")
                 if sr_log:
                     st.divider()
-                    st.markdown("**Gemini 结构审**")
+                    st.markdown("**Kimi 结构审**")
                     render_stage_meta(sr_log)
                     sr_status = sr_log.get("status", "pending")
                     sr_out = sr_log.get("output_data") or {}
@@ -1305,7 +1305,7 @@ with tabs[4]:
                         reason = sr_out.get("_skip_reason", "unknown")
                         if "not_configured" in str(reason):
                             st.warning(
-                                f"跳过（Gemini 未配置）：`{reason}`\n\n"
+                                f"跳过（辅助层未配置）：`{reason}`\n\n"
                                 "检查 `.streamlit/secrets.toml` 的 "
                                 "`VERTEX_EXPRESS_API_KEY` 是否填了，"
                                 "以及 `pipeline/config.py` 的 "
@@ -1324,7 +1324,7 @@ with tabs[4]:
                             _raw = sr_out.get("_raw_text_preview", "")
                             st.error(
                                 f"输出非 JSON：`{reason}`\n\n"
-                                "Gemini 返回的内容没法解析成 JSON——"
+                                "结构审返回的内容没法解析成 JSON——"
                                 "可能被安全过滤，或 Google Search 工具接管了响应格式。"
                                 "下面是它实际返回的前 500 字，看看它到底说了什么："
                             )
@@ -1343,7 +1343,7 @@ with tabs[4]:
                         if verdict == "all_pass":
                             st.success(
                                 f"所有 cell 结构完整 · "
-                                f"Gemini 评审通过（{len(sr_out.get('cell_reviews', []))} 条）"
+                                f"结构审通过（{len(sr_out.get('cell_reviews', []))} 条）"
                             )
                         elif incomplete:
                             st.warning(
@@ -1461,7 +1461,7 @@ with tabs[5]:
             with st.expander("完整 output_data", expanded=False):
                 st.json(_mid_out)
 
-# Tab 6: Vibe (网感复检 + Gemini 仲裁 + 重写 + 结构重写)
+# Tab 6: Vibe (网感复检 + 二审仲裁 + 重写 + 结构重写)
 with tabs[6]:
     # Vibe critic
     _vc_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_critic"]
@@ -1499,22 +1499,22 @@ with tabs[6]:
                                 f"{_emoji} **{_cid}** — gut: {_gut} · {_gut_word} · severity: {_sev}"
                             )
 
-                    # Gemini arbitration results (if any)
+                    # 二审仲裁结果 (if any)
                     _ga = _vc_out.get("_gemini_arbitration") or {}
                     if _ga and _ga.get("verdict") != "skipped":
                         st.divider()
-                        st.markdown("**Gemini 二审（仲裁）**")
+                        st.markdown("**二审（仲裁 · DeepSeek）**")
                         _ga_failed = _ga.get("failed_cells") or []
                         _ga_verdict = _ga.get("verdict", "unknown")
                         _ga_usage = _ga.get("_gemini_usage") or {}
                         if _ga_verdict == "all_pass" or not _ga_failed:
                             st.success(
-                                "Gemini 也判全部通过——Claude 和 Gemini 意见一致。"
+                                "二审也判全部通过——主判和二审意见一致。"
                             )
                         else:
                             st.warning(
-                                f"Gemini 额外 flag 了 {len(_ga_failed)} 个 cell "
-                                f"（Claude 判 pass 但 Gemini 判 fail）："
+                                f"二审额外 flag 了 {len(_ga_failed)} 个 cell "
+                                f"（主判 pass 但二审 fail）："
                             )
                             for _gf in _ga_failed:
                                 _g_cid = _gf.get("cell_id", "?")
@@ -1522,12 +1522,12 @@ with tabs[6]:
                                 st.caption(f"**{_g_cid}**：{_g_dir[:200]}")
                         if _ga_usage:
                             st.caption(
-                                f"Gemini 费用：${_ga_usage.get('cost_usd', 0):.4f} · "
+                                f"二审费用：${_ga_usage.get('cost_usd', 0):.4f} · "
                                 f"tokens {_ga_usage.get('input_tokens', 0)}+{_ga_usage.get('output_tokens', 0)}"
                             )
                     elif _ga and _ga.get("verdict") == "skipped":
                         st.caption(
-                            f"Gemini 二审跳过：{_ga.get('_skip_reason', 'unknown')}"
+                            f"二审跳过：{_ga.get('_skip_reason', 'unknown')}"
                         )
 
                     with st.expander("完整 critic 输出", expanded=False):
@@ -1854,7 +1854,7 @@ if status not in ("running",):
                             # 非致命:拿不到也只是 post 残留不影响主流程
                             pass
 
-                    # Gemini pre 阶段依附 crown_prince,crown_prince 重跑时
+                    # 前置 advisory 阶段依附 crown_prince,crown_prince 重跑时
                     # 它们也要删(之前就有逻辑,保留)。
                     for _gs in ("gemini_trend_scout_pre", "gemini_reference_analyzer"):
                         if _gs in _stage_order and _idx <= _stage_order.index(_gs):

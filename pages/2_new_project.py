@@ -81,7 +81,7 @@ def extract_file_content(uploaded_file) -> str:
         # 新版:本地起一个 Gemini Vision 调用,把图转成 OCR + 视觉描述
         # + 关键数据 的结构化文字块。Gemini 没配置 / 失败 → 降级到带
         # 警告语的占位符(transcribe_image_for_brief 内部包了所有异常)。
-        from pipeline.agents.gemini_image_transcriber import (
+        from pipeline.agents.kimi_image_transcriber import (
             transcribe_image_for_brief,
         )
         # mime 简单从扩展名推断,够 Gemini API 用
@@ -365,7 +365,7 @@ with tab_new:
                     ):
                         try:
                             import asyncio
-                            from pipeline.agents.gemini_screenshot_analyzer import (
+                            from pipeline.agents.kimi_screenshot_analyzer import (
                                 analyze_screenshots,
                                 format_analysis_for_brief,
                             )

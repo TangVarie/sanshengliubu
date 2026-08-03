@@ -2,9 +2,37 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.31.0"
-VERSION_DATE = "2026-07-21"
+VERSION = "v0.32.0"
+VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.0 breaking: 全链路换厂 —— Claude / GPT / Gemini 三家全部退场,"
+    "改用 Kimi (Moonshot) + DeepSeek 两家。"
+    "(1) 主链路 24 个 stage:策略核心 4 个 (太子/中书省/终审/工部·架构) 走 "
+    "kimi-k3 (2.8T, 1M ctx);异厂家对抗的门下省/兵部走 deepseek-v4-flash;"
+    "其余全部 kimi-k2.6。persona_simulator_alt 从 deepseek-v4-pro 改 "
+    "deepseek-v4-flash 与主链路对齐。"
+    "(2) 新增 Moonshot anthropic-compat backend (api.moonshot.cn/anthropic),"
+    "按 `kimi-*` 前缀路由,复用 DeepSeek 那条 per-model 路由器;"
+    "secrets.toml 新增 MOONSHOT_API_KEY / MOONSHOT_BASE_URL。"
+    "(3) Gemini 辅助层整体下线:新增 pipeline/agents/kimi_client.py 接管"
+    "网感二审 / 结构审 / 识图 / 截图分析四个岗位 (K2.6 原生多模态);"
+    "参考帖抓取改走 SocialDataX detail (Gemini url_context 无对应物);优先 "
+    "by-URL 变体,失败退 by-ID。整条链去掉 LLM —— SocialDataX 返回的本来就是"
+    "第一方结构化数据,再让模型转述一遍只是徒增幻觉。google-genai 依赖移除。"
+    "(4) thinking 按厂家分流:kimi-* 走 {\"type\":\"adaptive\"} (Moonshot "
+    "anthropic 端点支持),deepseek-* 不发 thinking 字段 (端点静默忽略,"
+    "发了只是浪费);Claude 的 adaptive 判定保留供历史 preset 用。"
+    "(5) 无 Claude 中转也能启动:init_api_config 不再强制要求 "
+    "[claude_relay_presets.*],只要 Moonshot / DeepSeek 任一可用即可;"
+    "MODEL_FALLBACK_CHAIN 取代 CLAUDE_FALLBACK_CHAIN,且会跳过未配置 "
+    "backend 的候选,不再把 'key 没配' 误当成 'no channel' 一路降级。"
+    "(6) 成本表按官网实价更新 (kimi-k3 $3/$15, kimi-k2.6 $0.95/$4, "
+    "deepseek-v4-flash $0.14/$0.28);Claude/GPT/Gemini 旧条目保留,"
+    "仅供历史 run 的成本回显,不再有任何 stage 指向它们。"
+    "⚠️ 迁移须知见 README「换厂迁移」段:secrets.toml 要补 "
+    "MOONSHOT_API_KEY,VERTEX_EXPRESS_API_KEY / VECTORENGINE_API_KEY 可停用。"
+)
+_VERSION_NOTES_V031 = (
     "v0.31.0 feature+reliability: SocialDataX 直连 + 全链路卡死/低质量硬化。"
     "(1) #33 趋势取样从 Gemini 网搜切到 SocialDataX MCP 直连小红书(REQUIRED/"
     "fail-fast:取不到样提前终止,避免少关键素材导致产出差)。"
@@ -180,108 +208,97 @@ _VERSION_NOTES_LEGACY = (
 )
 
 # ── Model assignments per stage ────────────────────────────────────────────
-# All stages use the same Claude model family. Whether thinking is enabled
-# is controlled per-call via the standard Anthropic API
-# `thinking={"type":"enabled","budget_tokens":N}` parameter — see
-# THINKING_STAGES below + agents/__init__.py::_call_claude.
+# v0.32.0 起主链路只剩两家:Kimi (Moonshot) 和 DeepSeek。两家都提供
+# Anthropic-compatible 端点,所以整条调用链仍然走 anthropic SDK,
+# agents/__init__.py 按模型名前缀路由到各自 base_url:
 #
-# Why one model name in most presets: Anthropic native, modern relay
-# proxies, and Vertex all accept the standard JSON `thinking` parameter.
-# The old convention of using a `-thinking` suffix in the model name was
-# a relay-specific routing hack. Keeping a single model name also makes
-# prompt caching cache across thinking and non-thinking stages (same
-# system prompt + same model = same cache key).
+#   kimi-*      → https://api.moonshot.cn/anthropic   (MOONSHOT_API_KEY)
+#   deepseek-*  → https://api.deepseek.com/anthropic  (DEEPSEEK_API_KEY)
 #
+# thinking 的开关仍由 THINKING_STAGES 控制,但参数形态按厂家分流
+# (见 agents/__init__.py::_call_model):Kimi 收 {"type":"adaptive"},
+# DeepSeek 端点会静默忽略 thinking 字段所以干脆不发。
+#
+# ── 三档模型 ─────────────────────────────────────────────────────────
+# 价格来源:Moonshot / DeepSeek 官网 2026-08 公开价,单位 USD / 1M token。
+# 换算下来整条流水线比换厂前(Opus 4.7 $15/$75)便宜约一个数量级。
+
+# 旗舰档 — 2.8T MoE / 1M 上下文 / $3 in · $15 out。只给"错了下游全废"
+# 的决策上游用,不铺开。
+FLAGSHIP_MODEL = "kimi-k3"
+# 主力档 — 262K 上下文 / 原生多模态 / $0.95 in · $4 out。中文写作和网感
+# 判断是这一档的强项,所以内容生成、网感judge、画像创作全在这里。
+PRIMARY_MODEL = "kimi-k2.6"
+# 廉价异厂家档 — $0.14 in · $0.28 out。用途有两个:(1) 给辩论/对抗环节
+# 提供跟 Kimi 不同 distribution 的第二方视角;(2) 高频低难度的批量判断。
+CHEAP_MODEL = "deepseek-v4-flash"
+
+# ── 向后兼容别名 ────────────────────────────────────────────────────
+# v0.31 及之前这三个常量是 Claude 名字。外部脚本 / 历史 preset 可能还在
+# import 它们,保留别名指向新档位,避免 ImportError。语义已经不是
+# "Opus/Sonnet" 而是 "旗舰/主力/内容",新代码请直接用上面三个。
+OPUS_MODEL = FLAGSHIP_MODEL
+SONNET_MODEL = PRIMARY_MODEL
+SONNET_CONTENT_MODEL = PRIMARY_MODEL
+
 # ── MODEL_PRESET options ─────────────────────────────────────────────
-# Change this string to switch strategy/content model split without
-# editing MODELS directly:
-#
-#   "all_opus"      (default, current behavior) — every stage on Opus.
-#                   Deepest reasoning; most expensive; Opus has a slightly
-#                   more "精致/端正" voice that some reviewers call AI-toned.
-#
-#   "content_sonnet" — Strategy + review stages stay on Opus; content-
-#                   producing stages (works_builder, vibe_critic,
-#                   vibe_rewriter) switch to Sonnet 4.6. Rationale:
-#                   Sonnet's demo output tends to read more "松弛/人味",
-#                   and critic-style tasks benefit from a lighter tone.
-#                   Cheaper + faster on the content-heavy stages.
-#                   RECOMMENDED for experimentation if output still feels
-#                   AI-toned after vibe rewriter.
-#
-#   "all_sonnet"   — Everything on Sonnet. Cheapest, fastest, but
-#                   reasoning-heavy stages (secretariat, chancellery,
-#                   chancellery_final) may produce lower-quality plans.
-#                   Mostly useful for dev loops / cost-tight pilots.
-
-OPUS_MODEL = "claude-opus-4-7"
-# 用于 all_sonnet preset 以及 planning / 结构化任务(planning 阶段需要
-# Sonnet 4-6 的稳定 JSON 输出能力)。
-SONNET_MODEL = "claude-sonnet-4-6"
-# v0.30.12: Claude content 写作模型。老版本 Sonnet 3.7 已退出可用模型表
-# (当前 Claude 只剩 opus 4-6/4-7/4-8 + sonnet 4-6),所以 content 角色从
-# Sonnet 3.7 切到 Sonnet 4-6。继续保留独立常量,语义上"内容写作用更轻
-# 的模型",但当前指向和 SONNET_MODEL 等价。哪天 Sonnet 4-7 上线,只需要
-# 改这一行就能把所有 content stage 切过去。
-SONNET_CONTENT_MODEL = "claude-sonnet-4-6"
-
-# v0.30.0: 在代码层面直接锁定每个 stage 用哪个模型(高质量配置),用户
-# 不必再在 secrets.toml 里维护 model_overrides。可选 preset:
-#
-#   premium_multi_vendor(v0.30.0 默认,推荐) — 不限成本求最优组合,
-#     - 推理 / 长上下文 / 中文锐度都拉满 (Claude Opus 4-7 担纲)
-#     - 中书省 (Claude) vs 门下省 / 兵部 (GPT) 故意用不同厂家避免辩论同色彩
-#     - 内容生成走 Sonnet 4-6(v0.30.12 起;原 Sonnet 3.7 已退役)
-#     - persona_simulator_alt 用 DeepSeek 提供异厂家画像视角
-#     - 需要 secrets.toml 同时配 Claude 中转 + VECTORENGINE_API_KEY(GPT) +
-#       (可选)DEEPSEEK_API_KEY
-#
-#   content_sonnet(v0.29.x 历史默认) — 保留兼容
-#   all_opus / all_sonnet — 单档全跑,降级方案
-MODEL_PRESET = "premium_multi_vendor"
+#   "kimi_deepseek"(v0.32.0 默认,推荐)— 按 KIMI_DEEPSEEK_MAP 逐 stage
+#       精确分配。策略核心 K3、对抗环节 DeepSeek、其余 K2.6。
+#   "all_primary"  — 全部 kimi-k2.6。最省事,策略深度会掉一档,适合
+#       跑通验证 / 成本敏感的试点。
+#   "all_flagship" — 全部 kimi-k3。最贵最深,适合单次高价值交付。
+#   "premium_multi_vendor" / "content_sonnet" / "all_opus" / "all_sonnet"
+#       — v0.31 及之前的旧名,保留兼容:前者等价 kimi_deepseek,
+#         后三者等价 all_primary(它们原本的 Opus/Sonnet 语义已不存在)。
+MODEL_PRESET = "kimi_deepseek"
 
 # 各阶段精确模型映射 — 写在代码里防止 secrets.toml 误覆盖。
-# Claude stage 用当前可用的 4 款 (opus 4-6/4-7/4-8 + sonnet 4-6);
-# 非 Claude backend (GPT via vectorengine / DeepSeek) 保留原配置不受影响。
-# v0.30.12: Claude 侧的 -thinking 后缀和 Sonnet 3.7 全部退役;thinking
-# 行为由 agents/__init__.py 里 adaptive thinking JSON 参数控制 (Opus 4.6+
-# 自带),不再走模型名后缀路径。
-PREMIUM_MULTI_VENDOR_MAP: dict[str, str] = {
-    # ── 策略 / 推理核心(深推理,Opus 4.7)──
-    # v0.30.2: 不带 -thinking 后缀,tdyun 上 -thinking 没定价。Opus 4.7
-    # base 自带内部 reasoning。
-    "crown_prince": "claude-opus-4-7",                    # 太子(整理 + 索引)
-    "secretariat": "claude-opus-4-7",                     # 中书省(策略发言)
-    "chancellery_final": "claude-opus-4-7",               # 终审(holistic 把关)
-    "ministry_works": "claude-opus-4-7",                  # 工部架构(整脊柱)
-    # ── 异厂家辩论(Claude vs GPT)──
-    # 用 GPT 提供和 Claude 不同 distribution 的异色彩对抗,比同厂家
-    # 自言自语更能挑出问题。GPT 走 vectorengine OpenAI-compat 后端。
-    "chancellery": "gpt-5.5",                             # 门下省(critic)
-    "ministry_war": "gpt-5.5",                            # 兵部(刁钻竞争)
-    # ── 结构化派发 / 五部 — Opus 4.6 稳态 ──
-    "dispatcher": "claude-opus-4-6",
-    "ministry_revenue": "claude-opus-4-6",
-    "ministry_rites": "claude-opus-4-6",
-    "ministry_justice": "claude-opus-4-6",                # 合规要严(v0.30.12: -thinking 后缀去掉,用户表只有 base)
-    "ministry_works_cell_planner": "claude-opus-4-6",
-    # ── 创意 / 内容相关阶段:判断走 Opus 4.6,纯写作走 Sonnet 4.6 ──
-    # 历史上写作用 Sonnet 3.7 (网感强),v0.30.12 起模型表里没了,统一切 4.6。
-    "ministry_personnel": "claude-opus-4-6",              # 画像创作(创意)
-    "narrative_director": "claude-opus-4-6",              # 跨 cell 一致性诊断(创意判断)
-    "vibe_critic": "claude-opus-4-6",                     # 网感复检(judge)
-    "structural_rewriter": "claude-opus-4-6",             # 身份/缺口手术(content 重写)
-    "ministry_works_builder": "claude-sonnet-4-6",        # 内容写作(v0.30.12: 原 Sonnet 3.7)
-    "vibe_rewriter": "claude-sonnet-4-6",                 # 内容重写(v0.30.12: 原 Sonnet 3.7)
-    # ── 红蓝精炼真对抗:Red (Opus 4.6) vs Blue (Sonnet 4.6) ──
-    # 异 distribution: Opus 找 AI 腔指纹和结构问题,Sonnet 接力最小修复
-    "red_blue_refiner": "claude-sonnet-4-6",              # legacy 兼容,实际不用
-    "red_blue_red": "claude-opus-4-6",                    # 攻方
-    "red_blue_blue": "claude-sonnet-4-6",                 # 守方(v0.30.12: 原 Sonnet 3.7)
-    # ── 画像模拟双 backend(v0.30.8):主 Claude + alt DeepSeek 异厂家 ──
-    "persona_simulator": "claude-sonnet-4-6",             # 主路径(v0.30.12: 原 Sonnet 3.7)
-    "persona_simulator_alt": "deepseek-v4-pro",           # DeepSeek 异厂家
+KIMI_DEEPSEEK_MAP: dict[str, str] = {
+    # ── 策略核心 4 个:kimi-k3 ────────────────────────────────────────
+    # 判定标准是"这一步错了,下游全部作废":太子丢素材 → 所有人看不到原始
+    # 信号;中书省定错方向 → 六部全在错方向上精耕;工部架构错 → 每个 cell
+    # 都长歪;终审放行 → 直接出货给客户。只有这 4 个值 3 倍单价。
+    "crown_prince": FLAGSHIP_MODEL,                # 太子(整理 + 索引)
+    "secretariat": FLAGSHIP_MODEL,                 # 中书省(策略发言)
+    "ministry_works": FLAGSHIP_MODEL,              # 工部架构(整脊柱)
+    "chancellery_final": FLAGSHIP_MODEL,           # 终审(holistic 把关)
+    # ── 异厂家对抗:deepseek-v4-flash ─────────────────────────────────
+    # 换厂前这两个跑 gpt-5.5,目的是"别让辩论双方同色彩自言自语"。现在
+    # 中书省(Kimi)↔ 门下省(DeepSeek)仍然是跨厂家,对抗性保留;兵部的
+    # 刁钻竞争视角同理。顺带 OpenAI 依赖整条去掉。
+    "chancellery": CHEAP_MODEL,                    # 门下省(critic)
+    "ministry_war": CHEAP_MODEL,                   # 兵部(刁钻竞争)
+    # ── 结构化派发 / 五部:kimi-k2.6 ──────────────────────────────────
+    "dispatcher": PRIMARY_MODEL,
+    "ministry_revenue": PRIMARY_MODEL,
+    "ministry_rites": PRIMARY_MODEL,
+    "ministry_justice": PRIMARY_MODEL,             # 合规审(带 thinking,见 THINKING_STAGES)
+    "ministry_works_cell_planner": PRIMARY_MODEL,
+    # ── 创意 / 内容:kimi-k2.6 ────────────────────────────────────────
+    # K2.6 的中文写作和"人味"是选它的主要理由,内容侧不降档。
+    "ministry_personnel": PRIMARY_MODEL,           # 画像创作(创意)
+    "narrative_director": PRIMARY_MODEL,           # 跨 cell 一致性诊断
+    "vibe_critic": PRIMARY_MODEL,                  # 网感复检(judge)
+    "structural_rewriter": PRIMARY_MODEL,          # 身份/缺口手术
+    "ministry_works_builder": PRIMARY_MODEL,       # 内容写作
+    "vibe_rewriter": PRIMARY_MODEL,                # 内容重写
+    # ── 红蓝精炼:攻方 Kimi vs 守方 DeepSeek ──────────────────────────
+    # 换厂前是 Opus(攻) vs Sonnet(守),同厂异档。现在直接做成跨厂:
+    # 攻方 K2.6 找 AI 腔指纹,守方 DeepSeek 接力做最小修复,两个
+    # distribution 差异比同厂异档更大,红队更不容易"自己放过自己"。
+    "red_blue_red": PRIMARY_MODEL,                 # 攻方
+    "red_blue_blue": CHEAP_MODEL,                  # 守方
+    "red_blue_refiner": PRIMARY_MODEL,             # legacy 兼容,实际不用
+    # ── 画像模拟双 backend:主 Kimi + alt DeepSeek ────────────────────
+    # v0.30.8 起就是双跑合并 personas[]。alt 从 deepseek-v4-pro 降到
+    # v4-flash,和主链路其它 DeepSeek 用量对齐(画像模拟是高频批量判断,
+    # 不需要 pro 档;异厂家视角来自"是 DeepSeek"而不是"是 pro")。
+    "persona_simulator": PRIMARY_MODEL,            # 主路径
+    "persona_simulator_alt": CHEAP_MODEL,          # DeepSeek 异厂家
 }
+
+# v0.31 及之前的名字,保留供外部 import。
+PREMIUM_MULTI_VENDOR_MAP = KIMI_DEEPSEEK_MAP
 
 _STAGE_ROLES = {
     # Strategy / review: needs reasoning depth
@@ -305,82 +322,68 @@ _STAGE_ROLES = {
     "red_blue_refiner": "content",     # legacy(v0.30.9 拆分后基本不用)
     "red_blue_red": "content",          # v0.30.9: 红蓝攻方
     "red_blue_blue": "content",         # v0.30.9: 红蓝守方
-    "persona_simulator": "content",    # simulates real humans (Claude 系)
+    "persona_simulator": "content",    # simulates real humans (Kimi 系)
     "persona_simulator_alt": "content",  # v0.30.8: DeepSeek 异厂家画像
     "vibe_critic": "content",
     "vibe_rewriter": "content",
-    # v0.29.0: 叙事结构重写者 — 和 vibe_rewriter 同角色(内容写作),
-    # 走 content 池(Sonnet 3.7 网感)。
+    # v0.29.0: 叙事结构重写者 — 和 vibe_rewriter 同角色(内容写作)。
     "structural_rewriter": "content",
 }
+# ⚠️ v0.32.0 起 role 标签不再参与默认 preset 的模型选择(kimi_deepseek 逐
+# stage 精确指定)。这个 dict 现在的作用是:(1) 定义"合法 stage 名"的全集,
+# MODELS 的 key 从这里来;(2) all_primary / all_flagship 单档 preset 的遍历
+# 依据。新增 stage 时仍然要在这里登记,否则 MODELS 里没有它、BaseAgent 会
+# 落到构造函数的兜底模型。
 
 
 def _resolve_models(preset: str) -> dict[str, str]:
     """Assemble the MODELS dict from role tags + preset. Returning a dict
     keeps consumers (logging, cost accounting, settings UI) unchanged.
 
-    角色 → 模型映射(按 preset):
+    kimi_deepseek(v0.32.0 默认):
+      每个 stage 直接从 KIMI_DEEPSEEK_MAP 取。没在 map 里的 stage(罕见,
+      通常是新增 stage 还没补)fallback 到 PRIMARY_MODEL —— 既保证能跑,
+      也不会因为漏配就悄悄用上最贵的旗舰档。
 
-    content_sonnet(默认):
-      - content 角色(builder / vibe_critic / vibe_rewriter / red_blue /
-        persona_simulator) → SONNET_CONTENT_MODEL(默认 Sonnet 3.7,写作
-        人味最重)
-      - 其他所有角色(strategy + planning + cross-cell coherence) →
-        OPUS_MODEL(默认 Opus 4.7,深推理)
+    all_primary / all_flagship:
+      全链路单档,分别是 kimi-k2.6 / kimi-k3。
 
-    all_sonnet:
-      - content 角色 → SONNET_CONTENT_MODEL(Sonnet 3.7)
-      - 其他角色 → SONNET_MODEL(Sonnet 4.6,稳定 JSON 输出)
-
-    all_opus:
-      - 全部 → OPUS_MODEL
-
-    注:planning 角色(尚书省 / 六部 / 格子规划)在 content_sonnet 下用 Opus
-    (不是 Sonnet),因为 "Structured planning: Opus preferred for stability"
-    ——结构化派发需要稳定的指令理解,降到 Sonnet 会偶尔漏字段。如果要
-    planning 走 Sonnet 省钱,改用 all_sonnet preset。
+    旧 preset 名(premium_multi_vendor / content_sonnet / all_opus /
+    all_sonnet)在 v0.32.0 换厂后已无对应语义,映射到最接近的新档位。
     """
-    if preset == "all_sonnet":
-        # 全 Sonnet 模式:content 用 3.7 保网感,其他用 4.6 保结构
+    if preset in ("kimi_deepseek", "premium_multi_vendor"):
         return {
-            k: (SONNET_CONTENT_MODEL if role == "content" else SONNET_MODEL)
-            for k, role in _STAGE_ROLES.items()
-        }
-    if preset == "content_sonnet":
-        return {
-            k: (SONNET_CONTENT_MODEL if role == "content" else OPUS_MODEL)
-            for k, role in _STAGE_ROLES.items()
-        }
-    if preset == "premium_multi_vendor":
-        # v0.30.0:每个 stage 都从 PREMIUM_MULTI_VENDOR_MAP 直接拿模型名;
-        # 没在 map 里的 stage(罕见,通常是新增的 stage 还没补)fallback 到
-        # OPUS_MODEL,既保证能跑也提示要补。
-        return {
-            k: PREMIUM_MULTI_VENDOR_MAP.get(k, OPUS_MODEL)
+            k: KIMI_DEEPSEEK_MAP.get(k, PRIMARY_MODEL)
             for k in _STAGE_ROLES
         }
-    # Default / fallback: all_opus
-    return {k: OPUS_MODEL for k in _STAGE_ROLES}
+    if preset == "all_flagship":
+        return {k: FLAGSHIP_MODEL for k in _STAGE_ROLES}
+    # all_primary + 所有旧的 Claude 档位名 → 全 K2.6
+    return {k: PRIMARY_MODEL for k in _STAGE_ROLES}
 
 
 MODELS: dict[str, str] = _resolve_models(MODEL_PRESET)
 
-# ── Claude model fallback chain (无可用渠道时的保底) ───────────────────────
-# 中转站偶尔对某个模型返回 "No available channel for model xxx"(该模型当前
-# 没有可用上游渠道)。这不是模型本身的问题,换一个 Claude 模型通常就能跑。
-# _call_claude 检测到这类错误时,按下面顺序降级到下一个 Claude 模型继续,
-# 避免整个 stage 直接失败。
+# ── Model fallback chain (无可用渠道时的保底) ─────────────────────────────
+# 中转 / 厂商偶尔对某个模型返回 "No available channel for model xxx"(该模型
+# 当前没有可用上游渠道),或短暂下线。这不是模型本身的问题,换一个模型通常
+# 就能跑。_call_model 检测到这类错误时按下面顺序降级,避免整个 stage 失败。
 #
-# 顺序是经验值(质量 + 渠道可用概率):主力 4-7 → 次新 4-8 → 稳态 4-6 →
-# 轻量保底 sonnet-4-6。stage 实际配的 primary 模型会自动排在第一位,这里
-# 只定义"它失败后依次尝试谁"。只对 Claude 生效;GPT / DeepSeek 不走这条链
-# (它们各自后端没有"渠道"概念,也没有等价的备选池)。
-CLAUDE_FALLBACK_CHAIN: list[str] = [
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
+# 顺序是"能跑通的概率 × 质量"的折中:主力 K2.6 → 旗舰 K3 → 跨厂家保底
+# DeepSeek。最后一档故意跨到另一家:Moonshot 整体故障时,DeepSeek 仍能让
+# 流水线以降级质量跑完,而不是整条 run 挂掉。
+#
+# ⚠️ 降级会跨厂家,所以 agents/__init__.py 里的 fallback 循环必须跳过
+# 「backend 没配 key」的候选 —— 否则 "DEEPSEEK_API_KEY 没配" 这种配置错误
+# 会被当成 no-channel,在链上一路重试后报一个和真实原因无关的错。
+MODEL_FALLBACK_CHAIN: list[str] = [
+    PRIMARY_MODEL,
+    FLAGSHIP_MODEL,
+    CHEAP_MODEL,
 ]
+
+# v0.31 及之前的名字,保留供外部 import。
+CLAUDE_FALLBACK_CHAIN = MODEL_FALLBACK_CHAIN
 
 # ── Retry & timeout ────────────────────────────────────────────────────────
 
@@ -489,6 +492,13 @@ CELL_PLANNER_CONCURRENCY = 5    # parallel cell-planner calls
 # adaptive thinking JSON 参数,保证合规审查仍有深推理(安全/法务把关不能
 # 悄悄变弱)。
 
+# ⚠️ v0.32.0: chancellery(门下省)留在这个集合里,但它现在跑 deepseek-v4-flash,
+# 而 DeepSeek 的 anthropic-compat 端点不认 thinking 参数 —— 所以它【实际上没有】
+# extended thinking,stage_log 会如实显示 thinking ✗。
+# 这是明知的取舍:门下省的价值主要来自"跟中书省不同厂家、不同 distribution"的
+# 对抗性,而不是推理深度;深推理那一侧由中书省的 kimi-k3 承担。哪天想换回来,
+# 把 KIMI_DEEPSEEK_MAP["chancellery"] 改成 PRIMARY_MODEL/FLAGSHIP_MODEL 即可,
+# thinking 会自动恢复(_call_model 按厂家判断,不需要动这个集合)。
 THINKING_STAGES: frozenset[str] = frozenset({
     "crown_prince",
     "secretariat",
@@ -511,10 +521,14 @@ THINKING_BUDGET_TOKENS = 10000  # for relay mode (budget_tokens)
 #   2. Concurrency cap (peak): at most CLAUDE_MAX_CONCURRENT calls in
 #                              flight at the same instant.
 #
-# Tune these to your backend's published limits. Defaults are calibrated
-# for a typical paid relay quota (15 RPM / 16 concurrent — actually
-# observed on a real account). Set CLAUDE_RPM_LIMIT to 0 to disable the
-# rate cap entirely (e.g. on Vertex with high project quota).
+# Tune these to your backend's published limits. Set CLAUDE_RPM_LIMIT to 0
+# to disable the rate cap entirely.
+#
+# ⚠️ v0.32.0: 常量名里的 CLAUDE_ 是历史包袱(改名要动限流器 + 设置页 +
+# 多处 preset 字段,收益不抵风险)。它管的是【主链路上游】的速率,现在指
+# Moonshot / DeepSeek。两家的实际配额跟原来的 Claude 中转不是一回事,
+# 15 RPM 这个 floor 多半偏保守 —— 下面的自适应安全阀会从 CEILING 起跑,
+# 撞到 429 才回落,所以不用急着手调;真嫌慢就抬 CLAUDE_RPM_CEILING。
 #
 # Vertex AI mode bypasses this limiter entirely — Vertex enforces quota
 # server-side and returns 429 we'd just retry into. See
@@ -548,8 +562,10 @@ CLAUDE_RPM_RECOVERY_STEP = 3
 # Safety net against runaway retry loops — 14 stages × worst-case retries
 # × thinking budgets can compound quickly without a cap.
 #
-# Opus at $15/M input + $75/M output → 1M tokens ≈ $45 ceiling per run
-# (assuming roughly balanced in/out). Tune to your cost tolerance.
+# v0.32.0 换厂后同样的 2M token 上限便宜了一个数量级:kimi-k2.6
+# ($0.95/M in + $4/M out) 下 2M token ≈ $5/run;即使全跑 kimi-k3
+# ($3/$15) 也就 ≈ $18(换厂前 Opus 4.7 是 ≈ $90)。上限保持 2M 不动 ——
+# 它的作用是"挡住重试风暴/死循环",不是控成本档位,按 token 计更稳。
 MAX_TOKENS_PER_RUN = 2_000_000
 
 # ── Liveness: heartbeat + stale-run reaper ───────────────────────────────
@@ -567,76 +583,57 @@ PIPELINE_HEARTBEAT_INTERVAL_SECONDS = 10
 # beats = dead), but small enough that zombies clear quickly.
 RUN_STALE_SECONDS = 75
 
-# ── Gemini auxiliary assist (second-opinion critic + structure reviewer) ──
-# Independent of the primary Claude backend. When configured, Gemini:
-#   1. Re-evaluates cells Claude's vibe_critic passed (B: 分歧仲裁).
-#      If Gemini says fail, the cell is sent back to vibe_rewriter.
-#      Use case: catch AI-tone outputs Claude's critic gives face-saving
-#      borderline → pass scores to.
-#   2. Audits structure completeness of every built prompt_cell (5 pools,
-#      persona integration, compliance block, keyword list). Output is
-#      appended to _revision_directives as advisory notes.
+# ── Kimi auxiliary assist (二审 / 结构审 / 视觉) ────────────────────────────
+# v0.32.0: 这一层原本是 Gemini(google-genai + Vertex Express key),现在整体
+# 迁到 Kimi。它跟主链路共用 Moonshot 的 key 和端点,但走一条独立的轻量调用
+# 路径(pipeline/agents/kimi_client.py):不进 stage_log 的重试/预算体系、
+# 不参与 run 级 token 熔断、失败一律降级不阻塞。
 #
-# Failure mode: advisory-only. Gemini call errors log a warning and the
-# pipeline proceeds with Claude-only verdicts. Never blocks a run.
+# 四个岗位:
+#   1. critic — 网感二审(分歧仲裁)。主链路 vibe_critic 判 pass 的 cell 再
+#      过一遍;这里判 fail 就打回 vibe_rewriter。存在意义是抓"主 critic 给
+#      面子分"的 AI 腔产出。
+#   2. structure_reviewer — 结构审。审查每个 prompt_cell 的完整性(5 个池 /
+#      画像嵌入 / 合规块 / 关键词表),输出作为 advisory 追加到
+#      _revision_directives。
+#   3. image_transcriber — 图片预转写。用户上传的图转成文字进 brief。
+#   4. screenshot_analyzer — 截图分析(小红书截图等)。
 #
-# Auth: Vertex Express API key (the `?key=${API_KEY}` variant — see
-# https://cloud.google.com/vertex-ai/docs/general/vertex-express).
-# Secrets.toml field: VERTEX_EXPRESS_API_KEY.
-ENABLE_GEMINI_ASSIST = True
+# 为什么二审仍然值得跑(同厂家了还审个什么?):二审的价值主要来自"换一次
+# 独立采样 + 换一套 prompt 视角",而不只是换厂家。不过跨厂家确实更强,所以
+# 默认把 critic 岗位钉在 DeepSeek(见 KIMI_ASSIST_MODEL_OVERRIDES),
+# 保留跨厂家仲裁;其余三个纯感知/清单任务走 Kimi。
+#
+# Failure mode: advisory-only,调用出错只记 warning,流水线照常走完。
+#
+# Auth: MOONSHOT_API_KEY(主链路同一个 key)。DeepSeek 岗位用 DEEPSEEK_API_KEY。
+ENABLE_KIMI_ASSIST = True
 
-# Model identifier. Must be in your Vertex Express account's accessible
-# model list — use the "📋 列出可用 Gemini 模型" button on the Settings
-# page to see exactly what your key can call.
-#
-# NOTE: Google uses DOTS for decimal version numbers (gemini-2.5-pro,
-# gemini-3.1-pro-preview), not dashes. `gemini-3-1-...` is wrong.
-#
-# Common picks:
-#   - gemini-3.5-flash              (released 2026-05; agentic/multimodal lead, cheaper)
-#   - gemini-3.1-pro-preview        (best on dense reasoning + long-context recall)
-#   - gemini-3.1-pro-preview-customtools  (same + tool-use features)
-#   - gemini-3-pro-preview          (earlier Gemini 3 Pro preview)
-#   - gemini-2.5-pro                (stable, widely available)
-#   - gemini-2.5-flash              (cheap legacy)
-#
-# This is the GLOBAL DEFAULT — applies to any role not listed in
-# GEMINI_MODEL_OVERRIDES below.
-GEMINI_MODEL = "gemini-3.1-pro-preview"
+# 全局默认 — 任何没在 KIMI_ASSIST_MODEL_OVERRIDES 里钉死的岗位用这个。
+KIMI_ASSIST_MODEL = PRIMARY_MODEL
 
-# Per-role model override. Each Gemini-driven agent looks itself up here
-# (via resolve_gemini_model() in gemini_client.py); if absent, falls back
-# to GEMINI_MODEL above.
+# 按岗位钉模型。kimi_client.resolve_assist_model(role) 先查这里,查不到用
+# KIMI_ASSIST_MODEL。
 #
-# Why per-role:
-#   Gemini 3.5 Flash (2026-05) leads 3.1 Pro on agentic / coding / multi-
-#   modal benchmarks, AND is ~40% cheaper. But Flash gives up ground on
-#   academic reasoning and dense long-context recall. So the "best" model
-#   genuinely depends on the role:
-#
-#   - Vision (image_transcriber, screenshot_analyzer):
-#       Flash wins outright on multimodal understanding → Flash.
-#   - Structural checklist (structure_reviewer):
-#       Agentic-style task, Flash wins on agentic benchmarks → Flash.
-#   - (trend_scout used to live here; it migrated off Gemini to
-#     SocialDataX first-party data and no longer resolves a Gemini model.)
-#   - Long-content URL reading (reference_analyzer):
-#       Posts can be long, dense recall matters → keep Pro.
-#   - "网感" / "烟火气" critic (critic):
-#       Nuanced judgment on AI-tone. Flash may flag more aggressively or
-#       miss subtle borderline cases. Jury still out — kept on Pro for
-#       now. Flip to Flash to A/B test; the critic's verdict change rate
-#       is the signal you're looking for.
-#
-# To override globally for ALL roles, leave this empty {} and just edit
-# GEMINI_MODEL above. To pin one role to a specific model, add it here.
-GEMINI_MODEL_OVERRIDES: dict[str, str] = {
-    "image_transcriber":   "gemini-3.5-flash",
-    "screenshot_analyzer": "gemini-3.5-flash",
-    "structure_reviewer":  "gemini-3.5-flash",
-    "reference_analyzer":  "gemini-3.1-pro-preview",
-    "critic":              "gemini-3.1-pro-preview",
+#   - critic:            钉 DeepSeek,保住"二审跟主判不同厂家"这条性质。
+#                        主链路 vibe_critic 是 kimi-k2.6,二审用同一个模型
+#                        等于自己复核自己,分歧仲裁就没意义了。
+#   - structure_reviewer: 纯清单核对,K2.6 足够,也不需要跨厂家。
+#   - image_transcriber / screenshot_analyzer: 必须多模态 → K2.6
+#                        (DeepSeek 这两档没有视觉输入,不能钉过去)。
+KIMI_ASSIST_MODEL_OVERRIDES: dict[str, str] = {
+    "critic":              CHEAP_MODEL,
+    "structure_reviewer":  PRIMARY_MODEL,
+    "image_transcriber":   PRIMARY_MODEL,
+    "screenshot_analyzer": PRIMARY_MODEL,
 }
+
+# ── 向后兼容别名 ────────────────────────────────────────────────────
+# v0.31 的 Gemini 常量名。留着是为了让任何还没改到的 import 不炸,值已经
+# 指向 Kimi。新代码请用上面的 KIMI_* 名字。
+ENABLE_GEMINI_ASSIST = ENABLE_KIMI_ASSIST
+GEMINI_MODEL = KIMI_ASSIST_MODEL
+GEMINI_MODEL_OVERRIDES = KIMI_ASSIST_MODEL_OVERRIDES
 
 # ── SocialDataX trend scout ────────────────────────────────────────────────
 # The trend scout pulls real current 小红书 posts as calibration samples for
@@ -707,38 +704,69 @@ SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED = True
 # How many posts to keep per invocation (ranked by real engagement).
 SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10
 
-# Max output tokens per Gemini call. 16K handles 6-cell structure
-# reviews without truncation. Grounding calls auto-bump to 24K (see
-# gemini_client.py). Gemini 3.x supports up to 64K output, but 16K
-# is a good default ceiling — our critic/reviewer/scout outputs are
-# typically 2-8K so the model will stop early anyway.
-GEMINI_MAX_OUTPUT_TOKENS = 16384
-
-# Rough per-1M-token prices (USD) for cost accounting. Fallback used by
-# _estimate_cost_usd when the running model isn't in GEMINI_PRICE_TABLE
-# below. Intentionally on the high side so reported cost errs toward
-# "expensive" rather than "surprise bill".
-GEMINI_COST_PER_1M_INPUT = 1.25
-GEMINI_COST_PER_1M_OUTPUT = 10.0
-
-# Per-model price table. Keys must match the model IDs used in
-# GEMINI_MODEL / GEMINI_MODEL_OVERRIDES. Add new entries when you switch
-# to a new model — otherwise the fallback rates above kick in and cost
-# accounting drifts.
+# ── 参考帖抓取(用户在第 2 页粘贴的帖子 URL)────────────────────────────
+# v0.32.0: 这个岗位原本靠 Gemini 的 url_context 工具去抓用户贴的小红书链接。
+# Kimi 没有等价的"模型自己去取 URL"能力,所以改走 SocialDataX:从 URL 里
+# 解析出 note_id,调 detail 工具拿第一方结构化正文,再交给 Kimi 做分析。
+# 副作用是比 Gemini 那条路更好 —— url_context 面对 JS 渲染 / 登录墙的小红书
+# 经常只拿到 og:title,SocialDataX 拿的是真正文 + 真互动量。
 #
-# Sources (verify before billing-critical decisions):
-#   - gemini-3.5-flash:        $1.50 / $9.00 per 1M (Google I/O 2026)
-#   - gemini-3.1-pro-preview:  $2.50 / $15.00 per 1M
-#   - gemini-2.5-pro:          $1.25 / $10.00 per 1M
-#   - gemini-2.5-flash:        $0.075 / $0.30 per 1M
-GEMINI_PRICE_TABLE: dict[str, dict[str, float]] = {
-    "gemini-3.5-flash":             {"input": 1.50,  "output": 9.00},
-    "gemini-3.1-pro-preview":       {"input": 2.50,  "output": 15.00},
-    "gemini-3.1-pro-preview-customtools": {"input": 2.50, "output": 15.00},
-    "gemini-3-pro-preview":         {"input": 2.50,  "output": 15.00},
-    "gemini-2.5-pro":               {"input": 1.25,  "output": 10.00},
-    "gemini-2.5-flash":             {"input": 0.075, "output": 0.30},
+# 工具名已按实际调用返回体里的 `tool` 字段核实(XHS 直接验过
+# xhs_get_note_detail_by_note_id;其余平台同一套命名规律)。
+#
+# 每个平台都有 by-ID 和 by-URL 两个变体。**默认走 by-URL**:
+#   - 我们手上本来就是用户粘贴的完整 URL,不需要先解析 ID
+#   - 小红书链接里的 xsec_token 是访问凭证,留在 URL 里整条传过去最稳,
+#     手工拆出来再拼回参数只是给自己找 bug
+# by-ID 是兜底:by-URL 调不通(短链、URL 变形)时,从 path 里抠出 ID 再试一次。
+#
+# 值的形状:(工具名, 参数名)。参数名跟工具名 `_by_` 后面那截一致 ——
+# 这是 SocialDataX 自己的命名规律,不是巧合,但仍然显式写出来,免得哪天
+# 对不上时只能靠猜。
+#
+# MCP 工具名和 CLI 是同一套接口:
+#   npx -y socialdatax-skills@latest xhs detail --url <url>
+#   npx -y socialdatax-skills@latest xhs detail --note-id <id>
+# CLI 内部就是转发到下面这些工具。
+#
+# 名字万一对不上也不会炸:该 stage 是 advisory-only,工具不存在时 MCP 报错
+# → 该条 URL 记 not_accessible,其余照常,流水线不受影响。
+SOCIALDATAX_NOTE_DETAIL_TOOLS: dict[str, dict[str, tuple[str, str]]] = {
+    "xhs": {
+        "by_url": ("xhs_get_note_detail_by_note_url", "note_url"),
+        "by_id": ("xhs_get_note_detail_by_note_id", "note_id"),
+    },
+    "douyin": {
+        "by_url": ("douyin_get_video_detail_by_url", "url"),
+        "by_id": ("douyin_get_video_detail_by_aweme_id", "aweme_id"),
+    },
+    "kuaishou": {
+        "by_url": ("kuaishou_get_video_detail_by_url", "url"),
+        "by_id": ("kuaishou_get_video_detail_by_photo_id", "photo_id"),
+    },
+    "weibo": {
+        "by_url": ("weibo_get_post_detail_by_post_url", "post_url"),
+        "by_id": ("weibo_get_post_detail_by_post_id", "post_id"),
+    },
+    "wechat": {
+        "by_url": ("wechat_get_video_detail_by_url", "url"),
+        "by_id": (
+            "wechat_get_video_detail_by_encrypted_object_id",
+            "encrypted_object_id",
+        ),
+    },
 }
+
+# 单次参考帖分析最多抓几条,防止用户粘 50 个链接把 run 拖死 + 烧配额。
+REFERENCE_ANALYZER_MAX_URLS = 10
+
+# Max output tokens per assist call. 16K handles 6-cell structure reviews
+# without truncation. K2.6 supports far more, but our critic/reviewer/vision
+# outputs are typically 2-8K so the model stops early anyway.
+KIMI_ASSIST_MAX_OUTPUT_TOKENS = 16384
+
+# 兼容别名(v0.31 名字)。
+GEMINI_MAX_OUTPUT_TOKENS = KIMI_ASSIST_MAX_OUTPUT_TOKENS
 
 
 # ── Prompt Caching ────────────────────────────────────────────────────────
@@ -756,31 +784,43 @@ ENABLE_PROMPT_CACHING = True
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
+# v0.32.0: 当前在用的三款按厂商官网 2026-08 公开价填。走中转的话实际单价
+# 以中转账单为准;这张表只影响成本展示,不影响 token 熔断。
+#
+# 官网价 (USD / 1M token, cache-miss input):
+#   kimi-k3            $3.00 in · $15.00 out   (cache hit $0.30)
+#   kimi-k2.6          $0.95 in · $4.00  out   (cache hit $0.16)
+#   deepseek-v4-flash  $0.14 in · $0.28  out   (cache hit $0.0028)
+#
+# ⚠️ 缓存命中价没进这张表 —— _estimate_call_cost_usd 对 cache_read token
+# 另有折算逻辑(见 agents/__init__.py)。三款模型的 cache 折扣都很猛
+# (K2.6 省 83%,v4-flash 省 98%),所以 ENABLE_PROMPT_CACHING 别关。
 COST_PER_1M_INPUT: dict[str, float] = {
-    # v0.30.12: 只列当前可用的 4 款 Claude。Opus 三代同 tier ($15/$75 in/out),
-    # Sonnet 4-6 是轻量 tier ($3/$15)。老条目 (opus-4-1 / sonnet-3-7) 删除,
-    # 它们在 MODELS 映射里已无引用;如果有历史 run 在 DB 里引用,
-    # _estimate_call_cost_usd 会 fallback 到 0 (见 agents/__init__.py)。
+    "kimi-k3": 3.00,
+    "kimi-k2.6": 0.95,
+    "deepseek-v4-flash": 0.14,
+    # ── 以下已无 stage 指向,仅供历史 run 的成本回显 ──────────────────
+    # DB 里 v0.31 及之前的 stage_log 存着这些模型名,删掉的话老 run 的
+    # total_cost_usd 会回显成 $0。保留不占运行时成本。
+    "deepseek-v4-pro": 0.5,   # 估算值(v0.30.8~v0.31 的 persona_simulator_alt)
+    "gpt-5.5": 2.5,           # 估算值(v0.30.7~v0.31 的门下省/兵部)
     "claude-opus-4-8": 15.0,
     "claude-opus-4-7": 15.0,
     "claude-opus-4-6": 15.0,
     "claude-sonnet-4-6": 3.0,
-    # 默认 premium_multi_vendor preset 下门下省/兵部走 gpt-5.5、画像·alt 走
-    # deepseek-v4-pro。不列进来 _estimate_call_cost_usd 会按 $0 计,total_cost_usd
-    # 系统性低报。⚠️ 下面是**估算值**(走中转,实际单价以你的中转/厂商账单为准),
-    # 请按实际计费校准。仅影响成本展示,不影响 token 熔断。
-    "gpt-5.5": 2.5,          # 估算,GPT-5 档;按中转实际单价校准
-    "deepseek-v4-pro": 0.5,  # 估算,DeepSeek 档;按实际单价校准
 }
 
 COST_PER_1M_OUTPUT: dict[str, float] = {
+    "kimi-k3": 15.00,
+    "kimi-k2.6": 4.00,
+    "deepseek-v4-flash": 0.28,
+    # ── 历史 run 回显用,同上 ────────────────────────────────────────
+    "deepseek-v4-pro": 2.0,
+    "gpt-5.5": 10.0,
     "claude-opus-4-8": 75.0,
     "claude-opus-4-7": 75.0,
     "claude-opus-4-6": 75.0,
     "claude-sonnet-4-6": 15.0,
-    # ⚠️ 估算值,同上,按实际账单校准。
-    "gpt-5.5": 10.0,         # 估算,GPT-5 档
-    "deepseek-v4-pro": 2.0,  # 估算,DeepSeek 档
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────
@@ -837,7 +877,7 @@ PIPELINE_STAGES = [
     # page 2 OR if Gemini isn't configured. Fetches user-specified
     # xiaohongshu post URLs via url_context — higher-signal than
     # keyword search because the user directly picked the references.
-    ("gemini_reference_analyzer", "参考帖子·Gemini", "02"),
+    ("gemini_reference_analyzer", "参考帖子·SocialDataX", "02"),
     # SocialDataX first-party trend sampling. Pulls real current 小红书
     # 爆款 (原文 + 互动量, engagement-ranked) and injects them into
     # brief._trend_intel so secretariat's strategy is calibrated against
@@ -860,9 +900,9 @@ PIPELINE_STAGES = [
     ("narrative_director", "叙事导演", "15"),
     ("red_blue_red", "红队·攻", "16"),
     ("red_blue_blue", "蓝队·守", "17"),
-    ("persona_simulator", "画像模拟·Claude", "18"),
+    ("persona_simulator", "画像模拟·Kimi", "18"),
     ("persona_simulator_alt", "画像模拟·DeepSeek", "19"),
-    ("ministry_works_structure_review", "结构审·Gemini", "20"),
+    ("ministry_works_structure_review", "结构审·Kimi", "20"),
     ("vibe_critic", "网感复检", "21"),
     # v0.29.3: 补展示 — 这两个阶段其实一直在跑也各自记 stage_log,
     # 但 PIPELINE_STAGES 漏了,导致 Settings 页面"模型配置"看不到它们
