@@ -1,11 +1,11 @@
 """设置 — API keys, model preferences, Supabase status."""
 
 import streamlit as st
-from pipeline.agents.gemini_client import resolve_gemini_model
+from pipeline.agents.kimi_client import resolve_assist_model
 from pipeline.config import (
-    ENABLE_GEMINI_ASSIST,
-    GEMINI_MODEL,
-    GEMINI_MODEL_OVERRIDES,
+    ENABLE_KIMI_ASSIST,
+    KIMI_ASSIST_MODEL,
+    KIMI_ASSIST_MODEL_OVERRIDES,
     MODELS,
     PIPELINE_STAGES,
     VERSION,
@@ -284,87 +284,80 @@ try:
 except Exception as _sdx_e:  # noqa: BLE001 — settings 页永不因状态区崩
     st.warning(f"SocialDataX 状态检查失败:{_sdx_e}")
 
-# ── Gemini auxiliary ────────────────────────────────────────────────────────
+# ── Kimi auxiliary ──────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader("Gemini 辅助检查（可选）")
+st.subheader("辅助层（Kimi · 可选）")
 
-_gemini_key = st.secrets.get("VERTEX_EXPRESS_API_KEY", "").strip()
-if not ENABLE_GEMINI_ASSIST:
+_kimi_key = st.secrets.get("MOONSHOT_API_KEY", "").strip()
+if not ENABLE_KIMI_ASSIST:
     st.info(
-        "已在 `pipeline/config.py` 里禁用（`ENABLE_GEMINI_ASSIST=False`）。"
-        "如需开启：改成 `True` 并在 secrets.toml 配 `VERTEX_EXPRESS_API_KEY`。"
+        "已在 `pipeline/config.py` 里禁用（`ENABLE_KIMI_ASSIST=False`）。"
+        "如需开启：改成 `True` 并确认 secrets.toml 里配了 `MOONSHOT_API_KEY`。"
     )
-elif not _gemini_key:
+elif not _kimi_key:
     st.warning(
-        "已在 config 启用但未配 `VERTEX_EXPRESS_API_KEY`。"
-        "Gemini 辅助检查本轮会被跳过（advisory-only，不影响主流程）。"
-        "在 GCP Console → Vertex AI → Settings → API keys 生成一个 Key 填入 secrets.toml。"
+        "已在 config 启用但未配 `MOONSHOT_API_KEY`。"
+        "辅助层本轮会被跳过（advisory-only，不影响主流程）——但注意主链路"
+        "也靠这个 key，没配的话整条流水线都跑不起来。"
     )
 else:
-    # Don't actually make a network call here — just confirm the client
-    # can be constructed (catches missing `google-genai` install).
     try:
-        from pipeline.agents.gemini_client import is_available
+        from pipeline.agents.kimi_client import is_available
         if is_available():
             st.success(
-                f"已配置 (***{_gemini_key[-4:]}) · 默认模型 `{GEMINI_MODEL}`"
+                f"已配置 (***{_kimi_key[-4:]}) · 默认模型 `{KIMI_ASSIST_MODEL}`"
             )
             st.caption(
-                "Gemini 会作为 (1) 网感二审：Claude critic 判 pass 的 cell 由 Gemini "
-                "二次复核；(2) 结构审：工部构建后审查 system_prompt 的完整性。"
-                "调用失败会降级为只用 Claude 结果。"
+                "辅助层负责 (1) 网感二审：主链路 critic 判 pass 的 cell 再复核一遍；"
+                "(2) 结构审：工部构建后审查 system_prompt 的完整性；"
+                "(3) 图片预转写 / 截图分析（Vision）。调用失败一律降级跳过，不阻塞流水线。"
             )
 
-            # Per-role override map. Each agent passes its role name to
-            # resolve_gemini_model() in gemini_client.py, which looks
-            # GEMINI_MODEL_OVERRIDES (in pipeline/config.py) and falls
-            # back to GEMINI_MODEL above when not pinned.
             _role_descriptions: dict[str, str] = {
                 "critic":              "网感二审（烟火气判断）",
                 "structure_reviewer":  "结构审（system_prompt 完整性）",
                 "image_transcriber":   "图片预转写（Vision）",
                 "screenshot_analyzer": "截图分析（Vision）",
-                "reference_analyzer":  "参考帖 URL 抓取分析",
             }
             with st.expander(
-                "按岗位模型分配（pipeline/config.py · GEMINI_MODEL_OVERRIDES）",
+                "按岗位模型分配（pipeline/config.py · KIMI_ASSIST_MODEL_OVERRIDES）",
                 expanded=False,
             ):
                 _rows = []
                 for role, desc in _role_descriptions.items():
-                    pinned = GEMINI_MODEL_OVERRIDES.get(role)
+                    pinned = KIMI_ASSIST_MODEL_OVERRIDES.get(role)
                     _rows.append(
                         {
                             "岗位 (role)": role,
                             "用途": desc,
-                            "实际模型": pinned or f"{GEMINI_MODEL} (默认)",
+                            "实际模型": pinned or f"{KIMI_ASSIST_MODEL} (默认)",
                             "是否 override": "[是]" if pinned else "—",
                         }
                     )
                 st.dataframe(_rows, hide_index=True, use_container_width=True)
                 st.caption(
-                    "想全局切换：改 `GEMINI_MODEL`。想只动某一个岗位（例如把 critic "
-                    "从 Pro 换成 Flash 做 A/B）：改 `GEMINI_MODEL_OVERRIDES`。"
+                    "`critic` 默认钉在 DeepSeek 而不是 Kimi —— 主链路的 vibe_critic "
+                    "已经是 kimi-k2.6，二审再用同一个模型等于自己复核自己，"
+                    "分歧仲裁就失去意义了。两个 Vision 岗位必须留在 Kimi："
+                    "DeepSeek 这两档不接受图片输入。"
                 )
 
-            # Live ping — sends a trivial request to verify the model ID,
-            # API key, and network path all work end-to-end. Crucial for
-            # diagnosing "why does Gemini always show as skipped".
+            # Live ping — 实发一条最小请求，验证模型名 / key / 网络三件事。
             if st.button(
-                "测试 Gemini 连接",
-                help="实发一条最小请求到 Vertex，验证模型名/API key/网络都 OK",
+                "测试辅助层连接",
+                help="实发一条最小请求到 Moonshot，验证模型名/API key/网络都 OK",
             ):
                 import time as _time
-                with st.spinner(f"正在调用 `{GEMINI_MODEL}` ..."):
+                with st.spinner(f"正在调用 `{KIMI_ASSIST_MODEL}` ..."):
                     t0 = _time.time()
                     try:
-                        from pipeline.agents.gemini_client import (
-                            GeminiCallFailed,
-                            GeminiNotConfigured,
-                            call_gemini_json,
+                        from pipeline.agents.kimi_client import (
+                            KimiCallFailed,
+                            KimiNotConfigured,
+                            call_kimi_json,
                         )
-                        result = call_gemini_json(
+                        result = call_kimi_json(
                             system_prompt=(
                                 "You are a terse JSON emitter. Output exactly "
                                 '{"ok": true, "model": "<model id>"}'
@@ -380,87 +373,27 @@ else:
                             f"费用 ${result['cost_usd']:.4f}"
                         )
                         st.json(result["data"])
-                    except GeminiNotConfigured as err:
+                    except KimiNotConfigured as err:
                         st.error(f"未配置：{err}")
-                    except GeminiCallFailed as err:
+                    except KimiCallFailed as err:
                         st.error(
                             f"调用失败：\n\n```\n{err}\n```\n\n"
                             "**常见原因**：\n"
-                            f"- 模型名 `{GEMINI_MODEL}` 你的 Vertex 账户不可用"
-                            " → 去 `pipeline/config.py` 改 `GEMINI_MODEL`"
-                            "（推荐先试 `gemini-2.5-pro` 或 `gemini-2.5-flash`）\n"
-                            "- API key 对应的项目没开 Vertex AI API\n"
-                            "- 地区配额问题"
+                            f"- 模型名 `{KIMI_ASSIST_MODEL}` 拼错或你的账号还没开通"
+                            " → 去 `pipeline/config.py` 改 `KIMI_ASSIST_MODEL`\n"
+                            "- 站点搞错了：`MOONSHOT_API_KEY` 是 platform.moonshot.cn "
+                            "（国内站）的 key，但 `MOONSHOT_BASE_URL` 指向了 "
+                            "api.moonshot.ai（国际站），或者反过来。两站账号体系独立、"
+                            "key 不通用。\n"
+                            "- 余额不足 / 该模型的并发配额为 0"
                         )
-                    except Exception as err:
-                        st.error(f"未预期的错误：{type(err).__name__}: {err}")
-
-            # List models — answers "what models can this API key actually
-            # call" without needing to trial-and-error through pipeline runs.
-            if st.button(
-                "列出可用 Gemini 模型",
-                help=(
-                    "调用 ListModels 接口，显示你这个 API key 能访问的所有"
-                    "模型。复制其中一个模型 ID 填到 pipeline/config.py 的 "
-                    "GEMINI_MODEL 即可切换。"
-                ),
-            ):
-                with st.spinner("正在拉取模型列表 ..."):
-                    try:
-                        from pipeline.agents.gemini_client import (
-                            GeminiCallFailed,
-                            GeminiNotConfigured,
-                            list_available_models,
-                        )
-                        models = list_available_models()
-                        if not models:
-                            st.warning("ListModels 返回空列表——key 可能有权限问题。")
-                        else:
-                            # Flag whether the currently configured GEMINI_MODEL
-                            # is actually in the list.
-                            available_ids = {m["id"] for m in models}
-                            current_ok = GEMINI_MODEL in available_ids
-                            if current_ok:
-                                st.success(
-                                    f"当前配置的 `{GEMINI_MODEL}` "
-                                    f"在可用列表里（共 {len(models)} 个模型）"
-                                )
-                            else:
-                                st.warning(
-                                    f"当前配置 `{GEMINI_MODEL}` **不在**可用列表里——"
-                                    f"这就是为什么 Gemini 总是 skipped。"
-                                    f"从下表挑一个支持 `generateContent` 的模型 ID，"
-                                    f"改 `pipeline/config.py` 里的 `GEMINI_MODEL`。"
-                                )
-                            # Render compact table — most relevant columns only
-                            rows = [
-                                {
-                                    "Model ID (填到 GEMINI_MODEL)": m["id"],
-                                    "Display Name": m["display_name"],
-                                    "Input tokens": f"{m['input_token_limit']:,}"
-                                    if m["input_token_limit"]
-                                    else "?",
-                                    "Output tokens": f"{m['output_token_limit']:,}"
-                                    if m["output_token_limit"]
-                                    else "?",
-                                    "Methods": ", ".join(m["supported_methods"])
-                                    if m["supported_methods"]
-                                    else "(unknown)",
-                                }
-                                for m in models
-                            ]
-                            st.dataframe(rows, use_container_width=True)
-                    except GeminiNotConfigured as err:
-                        st.error(f"未配置：{err}")
-                    except GeminiCallFailed as err:
-                        st.error(f"ListModels 失败：\n\n```\n{err}\n```")
                     except Exception as err:
                         st.error(f"未预期的错误：{type(err).__name__}: {err}")
         else:
-            st.error("Gemini 客户端初始化失败（`google-genai` 未装？）")
+            st.error("辅助层不可用：模型路由不通。")
             st.caption(
-                "`pip install google-genai>=0.3.0`（或重新跑 "
-                "`pip install -r requirements.txt`）后重启 Streamlit。"
+                "检查 secrets.toml 里的 `MOONSHOT_API_KEY`，以及 "
+                "`MOONSHOT_BASE_URL`（不填默认 https://api.moonshot.cn/anthropic）。"
             )
     except Exception as e:
         st.error(f"状态检测异常：{e}")
@@ -471,48 +404,60 @@ st.divider()
 st.subheader("模型配置")
 st.caption(
     "当前各环节使用的模型（修改需编辑 `pipeline/config.py`）。"
-    "Opus / Sonnet 都是 Claude；Gemini 是辅助（advisory），失败不阻塞；"
-    "SocialDataX 是趋势取样数据源（REQUIRED 模式下取样失败会终止 run）。"
+    "`kimi-k3` 是旗舰档（只给策略核心 4 个阶段）、`kimi-k2.6` 是主力档、"
+    "`deepseek-v4-flash` 是跨厂家对抗/廉价批量档；辅助层是 advisory，失败不阻塞；"
+    "SocialDataX 是趋势取样 + 参考帖抓取的数据源（趋势取样在 REQUIRED 模式下"
+    "失败会终止 run，参考帖抓取失败只跳过）。"
 )
 
-# Gemini 参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
-# 这里列出"Gemini 会介入"的阶段，而不是"Gemini 是主判"的阶段。
-# Tuple shape: (role_key for resolve_gemini_model, human description).
-GEMINI_ASSIST_STAGES: dict[str, tuple[str, str]] = {
-    "gemini_reference_analyzer": (
-        "reference_analyzer",
-        "主判（Gemini-only，url_context 抓用户贴的参考 URL）",
-    ),
-    # NOTE: trend_scout migrated off Gemini → SocialDataX (first-party XHS).
-    # It no longer runs on Gemini, so it is intentionally absent here.
+# 辅助层参与的阶段——跟 orchestrator.run() 的实际调用保持一致。
+# 这里列出"辅助层会介入"的阶段，而不是"辅助层是主判"的阶段。
+# Tuple shape: (role_key for resolve_assist_model, human description).
+#
+# NOTE: gemini_reference_analyzer 和 gemini_trend_scout_* 都不在这里 ——
+# 前者 v0.32.0 改成纯 SocialDataX 抓取（确定性代码，无 LLM 调用），
+# 后者 v0.31.0 就已经迁到 SocialDataX 了。两个 stage key 保留 "gemini_"
+# 前缀纯粹是为了 DB 里历史 stage_log 的兼容性。
+ASSIST_STAGES: dict[str, tuple[str, str]] = {
     "vibe_critic": (
         "critic",
-        "二审（Claude 判 pass 的 cell 再过 Gemini）",
+        "二审（主判 pass 的 cell 再过一遍）",
     ),
     "ministry_works_structure_review": (
         "structure_reviewer",
-        "主判（Gemini-only，结构完整性）",
+        "主判（辅助层独跑，结构完整性）",
     ),
 }
 
 for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
     model = MODELS.get(stage_key)
-    gemini_assist = GEMINI_ASSIST_STAGES.get(stage_key)
-    gemini_role: str | None = None
-    gemini_desc: str | None = None
-    if gemini_assist:
-        gemini_role, gemini_desc = gemini_assist
+    assist = ASSIST_STAGES.get(stage_key)
+    assist_role: str | None = None
+    assist_desc: str | None = None
+    if assist:
+        assist_role, assist_desc = assist
 
     # Assemble the right-hand-side badges based on which backends run here
     parts: list[str] = []
     if model:
-        tier = "Opus" if "opus" in model else "Sonnet"
+        # 档位标签按模型名判断 —— 让"这一步花的是哪一档的钱"在列表里一眼可见。
+        if model.startswith("kimi-k3"):
+            tier = "旗舰"
+        elif model.startswith("kimi-"):
+            tier = "主力"
+        elif model.startswith("deepseek-"):
+            tier = "廉价/异厂家"
+        else:
+            tier = "其它"
         parts.append(f"`{model}` {tier}")
 
-    # SocialDataX-backed trend sampling — not a Gemini stage anymore.
+    # SocialDataX-backed trend sampling — 不是辅助层阶段。
     # Badge must reflect the REQUIRED/fail-fast reality, not the generic
     # "未配置 · 跳过" fallback (which would misdirect a user whose run
     # just died here for lack of an API key).
+    if stage_key == "gemini_reference_analyzer":
+        parts.append("SocialDataX · 参考帖抓取(用户粘贴的 URL，失败只跳过)")
+
     if stage_key == "gemini_trend_scout_pre":
         try:
             _available = _sdx_ok()
@@ -529,18 +474,18 @@ for stage_key, stage_label, stage_icon in PIPELINE_STAGES:
         else:
             parts.append("SocialDataX · _(未配置 · 跳过)_")
 
-    if gemini_desc and ENABLE_GEMINI_ASSIST and _gemini_key:
-        # Gemini actually available — show the resolved (per-role) model
-        # so override-vs-default is visible at a glance.
-        _resolved = resolve_gemini_model(gemini_role)
-        parts.append(f"+ `{_resolved}` Gemini · {gemini_desc}")
-    elif gemini_desc:
-        # Gemini role designed but not configured — annotate so user
-        # understands why this stage may look "only Claude" in logs
-        parts.append(f"+ Gemini · {gemini_desc} _(未配置 · 跳过)_")
+    if assist_desc and ENABLE_KIMI_ASSIST and _kimi_key:
+        # 辅助层可用 —— 显示按岗位解析后的实际模型，让 override vs 默认
+        # 一眼可见。
+        _resolved = resolve_assist_model(assist_role)
+        parts.append(f"+ `{_resolved}` 辅助 · {assist_desc}")
+    elif assist_desc:
+        # 岗位设计了但没配 —— 标注出来，省得用户纳闷这一步为什么日志里
+        # 只有主判。
+        parts.append(f"+ 辅助 · {assist_desc} _(未配置 · 跳过)_")
 
     if not parts:
-        # e.g. structure_review when Gemini disabled + unconfigured
+        # e.g. structure_review when 辅助层 disabled + unconfigured
         parts = ["_未配置 · 跳过_"]
 
     st.markdown(

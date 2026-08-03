@@ -49,12 +49,12 @@ from pipeline.agents import (
     release_run_budget,
     reset_run_budget,
 )
-from pipeline.agents.gemini_critic import run_gemini_critic
-from pipeline.agents.gemini_structure_reviewer import (
-    format_revision_hints as _format_gemini_structure_hints,
-    run_gemini_structure_review,
+from pipeline.agents.kimi_critic import run_kimi_critic
+from pipeline.agents.kimi_structure_reviewer import (
+    format_revision_hints as _format_structure_hints,
+    run_kimi_structure_review,
 )
-from pipeline.agents.gemini_reference_analyzer import run_reference_analyzer
+from pipeline.agents.socialdatax_reference_analyzer import run_reference_analyzer
 from pipeline.retrieve_samples import (
     retrieve_reference_packs,
     summarize_packs_by_platform,
@@ -2821,9 +2821,9 @@ class PipelineOrchestrator:
         log_id = log["id"]
 
         try:
-            result = await run_gemini_structure_review(prompt_cells)
+            result = await run_kimi_structure_review(prompt_cells)
         except Exception as e:
-            # run_gemini_structure_review swallows its own errors; if
+            # run_kimi_structure_review swallows its own errors; if
             # something still leaks treat as non-fatal.
             logger.warning(
                 "[structure review] unexpected exception, skipping: %r", e
@@ -3193,9 +3193,9 @@ class PipelineOrchestrator:
             ]
             if claude_passed:
                 try:
-                    gemini_result = await run_gemini_critic(claude_passed)
+                    gemini_result = await run_kimi_critic(claude_passed)
                 except Exception as e:
-                    # run_gemini_critic is supposed to swallow everything.
+                    # run_kimi_critic is supposed to swallow everything.
                     # If something still leaks, treat as non-fatal.
                     logger.warning(
                         f"[gemini arbitration] unexpected exception, skipping: {e!r}"

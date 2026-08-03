@@ -125,7 +125,7 @@ def resolve_platform_id(platform: str | None) -> str | None:
 def _resolve_api_key() -> str:
     """Resolve the SocialDataX API key from Streamlit secrets first (the
     app runtime), then process env (standalone scripts / probe). Mirrors
-    the VERTEX_EXPRESS_API_KEY resolution convention in gemini_client.py.
+    the API-key resolution convention used elsewhere in pipeline/agents.
     """
     # 1) Streamlit secrets — primary path inside the app.
     try:

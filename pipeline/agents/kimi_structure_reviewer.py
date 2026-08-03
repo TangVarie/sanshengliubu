@@ -1,4 +1,4 @@
-"""Gemini structure reviewer — audits works_builder output for completeness.
+"""Kimi structure reviewer — audits works_builder output for completeness.
 
 Runs AFTER _run_works_builders succeeds but BEFORE _run_vibe_loop. The
 vibe critic judges content taste; the structure reviewer judges
@@ -9,9 +9,9 @@ shortfalls chancellery_final reliably calls out, and the whole point
 of shifting the check left is so the rewriter gets the feedback BEFORE
 the final review round-trip.
 
-Advisory semantics (identical to gemini_critic):
+Advisory semantics (identical to kimi_critic):
   - Not configured / call failed / parse error → return empty result,
-    caller proceeds without any revision_directives from Gemini.
+    caller proceeds without any revision_directives from Kimi.
   - Pipeline NEVER blocks on a structure-reviewer failure.
 
 Output is consumed by orchestrator to (a) log a stage_log entry for
@@ -26,11 +26,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from pipeline.agents.gemini_client import (
-    GeminiCallFailed,
-    GeminiNotConfigured,
-    call_gemini_json,
-    resolve_gemini_model,
+from pipeline.agents.kimi_client import (
+    KimiCallFailed,
+    KimiNotConfigured,
+    call_kimi_json,
+    resolve_assist_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,11 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 def _load_prompt() -> str:
-    path = _PROMPTS_DIR / "gemini_structure_reviewer.md"
+    path = _PROMPTS_DIR / "kimi_structure_reviewer.md"
     return path.read_text(encoding="utf-8")
 
 
-async def run_gemini_structure_review(
+async def run_kimi_structure_review(
     prompt_cells: list[dict],
 ) -> dict[str, Any]:
     """Audit a list of prompt_cells for structural completeness.
@@ -87,7 +87,7 @@ async def run_gemini_structure_review(
         system_prompt = _load_prompt()
     except Exception as e:
         logger.warning(
-            "[gemini_structure] prompt load failed, skipping: %s", e
+            "[kimi_structure] prompt load failed, skipping: %s", e
         )
         return {
             "verdict": "skipped",
@@ -96,20 +96,20 @@ async def run_gemini_structure_review(
         }
 
     try:
-        result = call_gemini_json(
+        result = call_kimi_json(
             system_prompt,
             user_message,
-            model=resolve_gemini_model("structure_reviewer"),
+            model=resolve_assist_model("structure_reviewer"),
         )
-    except GeminiNotConfigured as e:
-        logger.debug("[gemini_structure] not configured, skipping: %s", e)
+    except KimiNotConfigured as e:
+        logger.debug("[kimi_structure] not configured, skipping: %s", e)
         return {
             "verdict": "skipped",
             "cells_incomplete": [],
             "_skip_reason": f"not_configured: {e}",
         }
-    except GeminiCallFailed as e:
-        logger.warning("[gemini_structure] call failed, skipping: %s", e)
+    except KimiCallFailed as e:
+        logger.warning("[kimi_structure] call failed, skipping: %s", e)
         return {
             "verdict": "skipped",
             "cells_incomplete": [],
@@ -122,7 +122,7 @@ async def run_gemini_structure_review(
         if isinstance(parsed, dict):
             _preview = str(parsed.get("_raw_text", ""))[:500]
         logger.warning(
-            "[gemini_structure] output was not valid JSON, skipping. Raw: %s",
+            "[kimi_structure] output was not valid JSON, skipping. Raw: %s",
             _preview[:300] or "(no preview)",
         )
         return {
@@ -141,6 +141,11 @@ async def run_gemini_structure_review(
     parsed.setdefault("verdict", "unknown")
     parsed.setdefault("cells_incomplete", [])
     parsed.setdefault("cell_reviews", [])
+    # NOTE: 键名 `_gemini_usage` 是历史遗留的【跨模块契约】,不是漏改的。
+    # orchestrator (pipeline/orchestrator.py) 和 pages/3 都按这个名字读,
+    # DB 里已落库的 stage_log.output_data 也是这个名字 —— 改名会让历史 run
+    # 的用量回显变空。socialdatax_trend_scout.py 迁移时做过同样的决定。
+    # 换成 Kimi 之后它的语义是"辅助层用量",跟具体哪家无关。
     parsed["_gemini_usage"] = {
         "input_tokens": result.get("input_tokens", 0),
         "output_tokens": result.get("output_tokens", 0),
@@ -149,7 +154,7 @@ async def run_gemini_structure_review(
     }
 
     logger.info(
-        "[gemini_structure] verdict=%s, incomplete=%d/%d, cost=$%.4f, tokens=%d/%d",
+        "[kimi_structure] verdict=%s, incomplete=%d/%d, cost=$%.4f, tokens=%d/%d",
         parsed.get("verdict"),
         len(parsed.get("cells_incomplete") or []),
         len(prompt_cells),
@@ -173,7 +178,7 @@ def format_revision_hints(review_result: dict) -> str:
     incomplete = review_result.get("cells_incomplete") or []
     if not incomplete:
         return ""
-    lines = ["【Gemini 结构审提示】下面每条 cell 被识别出结构不全，建议在重写时顺带补上："]
+    lines = ["【Kimi 结构审提示】下面每条 cell 被识别出结构不全，建议在重写时顺带补上："]
     for c in incomplete:
         cid = c.get("cell_id", "?")
         missing = c.get("missing_items") or []

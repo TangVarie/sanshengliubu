@@ -6,19 +6,21 @@
 # st.experimental_fragment.
 streamlit>=1.37.0,<2.0.0
 anthropic[vertex]>=0.25.0,<1.0.0
+# google-auth 仍然需要:anthropic[vertex] 的 Vertex 凭证路径靠它。
+# 主链路(Kimi/DeepSeek)用不到,但 secrets 里配了 GCP_PROJECT_ID 的老部署
+# 还能继续跑 Claude on Vertex。
 google-auth>=2.20.0,<3.0.0
-# Gemini (Vertex AI Express API key or Studio API key). Optional —
-# pipeline runs fine without it; when configured it acts as a second-
-# opinion critic + structure reviewer. See pipeline/config.py
-# ENABLE_GEMINI_ASSIST and VERTEX_EXPRESS_API_KEY in secrets.toml.
-google-genai>=0.3.0,<2.0.0
+# v0.32.0: google-genai 已移除 —— 辅助层(网感二审/结构审/识图/截图分析)
+# 从 Gemini 迁到 Kimi,走 anthropic SDK 打 Moonshot 的 anthropic-compat
+# 端点,不再需要 Google 的 SDK。参考帖抓取迁到 SocialDataX。
 supabase>=2.4.0,<3.0.0
 pydantic>=2.6.0,<3.0.0
 PyPDF2>=3.0.0,<4.0.0
 python-docx>=1.0.0,<2.0.0
-# OpenAI-compatible SDK — GPT (走 vectorengine.ai 中转) 用,DeepSeek
-# 只走 anthropic-compat 不需要这个。Streamlit Cloud / 本地 pip install
-# 都会装上。
+# OpenAI-compatible SDK — v0.32.0 起默认配置里没有 gpt-* 阶段了(门下省/
+# 兵部改走 deepseek-v4-flash),所以这个包在默认路径上用不到。保留是因为
+# _call_openai_chat 那条 backend 还在:谁想把某个 stage override 回 GPT、
+# 或者接一个只讲 OpenAI 协议的中转,不用改 requirements 就能跑。
 openai>=1.40.0,<2.0.0
 # MCP SDK — used by the trend scout to talk to SocialDataX's first-party
 # MCP servers (streamable-HTTP) for real 小红书 content. Pure Python, so no

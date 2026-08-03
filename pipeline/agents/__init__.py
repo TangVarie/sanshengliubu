@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
-    CLAUDE_FALLBACK_CHAIN,
+    MODEL_FALLBACK_CHAIN,
     CLAUDE_MAX_CONCURRENT,
     CLAUDE_RPM_ADAPTIVE,
     CLAUDE_RPM_BACKOFF_FACTOR,
@@ -47,6 +47,151 @@ from pipeline.logger_utils import mask_secrets
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
+# ── Vendor routing ────────────────────────────────────────────────────────
+# Every backend we talk to speaks the Anthropic Messages API, so the only
+# thing that varies per vendor is (base_url, api_key) + which optional
+# request fields the endpoint actually honors. One helper resolves the
+# family from the model name; everything else keys off its return value.
+#
+#   "kimi"     — Moonshot,          api.moonshot.cn/anthropic
+#   "deepseek" — DeepSeek 官方,      api.deepseek.com/anthropic
+#   "gpt"      — OpenAI-compat 中转, 走 _call_openai_chat(不是 anthropic SDK)
+#   "claude"   — 历史 relay / Vertex preset。v0.32.0 起没有任何 stage 默认
+#                指向它,但 secrets 里配了 claude_relay_presets 的老部署
+#                仍然能用 model_overrides 把某个 stage 钉回 Claude。
+def _model_vendor(model: str) -> str:
+    m = (model or "").lower()
+    if m.startswith("kimi-") or m.startswith("moonshot-"):
+        return "kimi"
+    if m.startswith("deepseek-"):
+        return "deepseek"
+    if m.startswith("gpt-"):
+        return "gpt"
+    return "claude"
+
+
+# Which vendors accept the standard Anthropic JSON `thinking` field.
+#
+# Kimi: Moonshot's /anthropic endpoint documents thinking.type and maps the
+#   enabled levels onto adaptive reasoning, so K2.6/K3 get real extended
+#   thinking through the standard parameter.
+# DeepSeek: the anthropic-compat endpoint silently ignores both
+#   thinking.budget_tokens and cache_control (reported repeatedly against
+#   several Anthropic-compat shims). Sending it isn't an error, it's just
+#   dead weight in every request — so we don't. DeepSeek stages therefore
+#   log "thinking ✗", which is honest rather than a silent no-op.
+_THINKING_CAPABLE_VENDORS = frozenset({"kimi", "claude"})
+
+# Vendor → (secrets 字段名, 人话名字)。仅用于拼报错文案。
+_VENDOR_SECRET_HINT = {
+    "kimi": ("MOONSHOT_API_KEY", "Moonshot (Kimi)"),
+    "deepseek": ("DEEPSEEK_API_KEY", "DeepSeek"),
+}
+
+
+def backend_configured(model: str) -> bool:
+    """这个模型的 backend 配齐了吗?(不构造 client,不发请求)
+
+    fallback 链会跨厂家降级,所以在真正尝试之前得能问一句"下一个候选有 key
+    吗" —— 否则 "DEEPSEEK_API_KEY 没配" 会被 fallback 循环当成一次普通失败,
+    链走完后抛出的错跟真实原因对不上。
+    """
+    if not _api_config:
+        init_api_config()
+    vendor = _model_vendor(model)
+    if vendor in ("kimi", "deepseek"):
+        cfg = _api_config.get(vendor)
+        return bool(cfg and cfg.get("api_key"))
+    if vendor == "gpt":
+        cfg = _api_config.get("vectorengine")
+        return bool(cfg and cfg.get("api_key"))
+    # claude:Vertex 模式恒可用;relay 模式要有 preset key
+    if _api_config.get("mode") == "vertex":
+        return True
+    return bool(_api_config.get("api_key"))
+
+
+def get_client_for_model(model: str) -> anthropic.Anthropic:
+    """Select the right Anthropic-compatible client based on model name.
+
+    多 vendor 路由(v0.30.0 引入,v0.32.0 加 Kimi):
+    - `kimi-*`     → Moonshot 官方 anthropic-compat 端点
+    - `deepseek-*` → DeepSeek 官方 anthropic-compat 端点
+    - `gpt-*`      → 不走这里(_call_model 提前 dispatch 到
+                     _call_openai_chat,OpenAI SDK)
+    - `claude-*`   → 当前激活 relay preset 的 base_url,或 Vertex
+
+    每家都是独立 base_url + 独立 api_key,所以 client 必须按 effective_model
+    挑,不能全局复用一个。
+
+    模块级函数(不是 BaseAgent 方法),因为辅助层 kimi_client.py 不走
+    BaseAgent 那套 stage_log/预算/重试体系,但需要完全相同的路由规则 ——
+    复制一份迟早会漂移。
+    """
+    if not _api_config:
+        init_api_config()
+
+    _mlow = (model or "").lower()
+    vendor = _model_vendor(model)
+
+    # Kimi / DeepSeek:同构的"独立端点 + 独立 key",走同一段。
+    if vendor in ("kimi", "deepseek"):
+        cfg = _api_config.get(vendor)
+        if not cfg or not cfg.get("api_key"):
+            _field, _name = _VENDOR_SECRET_HINT[vendor]
+            raise RuntimeError(
+                f"模型 {model!r} 需要 {_name} backend,但 "
+                f"secrets.toml 里没配 {_field}。"
+                "去 .streamlit/secrets.toml 加上 "
+                f"`{_field} = \"sk-...\"` 后重启。"
+            )
+        return anthropic.Anthropic(
+            api_key=cfg["api_key"],
+            base_url=cfg["base_url"],
+            timeout=900.0,
+        )
+
+    # Vertex 模式只能跑 Claude(GPT 也不行,Vertex AI Anthropic 是
+    # Anthropic-only endpoint)
+    if _api_config.get("mode") == "vertex":
+        if _mlow.startswith("gpt-"):
+            raise RuntimeError(
+                f"Vertex 模式不支持 GPT 模型 {model!r}。"
+                "需要切换到 relay preset(支持多模型路由的中转)"
+                "或在 GCP_PROJECT_ID 之外另配 ANTHROPIC_API_KEY。"
+            )
+        from anthropic import AnthropicVertex
+        vertex_kwargs: dict[str, Any] = {
+            "project_id": _api_config["project_id"],
+            "region": _api_config["region"],
+            "timeout": 900.0,
+        }
+        if "credentials" in _api_config:
+            vertex_kwargs["credentials"] = _api_config["credentials"]
+        return AnthropicVertex(**vertex_kwargs)
+
+    # Direct relay/Anthropic 模式 — 历史 Claude 中转路径。
+    # v0.32.0 起默认配置里没有任何 stage 指向 claude-*,所以走到这里说明是
+    # 老部署,或者有人手动把某个 stage override 回了 Claude。
+    _relay_key = _api_config.get("api_key") or ""
+    if not _relay_key:
+        raise RuntimeError(
+            f"模型 {model!r} 需要 Claude 接入(中转或官方),但 secrets.toml "
+            "里既没有 [claude_relay_presets.*] 也没有 ANTHROPIC_API_KEY。"
+            "v0.32.0 起主链路默认全是 kimi-* / deepseek-*,不需要 Claude —— "
+            "如果你没有刻意配 model_overrides 把这个 stage 钉回 Claude，"
+            "多半是哪里还留着旧的模型名，检查 secrets.toml 的 "
+            "model_overrides 和 pipeline/config.py 的 MODELS。"
+        )
+    kwargs = {"api_key": _relay_key}
+    if _api_config.get("base_url"):
+        kwargs["base_url"] = _api_config["base_url"]
+    kwargs["timeout"] = 900.0
+    return anthropic.Anthropic(**kwargs)
+
+
+
+
 # Relay "no upstream channel" phrasings, English + common Chinese-relay
 # variants (tdyun/vectorengine/等国内中转 return Chinese). Matching these
 # routes the model through the Claude fallback chain instead of failing the
@@ -67,7 +212,7 @@ def _is_no_channel_error(exc: BaseException) -> bool:
     """True if the error looks like a relay "no upstream channel for this
     model" rejection (English or Chinese-relay phrasing). Such errors are
     routing failures, not model failures — they should trigger the Claude
-    fallback chain in _call_claude, not fail the stage."""
+    fallback chain in _call_model, not fail the stage."""
     msg = str(exc).lower()
     return any(m.lower() in msg for m in _NO_CHANNEL_MARKERS)
 
@@ -110,7 +255,7 @@ def _classify_llm_error(exc: BaseException, attempt: int) -> tuple[bool, bool]:
     retries on auth/400 and using the wrong backoff for 5xx.
     """
     # Non-retryable: auth / permission / malformed request (except the
-    # cache_control fault, which _call_claude self-heals by retrying).
+    # cache_control fault, which _call_model self-heals by retrying).
     import anthropic as _anthropic
     _low = str(exc).lower()
     _status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
@@ -163,7 +308,7 @@ def note_rate_limit_hit(stage_name: str = "") -> None:
 
 # ── API config cache (populated in main thread, used by background threads) ──
 _api_config: dict[str, str] = {}
-# Guard the narrow write-during-run path in _call_claude: when the backend
+# Guard the narrow write-during-run path in _call_model: when the backend
 # rejects cache_control with 400, multiple concurrent agent threads can all
 # hit the same fault simultaneously. Without this lock N threads each do a
 # redundant fallback retry before any of them flips the "cache disabled" bit
@@ -255,6 +400,31 @@ def init_api_config():
     # backend。所以这两个的初始化必须放在 mode 判定之前;以前(v0.30.0/0.30.7
     # 引入时)关在 relay 分支里,Vertex 部署下永远拿不到 DS/VE 配置,GPT 阶段
     # 在 _call_openai_chat 报"未配 VectorEngine",DeepSeek 阶段同理。
+    # v0.32.0: Moonshot (Kimi) 是换厂后的主链路 backend。跟 DeepSeek 一样
+    # 是"独立 base_url + 独立 key"的 anthropic-compat 端点,所以初始化同样
+    # 放在 mode 判定之前 —— Vertex / relay / 什么都没配,三种情况下 kimi-*
+    # 都必须能找到自己的 backend。
+    #
+    # 国内站 api.moonshot.cn 和国际站 api.moonshot.ai 是两套独立账号体系,
+    # key 不通用。默认走国内站;要换国际站就在 secrets.toml 里设
+    # MOONSHOT_BASE_URL = "https://api.moonshot.ai/anthropic"。
+    _kimi_key = (st.secrets.get("MOONSHOT_API_KEY") or "").strip()
+    if _kimi_key:
+        _api_config["kimi"] = {
+            "api_key": _kimi_key,
+            "base_url": (
+                st.secrets.get("MOONSHOT_BASE_URL")
+                or "https://api.moonshot.cn/anthropic"
+            ).rstrip("/"),
+        }
+        logger.info(
+            "[init_api_config] Moonshot (Kimi) anthropic-compat 端点已配置 "
+            "(base=%s)",
+            _api_config["kimi"]["base_url"],
+        )
+    else:
+        _api_config.pop("kimi", None)
+
     _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
     if _ds_key:
         _api_config["deepseek"] = {
@@ -322,11 +492,48 @@ def init_api_config():
     active_name = get_active_claude_relay_name()
 
     if not presets or not active_name:
-        raise RuntimeError(
-            "找不到可用的 Claude 接入配置：既没有 Vertex（GCP_PROJECT_ID），"
-            "也没有 [claude_relay_presets.*] 或 ANTHROPIC_API_KEY。"
-            "请补齐 .streamlit/secrets.toml。"
+        # v0.32.0: 没有 Claude 中转不再是致命错误 —— 换厂后的默认配置里
+        # 根本不该有 claude_relay_presets。只要 Moonshot / DeepSeek 至少配
+        # 了一个,主链路就能跑;真正一个 backend 都没有才报错。
+        #
+        # 这里把 _api_config 置成"没有 Claude preset"的直连态:api_key 留空、
+        # 各项 preset 行为标志用全局默认。kimi-*/deepseek-* 走
+        # _get_client_for_model 里各自的分支,压根不读这些字段;只有把某个
+        # stage 手动 override 回 claude-* 时才会撞上空 api_key,那时报的
+        # 错也直白("没配 Claude 接入")。
+        _fallback_backends = [
+            name for name in ("kimi", "deepseek") if _api_config.get(name)
+        ]
+        if not _fallback_backends:
+            raise RuntimeError(
+                "找不到任何可用的模型接入配置：MOONSHOT_API_KEY、"
+                "DEEPSEEK_API_KEY 都没配，也没有 Vertex（GCP_PROJECT_ID）"
+                "或 [claude_relay_presets.*]。请补齐 .streamlit/secrets.toml，"
+                "最少需要 MOONSHOT_API_KEY（主链路 kimi-* 全靠它）。"
+            )
+        _api_config["mode"] = "direct"
+        _api_config["active_preset"] = ""
+        _api_config["active_label"] = "无 Claude 中转（Kimi/DeepSeek 直连）"
+        _api_config["api_key"] = ""
+        _api_config["base_url"] = ""
+        _api_config["rpm_limit"] = int(CLAUDE_RPM_LIMIT)
+        _api_config["max_concurrent"] = int(CLAUDE_MAX_CONCURRENT)
+        _api_config["supports_cache"] = bool(ENABLE_PROMPT_CACHING)
+        _api_config["supports_adaptive_thinking"] = True
+        _api_config["thinking_via_model_suffix"] = False
+        _api_config["model_overrides"] = {}
+        _relay_limiter.reconfigure(
+            _api_config["rpm_limit"], _api_config["max_concurrent"]
         )
+        logger.info(
+            "[init_api_config] 无 Claude preset，直连模式：可用 backend=%s, "
+            "RPM=%d, concurrent=%d, cache=%s",
+            "+".join(_fallback_backends),
+            _api_config["rpm_limit"],
+            _api_config["max_concurrent"],
+            _api_config["supports_cache"],
+        )
+        return
 
     cfg = presets[active_name]
     _api_config["mode"] = "direct"
@@ -374,7 +581,7 @@ def init_api_config():
     # Some relays (e.g. tdyun.ai) don't understand the `thinking` JSON
     # parameter at all and use a model-name suffix convention instead
     # (claude-opus-4-6-thinking / -high / -medium / -low / -max). When
-    # this flag is true, _call_claude:
+    # this flag is true, _call_model:
     #   1. Does NOT send the `thinking` JSON parameter
     #   2. Relies on the model name (resolved via model_overrides below)
     #      to carry thinking-tier information
@@ -423,7 +630,7 @@ def init_api_config():
 
 # ── Sliding-window rate limiter ───────────────────────────────────────────
 #
-# Lives in this module because _call_claude is the chokepoint and runs in
+# Lives in this module because _call_model is the chokepoint and runs in
 # threads (via asyncio.to_thread). All primitives are threading-based, not
 # asyncio-based, so they work correctly inside the thread-pool executor.
 # A single shared limiter instance per process is correct: even with
@@ -613,7 +820,7 @@ class RunBudgetExceededError(RuntimeError):
 
 
 # ── Per-run budget tracker ─────────────────────────────────────────────
-# Shared across all agents in the process so every _call_claude accrues
+# Shared across all agents in the process so every _call_model accrues
 # into the same pot. Keyed by run_id to stay isolated across concurrent
 # runs (if ever). Reset at the start of orchestrator.run() via
 # reset_run_budget(run_id).
@@ -710,14 +917,20 @@ def accumulate_auxiliary_cost(
     output_tokens: int = 0,
     source: str = "auxiliary",
 ) -> None:
-    """Add cost from an out-of-band (non-Claude) backend to the run's
-    running totals. Used by Gemini assist so its spend shows up in
-    pipeline_run.total_cost_usd alongside Claude's.
+    """Add cost from an out-of-band backend to the run's running totals —
+    i.e. spend that didn't go through a BaseAgent stage. Used by the
+    SocialDataX scouts so their per-call billing shows up in
+    pipeline_run.total_cost_usd alongside the LLM spend.
 
-    Does NOT count toward MAX_TOKENS_PER_RUN — that ceiling is there
-    to bound runaway Claude retry loops, and Gemini (priced 10-100×
-    cheaper for Flash/Pro tiers) would underflow the guard into
-    irrelevance. Tokens are still tracked per-source for UI breakdown.
+    Does NOT count toward MAX_TOKENS_PER_RUN — that ceiling exists to bound
+    runaway retry loops in the main chain, and out-of-band sources (priced
+    per API call, or an order of magnitude cheaper per token) would dilute
+    the guard into irrelevance. Tokens are still tracked per-source for the
+    UI breakdown.
+
+    ⚠️ v0.32.0: 辅助层(kimi_client)【不】走这里 —— 它是 advisory,刻意不进
+    run 总账,免得二审/结构审的开销把主链路的预算熔断提前触发。它的成本经
+    call_kimi_json 返回值里的 cost_usd 单独上报给调用方。
     """
     with _run_totals_lock:
         totals = _run_totals.setdefault(
@@ -835,10 +1048,11 @@ class BaseAgent:
     prompt_file: str = ""  # relative to pipeline/prompts/
 
     def __init__(self):
-        # v0.30.12: fallback 用当前可用模型表里最便宜的 (Sonnet 4-6)。
-        # 老 fallback 是带日期后缀的 claude-sonnet-4-20250514,中转 / Vertex
-        # 用户表上不一定能解析。
-        self.model = MODELS.get(self.stage_name, "claude-sonnet-4-6")
+        # 兜底模型:stage 没登记进 config._STAGE_ROLES 时用主力档。
+        # v0.32.0 从 claude-sonnet-4-6 改成 kimi-k2.6 —— 换厂后 Claude 的 key
+        # 通常压根没配,老兜底会让"忘了登记 stage"这种小错以"没配 Claude
+        # 接入"的面目报出来,查起来南辕北辙。
+        self.model = MODELS.get(self.stage_name, "kimi-k2.6")
         self.max_tokens = STAGE_MAX_TOKENS.get(self.stage_name, MAX_TOKENS_DEFAULT)
         # Validate prompt file exists at construction time so we fail fast
         # instead of crashing mid-pipeline after burning tokens on prior stages.
@@ -857,91 +1071,44 @@ class BaseAgent:
         backend)。"""
         return self._get_client_for_model(self.model)
 
+    # 路由逻辑住在模块级(见上面 get_client_for_model / backend_configured),
+    # 这里只是 BaseAgent 上的转发口,保持既有调用点不用改。
+    backend_configured = staticmethod(backend_configured)
+
     def _get_client_for_model(self, model: str) -> anthropic.Anthropic:
-        """Select the right Anthropic-compatible client based on model name.
+        return get_client_for_model(model)
 
-        v0.30.0 引入多 vendor 路由:
-        - `deepseek-*` → DeepSeek 官方 anthropic-compat 端点(独立 base_url
-          和 api_key,从 _api_config["deepseek"] 读)
-        - `gpt-*` 或 `claude-*` → 走当前激活 preset 的 base_url(用户的
-          tdyun 中转同时支持 Claude 和 GPT,model 字符串决定 relay 内部
-          路由到哪家)
-        - Vertex 模式 → 仍然走 AnthropicVertex(只有 Claude 模型)
+    @classmethod
+    def _model_fallback_candidates(cls, primary_model: str) -> list[str]:
+        """Build [primary, ...fallbacks] for the no-channel 保底 path.
 
-        Vertex 不支持 deepseek/gpt:如果 vertex 模式下被要求 deepseek-*,
-        会 fallback 到独立的 DeepSeek 配置(如果配了);否则报错。
+        v0.32.0 改动两处:
+
+        1. 链条跨厂家。以前只有 claude-* 有备选池(同厂异档),gpt/deepseek
+           各自返回 [primary] 就完事。现在 MODEL_FALLBACK_CHAIN 里 Kimi 两档
+           + DeepSeek 一档混排,任何模型失联都能降级到另一家继续跑完,而不是
+           整条 run 挂在某一家的短暂故障上。
+
+        2. 跳过没配 key 的候选。跨厂家降级的代价是"下一个候选可能压根没配"。
+           如果放任它进循环,_get_client_for_model 会抛 RuntimeError("没配
+           XXX_API_KEY") —— 那不是 no-channel 错误,循环会直接上抛,于是
+           用户看到的报错是"没配 DeepSeek",而真实原因是"Kimi 无渠道"。
+           所以在这里就把未配置的候选滤掉。
+
+        primary 永远排第一且永远保留(哪怕它自己没配)—— 让真实的配置错误
+        在第一次尝试时就以本来面目抛出来。
         """
-        if not _api_config:
-            init_api_config()
-
-        _mlow = (model or "").lower()
-        _is_deepseek = _mlow.startswith("deepseek-")
-
-        if _is_deepseek:
-            ds_cfg = _api_config.get("deepseek")
-            if not ds_cfg or not ds_cfg.get("api_key"):
-                raise RuntimeError(
-                    f"模型 {model!r} 需要 DeepSeek backend,但 "
-                    "secrets.toml 里没配 DEEPSEEK_API_KEY。"
-                    "去 .streamlit/secrets.toml 加上 "
-                    "`DEEPSEEK_API_KEY = \"sk-...\"` 后重启。"
-                )
-            kwargs: dict[str, Any] = {
-                "api_key": ds_cfg["api_key"],
-                "base_url": ds_cfg["base_url"],
-                "timeout": 900.0,
-            }
-            return anthropic.Anthropic(**kwargs)
-
-        # Vertex 模式只能跑 Claude(GPT 也不行,Vertex AI Anthropic 是
-        # Anthropic-only endpoint)
-        if _api_config.get("mode") == "vertex":
-            if _mlow.startswith("gpt-"):
-                raise RuntimeError(
-                    f"Vertex 模式不支持 GPT 模型 {model!r}。"
-                    "需要切换到 relay preset(支持多模型路由的中转)"
-                    "或在 GCP_PROJECT_ID 之外另配 ANTHROPIC_API_KEY。"
-                )
-            from anthropic import AnthropicVertex
-            vertex_kwargs: dict[str, Any] = {
-                "project_id": _api_config["project_id"],
-                "region": _api_config["region"],
-                "timeout": 900.0,
-            }
-            if "credentials" in _api_config:
-                vertex_kwargs["credentials"] = _api_config["credentials"]
-            return AnthropicVertex(**vertex_kwargs)
-
-        # Direct relay/Anthropic 模式 — Claude 和 GPT 都走这里
-        # (用户的 tdyun 中转 model 字符串路由到 Anthropic 或 OpenAI)
-        kwargs = {"api_key": _api_config["api_key"]}
-        if _api_config.get("base_url"):
-            kwargs["base_url"] = _api_config["base_url"]
-        kwargs["timeout"] = 900.0
-        return anthropic.Anthropic(**kwargs)
-
-    @staticmethod
-    def _claude_fallback_candidates(primary_model: str) -> list[str]:
-        """Build [primary, ...fallbacks] for the no-channel保底 path.
-
-        Fallbacks = the other Claude models from CLAUDE_FALLBACK_CHAIN,
-        in chain order, excluding the primary. Non-Claude models
-        (gpt-* / deepseek-*) return just [primary] — they route through
-        their own backends and have no equivalent fallback pool, so they
-        never enter the fallback loop.
-
-        Note: a primary that's a relay suffix variant (e.g.
-        "claude-opus-4-6-high") still counts as Claude and gets the base
-        chain appended — losing the suffix on fallback is an acceptable
-        degradation when the suffixed model has no channel at all.
-        """
-        if not (primary_model or "").lower().startswith("claude-"):
-            return [primary_model]
         out = [primary_model]
-        for m in CLAUDE_FALLBACK_CHAIN:
-            if m != primary_model and m not in out:
-                out.append(m)
+        for m in MODEL_FALLBACK_CHAIN:
+            if m in out:
+                continue
+            if not cls.backend_configured(m):
+                continue
+            out.append(m)
         return out
+
+    # v0.31 及之前的名字,保留给任何外部调用方。
+    _claude_fallback_candidates = _model_fallback_candidates
 
     # Agents that need strategy-level methodology (差异化/真实感/平台感知)
     _STRATEGY_STAGES = frozenset({
@@ -1056,7 +1223,7 @@ class BaseAgent:
         GPT 系列模型不能通过 anthropic SDK 调用——tdyun-style anthropic-compat
         中转转发不过去。所以单独走 OpenAI SDK + vectorengine 端点。
 
-        返回和 _call_claude 同样的 7-tuple,让上层调度逻辑不用分支处理:
+        返回和 _call_model 同样的 7-tuple,让上层调度逻辑不用分支处理:
         (text, input_tokens, output_tokens, cache_read, cache_creation,
         thinking_fired, actual_model)。GPT 没有 anthropic 风格的 thinking 块,
         thinking_fired 永远是 False;GPT 不走 Claude 的 no-channel fallback,
@@ -1135,10 +1302,15 @@ class BaseAgent:
 
         return (text, input_tokens, output_tokens, cache_read, 0, False, effective_model)
 
-    def _call_claude(
+    def _call_model(
         self, system_prompt: str, user_message: str
     ) -> tuple[str, int, int, int, int, bool, str]:
-        """Synchronous Claude API call.
+        """Synchronous model call (Anthropic Messages API 形状)。
+
+        v0.32.0 从 `_call_claude` 改名为 `_call_model` —— 换厂之后这条路上
+        跑的是 Kimi 和 DeepSeek,名字里的 Claude 已经会误导人。它一直都不是
+        "只打 Claude" 的方法(v0.30.0 起就在路由多家),只是名字没跟上。
+        类底部保留了 `_call_claude` 别名,以防外部有引用。
 
         Returns (response_text, input_tokens, output_tokens,
         cache_read_input_tokens, cache_creation_input_tokens,
@@ -1150,8 +1322,8 @@ class BaseAgent:
 
         actual_model is the model that actually produced the response —
         normally the stage's configured model, but if the relay returned
-        "No available channel" it's whichever Claude fallback succeeded
-        (see CLAUDE_FALLBACK_CHAIN). run() surfaces it in model_used so
+        "No available channel" it's whichever fallback model succeeded
+        (see MODEL_FALLBACK_CHAIN). run() surfaces it in model_used so
         the UI reflects the真实 model, not the planned one.
 
         Three execution paths share the SAME kwargs construction (model,
@@ -1233,20 +1405,27 @@ class BaseAgent:
                     or _is_rate_limit_error(_gpt_err)
                     or _classify_llm_error(_gpt_err, 0)[1]  # is_5xx
                 )
-                _cross = (CLAUDE_FALLBACK_CHAIN or [None])[0]
+                # v0.32.0: 兜底目标从"Claude 链首"改成 MODEL_FALLBACK_CHAIN
+                # 里第一个【真的配了 key】的模型。换厂后 Claude 通常没配,
+                # 照老逻辑兜到 claude-* 只会换一个错法失败。
+                _cross = next(
+                    (m for m in MODEL_FALLBACK_CHAIN
+                     if self.backend_configured(m)),
+                    None,
+                )
                 if _routing_or_transient and _cross:
                     logger.warning(
                         "[%s] GPT backend failed (%s: %s); cross-vendor "
-                        "fallback to Claude %s",
+                        "fallback to %s",
                         self.stage_name, type(_gpt_err).__name__,
                         mask_secrets(str(_gpt_err))[:200], _cross,
                     )
                     effective_model = _cross
                     _model_low = effective_model.lower()
                     _is_gpt_family = False
-                    # fall through to the Claude path below with the Claude
-                    # model; thinking/backend selection recompute off
-                    # effective_model, so this behaves like a Claude stage.
+                    # fall through to the anthropic-SDK path below;
+                    # thinking/backend selection recompute off
+                    # effective_model.
                 else:
                     raise
 
@@ -1287,27 +1466,36 @@ class BaseAgent:
         #
         #   3. Fallback (older relays / older models): pass
         #      {"type":"enabled","budget_tokens":N} explicit form.
+        #
+        # v0.32.0 在这三条约定之上加了一层【按厂家】的前置判断:上面三条讲
+        # 的是"这个 backend 用什么形态表达 thinking",而厂家决定的是"它到底
+        # 认不认这个字段"。不认的直接不发(见 _THINKING_CAPABLE_VENDORS)。
         _preset_uses_suffix = _api_config.get("thinking_via_model_suffix", False)
         _preset_supports_adaptive = _api_config.get(
             "supports_adaptive_thinking", True
         )
-        # Adaptive thinking is an Opus-4.6+ API feature(自 Opus 4.6 起支持,
-        # Opus 4.7 / 4.8 继承,Sonnet 4.6 同代际)。Match canonical model
-        # family prefixes exactly, so future names like "claude-opus-5-0"
-        # don't accidentally match and we don't cross-match unrelated model
-        # names containing those digits. Sonnet 3.7 不支持 adaptive
-        # thinking,会走到 else 分支发 budget_tokens。
+        _vendor = _model_vendor(effective_model)
+        # 哪些模型接受 {"type":"adaptive"}(让服务端自己定预算),哪些只能收
+        # 老的 {"type":"enabled","budget_tokens":N}:
+        #   - Kimi K2.6 / K3:Moonshot 的 /anthropic 端点把 enabled 各档都
+        #     映射到 adaptive reasoning,直接发 adaptive 最省事也最贴合。
+        #   - Claude Opus 4.6+ / Sonnet 4.6:Anthropic 自 4.6 起推荐 adaptive,
+        #     固定 budget_tokens 已被标记 deprecated 且效果更差。
+        # 前缀精确匹配,避免将来的 "claude-opus-5-0" 之类误命中。
         _is_adaptive_thinking_family = (
-            "claude-opus-4-6" in effective_model
+            _vendor == "kimi"
+            or "claude-opus-4-6" in effective_model
             or "claude-opus-4-7" in effective_model
             or "claude-opus-4-8" in effective_model
             or "claude-sonnet-4-6" in effective_model
         )
-        # v0.30.0: GPT 模型即使 stage 在 THINKING_STAGES 里也强制不发
-        # thinking 参数(relay 转给 OpenAI 接口会 400)。代码上层把
-        # _use_thinking 留着用于日志标签的"我们打算 think 但 GPT 不接",
-        # 但 kwargs 里啥都不加。
-        if self._use_thinking and _is_gpt_family:
+        # 不认 thinking 字段的厂家:即使 stage 在 THINKING_STAGES 里也不发。
+        #   - GPT:relay 转给 OpenAI 接口会 400。
+        #   - DeepSeek:anthropic-compat 端点静默忽略 thinking,发了不报错但
+        #     也不生效 —— 与其在每个请求里塞一个死字段、让日志显示"开了
+        #     thinking"造成假象,不如不发,thinking_fired 如实记 ✗。
+        # 上层保留 _use_thinking 用于日志标签("我们本来想 think,但这家不接")。
+        if self._use_thinking and _vendor not in _THINKING_CAPABLE_VENDORS:
             pass  # 跳过 thinking 注入,后面 thinking_fired 会自然记录 ✗
         elif self._use_thinking and not _preset_uses_suffix:
             if _is_adaptive_thinking_family and _preset_supports_adaptive:
@@ -1365,7 +1553,7 @@ class BaseAgent:
             disable-cache-and-retry path internally. Any other error
             (including the relay "no available channel" rejection) is
             raised so the outer model-fallback loop can decide whether to
-            try the next Claude model."""
+            try the next model in the fallback chain."""
             try:
                 return _do_stream(kwargs)
             except anthropic.BadRequestError as e:
@@ -1402,13 +1590,14 @@ class BaseAgent:
                 return _do_stream(kwargs)
 
         # ── Model fallback 保底 ────────────────────────────────────────
-        # 中转站对某个 Claude 模型返回"无可用渠道"(No available channel
-        # for model xxx)时,按 CLAUDE_FALLBACK_CHAIN 依次降级到下一个 Claude
-        # 模型重试,避免整个 stage 失败。非 Claude(gpt/deepseek)只有自己
-        # 一个候选,行为不变。每次换模型都重绑 client(闭包变量)+ kwargs
-        # ["model"]。其它错误(rate limit / 5xx / auth)照常上抛,交给
-        # run() 的重试 / 分类逻辑。
-        _candidates = self._claude_fallback_candidates(effective_model)
+        # 上游对某个模型返回"无可用渠道"(No available channel for model
+        # xxx)时,按 MODEL_FALLBACK_CHAIN 依次降级重试,避免整个 stage 失败。
+        # v0.32.0 起这条链跨厂家(Kimi 两档 + DeepSeek),所以候选里未配 key
+        # 的会被 _model_fallback_candidates 提前滤掉。每次换模型都重绑
+        # client(闭包变量)+ kwargs["model"] —— 跨厂家降级时 base_url 和
+        # api_key 都变了,不重绑会拿旧 client 打新厂家的模型名。其它错误
+        # (rate limit / 5xx / auth)照常上抛,交给 run() 的重试 / 分类逻辑。
+        _candidates = self._model_fallback_candidates(effective_model)
         response = None
         for _ci, _try_model in enumerate(_candidates):
             client = self._get_client_for_model(_try_model)
@@ -1709,7 +1898,7 @@ class BaseAgent:
                     thinking_fired,
                     actual_model,
                 ) = await asyncio.to_thread(
-                    self._call_claude, system_prompt, user_message
+                    self._call_model, system_prompt, user_message
                 )
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens
@@ -1733,7 +1922,7 @@ class BaseAgent:
                 _planned_model = (
                     _model_overrides_for_label.get(self.stage_name) or self.model
                 )
-                # v0.30.12: actual_model comes back from _call_claude. If the
+                # v0.30.12: actual_model comes back from _call_model. If the
                 # relay had no channel for the planned model and we fell back
                 # to another Claude model, actual_model ≠ planned — surface
                 # that with a [fallback←planned] tag so model_used in the UI /
@@ -1951,3 +2140,9 @@ class BaseAgent:
             duration_seconds=round(duration, 2),
         )
         raise last_error  # type: ignore[misc]
+
+
+# v0.31 及之前 BaseAgent 上这个方法叫 `_call_claude`。v0.32.0 换厂后改名为
+# `_call_model`(见该方法 docstring)。别名挂在类上,以防有外部代码或测试
+# 按老名字引用/打桩。
+BaseAgent._call_claude = BaseAgent._call_model
