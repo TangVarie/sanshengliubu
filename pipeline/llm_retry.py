@@ -75,11 +75,22 @@ _RETRYABLE_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
+# 欠费停号的指纹 —— 披着 429 的皮但不是限流,充值前重试永远失败。
+# 与 pipeline/agents/__init__.py::_BALANCE_SUSPENDED_MARKERS 保持一致
+# (不直接 import 是为了让本模块保持零 pipeline 依赖,可独立测试)。
+_BALANCE_SUSPENDED_SUBSTRINGS = (
+    "insufficient balance", "please recharge", "account is suspended",
+    "insufficient_user_quota", "余额不足", "欠费",
+)
+
+
 def _is_transient(exc: BaseException) -> bool:
     """Inspect exception text for transient-error fingerprints. Conservative:
     when in doubt, return False (don't retry). Better to fail-fast on a real
     bug than burn retry budget on something that won't recover."""
     msg = str(exc).lower()
+    if any(s in msg for s in _BALANCE_SUSPENDED_SUBSTRINGS):
+        return False  # 欠费:429 外皮,永久失败,重试只是白等
     return any(s in msg for s in _RETRYABLE_SUBSTRINGS)
 
 

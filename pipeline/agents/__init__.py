@@ -246,6 +246,37 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return any(m in msg for m in _RATE_LIMIT_MARKERS)
 
 
+# 「账户被停/余额不足」的指纹。Moonshot 在余额烧干时返回 429 +
+# "Your account org-... is suspended due to insufficient balance, please
+# recharge"(type=exceeded_current_quota_error)。DeepSeek 对应的是 402
+# "Insufficient Balance"。
+#
+# ⚠️ 它们披着 429/RateLimitError 的皮,但语义和限流完全相反:限流是"等一等
+# 就好",欠费是"等到天荒地老也不会好,直到人去充值"。按限流处理的实际后果
+# (2026-08-04 现场):终审阶段对着 suspended 账户重试 3 轮 × 后续 3 个阶段,
+# 白等 3 分钟后 run 以一堆和"欠费"无关的堆栈挂掉 —— 而那条 run 已经跑到了
+# 最后一步,内容全部生成完。用户看到的应该是一句"去充值,回来点恢复",
+# 而不是 traceback。
+_BALANCE_SUSPENDED_MARKERS = (
+    "insufficient balance",
+    "please recharge",
+    "account is suspended",
+    "insufficient_user_quota",
+    "余额不足",
+    "欠费",
+)
+
+
+def _is_balance_suspended_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _BALANCE_SUSPENDED_MARKERS)
+
+
+class BalanceSuspendedError(RuntimeError):
+    """账户欠费被停。不可重试;充值后在流水线详情页点「继续执行」即可续跑
+    (已完成的阶段会被跳过,不重烧)。"""
+
+
 def _classify_llm_error(exc: BaseException, attempt: int) -> tuple[bool, bool]:
     """Vendor-agnostic error classification. Returns (retryable, is_5xx).
 
@@ -254,6 +285,10 @@ def _classify_llm_error(exc: BaseException, attempt: int) -> tuple[bool, bool]:
     (openai.*) error fell through to the default 'retryable=True', wasting
     retries on auth/400 and using the wrong backoff for 5xx.
     """
+    # 欠费停号:最高优先级判定。它带着 429 状态码,不先拦下来就会掉进下面
+    # "rate-limit = transient" 的分支白白重试。
+    if _is_balance_suspended_error(exc):
+        return (False, False)
     # Non-retryable: auth / permission / malformed request (except the
     # cache_control fault, which _call_model self-heals by retrying).
     import anthropic as _anthropic
@@ -2070,6 +2105,19 @@ class BaseAgent:
                 logger.exception(
                     f"[{self.stage_name}] attempt {attempt + 1}/{MAX_RETRIES + 1} failed"
                 )
+                # 欠费停号:立刻换成人话错误并停止一切重试。它披着 429 的皮,
+                # 但充值之前重试多少次都一样;也不该触发 adaptive RPM 降速
+                # (那是给真限流准备的)。BalanceSuspendedError 会走下面
+                # non-retryable 分支落 stage_log,orchestrator 把 run 标 failed
+                # —— 已完成的阶段都在 DB 里,充值后点「继续执行」从断点续跑。
+                if _is_balance_suspended_error(e):
+                    last_error = BalanceSuspendedError(
+                        f"[{self.stage_name}] 模型账户欠费被暂停(上游报: "
+                        f"{str(e)[:160]})。这不是代码或限流问题 —— 去充值,"
+                        f"然后回流水线详情页点「继续执行」:已完成的阶段会被"
+                        f"跳过,只补跑剩下的,不会重烧已花的钱。"
+                    )
+                    break
                 # Adaptive-RPM safety valve: a 429 means the relay is
                 # throttling us. Back the effective rate off toward the safe
                 # floor before retrying — so throttling stays the relay's

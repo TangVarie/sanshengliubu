@@ -2,9 +2,16 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.32.4"
+VERSION = "v0.32.5"
 VERSION_DATE = "2026-08-03"
 VERSION_NOTES = (
+    "v0.32.5 fix: 账户欠费被停(429 suspended / 402 Insufficient Balance)"
+    "不再当普通限流重试。现场(2026-08-04 08:10):run 已跑到终审,Moonshot "
+    "余额烧干,终审对着 suspended 账户重试 3 轮 × 3 个阶段后 run 以一堆无关"
+    "堆栈挂掉。现在:主链路和辅助层都识别欠费指纹,立即停止重试,错误信息"
+    "直接写'去充值,回详情页点继续执行(已完成阶段不重跑)'。"
+)
+_VERSION_NOTES_V0324 = (
     "v0.32.4 hardening: 卡死/空烧排查的第二轮,拆两颗同类雷。"
     "(1) _validate_prompt_cell 的 essential_keywords(合规/关键词/反 AI 腔"
     "禁用清单)是【硬失败】却单字面量匹配,是全函数唯一没有别名表的检查 ——"
