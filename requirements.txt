@@ -5,6 +5,16 @@
 # watcher in pages/3 (non-blocking auto-refresh). Older versions only had
 # st.experimental_fragment.
 streamlit>=1.37.0,<2.0.0
+# ⚠️ 传递依赖钉死(2026-08-05 生产事故):starlette 1.4.0 给
+# GZipResponder.__init__ 新增了必填的 keyword-only 参数 thread_minimum_size,
+# 而 streamlit(实测 1.61.0,声明的约束是 starlette<2,>=0.46 —— 拦不住)的
+# _MediaAwareGZipResponder 仍按旧签名调用。后果:服务器对【所有】请求 500
+# (TypeError: missing 'thread_minimum_size'),健康检查不过,应用整个起不来,
+# app.py 根本没被执行到。Streamlit Cloud 每次重建容器都全新解析依赖,所以
+# 这类"上游昨晚发新版"的破坏会在任意一次重启时突然出现。
+# 下限 0.49.1 来自 sse-starlette 3.4.8(mcp 的依赖)的要求。
+# 等 streamlit 适配 starlette 1.4 后再放开上限。
+starlette>=0.49.1,<1.4.0
 anthropic[vertex]>=0.25.0,<1.0.0
 # google-auth 仍然需要:anthropic[vertex] 的 Vertex 凭证路径靠它。
 # 主链路(Kimi/DeepSeek)用不到,但 secrets 里配了 GCP_PROJECT_ID 的老部署
