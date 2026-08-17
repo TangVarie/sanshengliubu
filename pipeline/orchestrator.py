@@ -75,6 +75,7 @@ from pipeline.prose_gate import (
     scan_text as prose_scan_text,
 )
 from pipeline.quality_metrics import (
+    check_and_flag_regression,
     deterministic_structure_audit,
     persist_quality_score,
     score_matrix,
@@ -866,6 +867,15 @@ class PipelineOrchestrator:
                 )
                 final_system["_quality_score"] = _scorecard
                 persist_quality_score(self.db, self.run_id, _scorecard)
+                # 回归哨兵:跟同项目历史比,掉出噪声带就写红字告警。
+                # 单条 run 的分数没有意义,只有跟自己的历史比才知道是涨是跌 ——
+                # 而没人会去手动比对每条 run 的两个数字。
+                _reg = check_and_flag_regression(
+                    self.db, self.project_id, self.run_id,
+                    _scorecard, final_system,
+                )
+                if _reg:
+                    _scorecard["_regression"] = _reg
             except Exception:
                 # 评分器本身抛异常也不能把一条跑完的 run 判死 —— 它是可观测性,
                 # 不是硬不变量。和 _persist_audit_findings 同一个原则。

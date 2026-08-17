@@ -486,6 +486,155 @@ def score_matrix(
     }
 
 
+# ── 回归哨兵 ─────────────────────────────────────────────────────────────
+#
+# 单条 run 的分数没有意义。「红线 10/12、高分篇 5/12」是好是坏,只有跟这个项目
+# 自己的历史比才知道。
+#
+# 这一层要解决的不是"记得打开某个开关" —— 开关本来就是默认开的,不需要人记。
+# 它解决的是**靠记性做不到的那件事**:某次改动之后质量悄悄掉了。人不会盯着
+# 每条 run 的两个数字去跟上周对比,但代码会。
+
+# 拿最近几条 run 做基线。太少(<3)噪声压不住,太多则对真实的阶段性改进反应迟钝。
+BASELINE_WINDOW = 8
+# 至少要有这么多条历史才开始判 —— 前几条 run 是在建立基线,不该报警。
+BASELINE_MIN_RUNS = 3
+# 高分篇率的噪声带。LLM 生成本身带 temperature 抖动,同一版 prompt 连跑两批
+# 高分篇数就会差一两篇。低于这个幅度的变化一律读作"持平",不报警。
+# 0.15 ≈ 12 格子里差 1.8 篇,和小样本下的实测抖动量级一致。
+HIGH_SCORE_NOISE_BAND = 0.15
+# 红线是确定性判定(正则命中),不受 temperature 影响 —— 掉了就是真掉了,
+# 所以用一个很小的容差,基本等于"只要跌就报"。
+REDLINE_NOISE_BAND = 0.02
+
+
+def _median(xs: list[float]) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2
+
+
+def detect_regression(
+    scorecard: dict, history: list[dict]
+) -> dict | None:
+    """拿本轮分数跟历史中位数比,判断是否回归。
+
+    Args:
+        scorecard: 本轮的 `score_matrix` 输出。
+        history: 同项目此前若干条 run 的 scorecard(时间倒序),由
+            `db.get_quality_score_history` 提供。
+
+    Returns:
+        None = 没有回归(或历史不足以判断);dict = 回归详情。
+
+    两条指标分开判,口径不同:
+      - **红线通过率**是确定性判定,不受 temperature 影响 —— 跌了就是真跌
+      - **高分篇率**受生成抖动影响 —— 要跌出噪声带才算
+
+    高分篇这里用**率**不用绝对数,因为跨 run 的格子数会变(方向数 × 平台数
+    不固定,策略升级还会加格子)。绝对数在同一批实验内部可比,跨 run 比必须归一。
+    这和 UI 上"看绝对数翻倍"不矛盾:那是同口径的纵向对比,这里是跨口径的。
+    """
+    # 只跟**覆盖完整**的历史比。critic 挂过的那几条 run 高分篇数是被低估的,
+    # 混进基线会把标准拉低,于是真正的退步反而报不出来。
+    usable = [
+        h for h in history
+        if h.get("total_cells")
+        and h.get("high_score_coverage_cells") == h.get("total_cells")
+    ]
+    if len(usable) < BASELINE_MIN_RUNS:
+        return None
+
+    usable = usable[:BASELINE_WINDOW]
+    cur_total = scorecard.get("total_cells") or 0
+    if not cur_total:
+        return None
+    # 本轮自己覆盖不全时不判高分层 —— 那个数字本来就不可比。
+    cur_full_coverage = (
+        scorecard.get("high_score_coverage_cells") == cur_total
+    )
+
+    base_redline = _median([
+        float(h.get("redline_pass_rate") or 0.0) for h in usable
+    ])
+    base_high = _median([
+        (h.get("high_score_cells") or 0) / (h.get("total_cells") or 1)
+        for h in usable
+    ])
+    cur_redline = float(scorecard.get("redline_pass_rate") or 0.0)
+    cur_high = (scorecard.get("high_score_cells") or 0) / cur_total
+
+    issues: list[str] = []
+    if cur_redline < base_redline - REDLINE_NOISE_BAND:
+        issues.append(
+            f"红线通过率 {cur_redline:.0%} < 近 {len(usable)} 条 run 的中位数 "
+            f"{base_redline:.0%}。红线是确定性判定、不受生成抖动影响，"
+            f"跌了就是真跌 —— 多半是某条规则被改动引入，或提示词里对应的"
+            f"约束被削弱了"
+        )
+    if cur_full_coverage and cur_high < base_high - HIGH_SCORE_NOISE_BAND:
+        issues.append(
+            f"高分篇率 {cur_high:.0%} < 中位数 {base_high:.0%}，"
+            f"跌幅超出噪声带 {HIGH_SCORE_NOISE_BAND:.0%}。这一项受生成抖动影响，"
+            f"单次可能是偶然 —— 但连续两条 run 都报就值得回去看最近改了什么"
+        )
+
+    if not issues:
+        return None
+
+    return {
+        "regressed": True,
+        "baseline_runs": len(usable),
+        "redline": {"current": round(cur_redline, 4),
+                    "baseline_median": round(base_redline, 4)},
+        "high_score_rate": {"current": round(cur_high, 4),
+                            "baseline_median": round(base_high, 4),
+                            "_scored": cur_full_coverage},
+        "issues": issues,
+    }
+
+
+def check_and_flag_regression(
+    db, project_id: str, run_id: str, scorecard: dict, final_system: dict
+) -> dict | None:
+    """跑回归哨兵,有回归就写进 strategic_warnings 让 UI 红字显示。
+
+    尽力而为:查询失败 / 历史不足 / 判定异常一律静默跳过,绝不影响出货。
+    """
+    try:
+        history = db.get_quality_score_history(
+            project_id, limit=BASELINE_WINDOW, exclude_run_id=run_id
+        )
+        result = detect_regression(scorecard, history)
+        if not result:
+            logger.info(
+                "[regression] 无回归(可比历史 %d 条)", len(history)
+            )
+            return None
+
+        final_system.setdefault("strategic_warnings", []).append({
+            "type": "quality_regression",
+            "stage": "quality_score",
+            "message": (
+                "⚠️ **本轮质量分低于该项目的历史水平** —— "
+                + "；".join(result["issues"])
+                + "。建议对照 architecture.md 第 5 节的 SQL 看一下分数曲线，"
+                  "并回顾最近改了哪些提示词或 flag。"
+            ),
+            "detail": result,
+            "source": "regression_sentinel",
+        })
+        logger.warning(
+            "[regression] 检出回归:%s", " | ".join(result["issues"])
+        )
+        return result
+    except Exception:
+        logger.exception("[regression] 哨兵执行失败(non-fatal)")
+        return None
+
+
 def persist_quality_score(db, run_id: str, scorecard: dict) -> None:
     """把 scorecard 写成一行 stage_log(stage_name='quality_score')。
 

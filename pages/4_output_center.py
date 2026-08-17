@@ -438,6 +438,42 @@ elif consumer_sim and consumer_sim.get("judgments"):
 # rewriter 改不了,需要用户人工介入(回 secretariat 改 direction,或回
 # cell_planner 改 product_role)。红色 callout,直接挂在 vibe 结果下面。
 strategic_warnings = prompt_system.get("strategic_warnings") or []
+
+# 回归哨兵的告警是 run 级的（跟项目历史比），不是 cell 级的策略隐患。
+# 下面那个 expander 按 cell_id + root_cause_explanation 渲染，塞进去会显示成
+# 一行空白。所以先摘出来单独给个显眼位置，剩下的再走原通道。
+_regression_warnings = [
+    w for w in strategic_warnings
+    if w.get("type") == "quality_regression"
+]
+strategic_warnings = [
+    w for w in strategic_warnings
+    if w.get("type") != "quality_regression"
+]
+for _rw in _regression_warnings:
+    st.error(_rw.get("message", "本轮质量分低于历史水平"))
+    _d = _rw.get("detail") or {}
+    _rl, _hs = _d.get("redline") or {}, _d.get("high_score_rate") or {}
+    _c1, _c2 = st.columns(2)
+    _c1.metric(
+        "红线通过率",
+        f"{_rl.get('current', 0):.0%}",
+        delta=f"{(_rl.get('current', 0) - _rl.get('baseline_median', 0)):+.0%} vs 历史中位数",
+        delta_color="inverse",
+    )
+    _c2.metric(
+        "高分篇率",
+        f"{_hs.get('current', 0):.0%}"
+        + ("" if _hs.get("_scored", True) else "（本轮覆盖不全，未参与判定）"),
+        delta=f"{(_hs.get('current', 0) - _hs.get('baseline_median', 0)):+.0%} vs 历史中位数",
+        delta_color="inverse",
+    )
+    st.caption(
+        f"基线取自该项目最近 {_d.get('baseline_runs', '?')} 条**评分覆盖完整**的 run 的中位数。"
+        "覆盖不全的 run 被排除在基线之外 —— 那些 run 的高分篇数是被低估的，"
+        "混进来会把标准拉低、真正的退步反而报不出来。"
+    )
+
 if strategic_warnings:
     with st.expander(
         f"策略层隐患({len(strategic_warnings)} 条)——这些 cell 流水线跑完了但策略层有漏洞",
