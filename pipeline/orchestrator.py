@@ -24,6 +24,9 @@ from pipeline.config import (
     ENABLE_STRUCTURAL_REWRITER,
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
+    CONSUMER_SIM_ONLY_WEAK_ALIGN,
+    NARRATIVE_DIRECTOR_MAX_REBUILDS,
+    PERSONA_WEAK_REQUIRES_BOTH_BACKENDS,
     STRATEGIC_LOOP_MAX_ITERATIONS,
     PIPELINE_HEARTBEAT_INTERVAL_SECONDS,
     SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
@@ -1958,6 +1961,56 @@ class PipelineOrchestrator:
         )
         final_system["_narrative_director_result"] = review
 
+        # v0.33.2: 重建设上限。诊断很便宜(2101 字符提示词、只看 demo 前 500 字),
+        # 贵的全在重建 —— 每个 flagged cell 都要重跑一次 works_builder,
+        # 而那是全流水线 token 消耗第一的 stage。诊断出 8 个问题就等于把
+        # 最贵的 stage 又跑 8 次。
+        #
+        # 它管的"钩子重复/跨 cell 撞车"另有两处覆盖:`_find_cross_cell_duplicates`
+        # (确定性、零成本、跑两遍)和 vibe_critic 第 3 步的跨 cell 一致性检查。
+        # 三重覆盖里只有这一路会触发最贵的重建,所以这里限流。
+        #
+        # 按 severity 排序后取前 N 个:模型没给 severity 时按原顺序(它通常
+        # 已经把最严重的排在前面)。被截掉的写进 review 让终审和 UI 看得见,
+        # 不静默丢弃 —— 无声截断会被读成"这些问题不存在"。
+        _cap = NARRATIVE_DIRECTOR_MAX_REBUILDS
+        _deferred: list[dict] = []
+        if _cap is not None and len(cells_to_revise) > _cap:
+            _sev_rank = {"high": 0, "critical": 0, "medium": 1, "low": 2}
+            _sorted = sorted(
+                cells_to_revise,
+                key=lambda r: _sev_rank.get(
+                    (r.get("severity") or "").strip().lower(), 1
+                ),
+            )
+            _deferred = _sorted[_cap:]
+            cells_to_revise = _sorted[:_cap]
+            logger.warning(
+                "[narrative_director] 诊断出 %d 个待修 cell,按上限只重建前 %d 个"
+                "(重建=重跑 works_builder,最贵的 stage);其余 %d 个转 "
+                "strategic_warnings 交人工: %s",
+                len(_deferred) + _cap, _cap, len(_deferred),
+                [c.get("cell_id") for c in _deferred],
+            )
+            review["_deferred_rebuilds"] = [
+                {
+                    "cell_id": c.get("cell_id"),
+                    "issue": c.get("issue", ""),
+                    "fix_instruction": c.get("fix_instruction", ""),
+                }
+                for c in _deferred
+            ]
+            for c in _deferred:
+                final_system.setdefault("strategic_warnings", []).append({
+                    "cell_id": c.get("cell_id"),
+                    "type": "narrative_rebuild_deferred",
+                    "root_cause_explanation": (
+                        "叙事导演诊断出跨 cell 问题,但本轮重建已达上限 "
+                        f"({_cap} 个) 未修复 —— {c.get('issue', '')}"
+                    ),
+                    "source": "narrative_director",
+                })
+
         # Selective rebuild: for each flagged cell, inject the director's
         # fix_instruction into the builder's input as a _narrative_directive
         # and re-run just that cell. Reuse the existing single-cell builder
@@ -2407,12 +2460,43 @@ class PipelineOrchestrator:
                         f"{_pid}: {(_r.get('reaction') or '')[:60]}"
                     )
 
-            _weak_set: set[str] = set()
+            # 每个 backend 独立投票:该 backend 至少给了 3 个画像判决且全 skip
+            # → 这个 backend 一致否决。
+            _vetoed_by: dict[str, set[str]] = {}
+            _backends_seen: set[str] = set()
             for (_cid, _src), _acts in _actions_by_cell_src.items():
-                # 该 backend 至少给了 3 个画像判决且全 skip → 这个 backend 一致否决
+                _backends_seen.add(_src)
                 if len(_acts) >= 3 and all(_a == "skip" for _a in _acts):
-                    _weak_set.add(_cid)
-            _weak_cell_ids = sorted(_weak_set)
+                    _vetoed_by.setdefault(_cid, set()).add(_src)
+
+            # v0.33.2: 判据从【任一 backend 否决】改成【所有跑通的 backend 都否决】。
+            #
+            # 改的是**成本不对称**不是准确率。并集规则下多一个 backend 主要是提高
+            # 误报率,而误报的代价极不对称:弱 cell → strategic_warnings →
+            # 触发 strategic_escalation → 回中书省(kimi-k3)改方向 → 再跑一整轮
+            # vibe_loop。一次几分钱的 DeepSeek 调用能触发全流水线最贵的重入。
+            #
+            # 交集要求两个不同厂家、不同 distribution 的画像都一致否决 —— 这才是
+            # 当初做双 backend 的本意:跨厂家一致=强信号,单边否决=噪声。
+            # 只有一个 backend 跑通时(另一个没配 key / 挂了)交集自动退化成
+            # 它自己,不会因为少一票就永远判不出弱 cell。
+            if PERSONA_WEAK_REQUIRES_BOTH_BACKENDS and len(_backends_seen) > 1:
+                _weak_cell_ids = sorted(
+                    cid for cid, srcs in _vetoed_by.items()
+                    if srcs >= _backends_seen
+                )
+                _single_sided = sorted(
+                    cid for cid, srcs in _vetoed_by.items()
+                    if not (srcs >= _backends_seen)
+                )
+                if _single_sided:
+                    logger.info(
+                        "[persona_sim] %d 个 cell 只被单边 backend 否决,按交集"
+                        "规则不判弱(避免廉价误报触发 strategic_escalation): %s",
+                        len(_single_sided), _single_sided,
+                    )
+            else:
+                _weak_cell_ids = sorted(_vetoed_by.keys())
 
             if _weak_cell_ids:
                 _matrix = final_system.get("prompt_matrix") or []
@@ -4029,8 +4113,53 @@ class PipelineOrchestrator:
         # v0.30.6 fix M4: 每个 cell 带自己的 platform,避免多平台 brief
         # 里 douyin cell 被用 xhs 标准评判。
         fallback_audience = structured_brief.get("target_audience", "") or ""
+
+        # v0.33.2: 只对 critic 判 interest_align=weak 的 cell 做第二层校验。
+        #
+        # 到这一步同一批 demo 已经被画像类 agent 判过两遍(主 + alt 双 backend),
+        # 而本函数调的**就是同一个 persona_simulator**,只是换了 mode 和判据 ——
+        # 同一个 agent 对同一批内容判第三遍。
+        #
+        # 而它的定位是"interest_align 的第二层校验",可 vibe_critic 的四乘数
+        # 硬门槛已经逐 cell 判过 interest_align 了:判 pass 的再判一遍多半同答案,
+        # 判 fail 的早就进了 rewriter 或 strategic_warnings。真正值得花第二票的
+        # 只有 **weak** 那一档 —— critic 自己都拿不准的。
+        #
+        # 数据来自 vibe_loop 累积的 _vibe_cell_reviews(零额外成本)。拿不到时
+        # 退回全量 —— critic 挂了的情况下恰恰最需要这层校验。
+        _target_cells = prompt_cells
+        _reviews = getattr(self, "_vibe_cell_reviews", None) or {}
+        if CONSUMER_SIM_ONLY_WEAK_ALIGN and _reviews:
+            _weak_ids = {
+                cid for cid, rv in _reviews.items()
+                if ((rv.get("multiplier_gate") or {}).get("interest_align") or "")
+                .strip().lower() == "weak"
+            }
+            if not _weak_ids:
+                logger.info(
+                    "[consumer_sim] critic 对全部 %d 个 cell 的 interest_align "
+                    "都不是 weak,跳过第二层校验(省一次调用)",
+                    len(prompt_cells),
+                )
+                final_system["_consumer_simulation"] = {
+                    "status": "skipped",
+                    "reason": (
+                        "vibe_critic 的 interest_align 判决里没有 weak 档 —— "
+                        "pass 的不需要复判,fail 的已走重写/告警通道。"
+                    ),
+                    "_scope": "weak_only",
+                }
+                return
+            _target_cells = [
+                c for c in prompt_cells if c.get("cell_id") in _weak_ids
+            ]
+            logger.info(
+                "[consumer_sim] 只复判 interest_align=weak 的 %d/%d 个 cell: %s",
+                len(_target_cells), len(prompt_cells), sorted(_weak_ids),
+            )
+
         slim_cells = []
-        for c in prompt_cells:
+        for c in _target_cells:
             did = c.get("direction_id")
             d = direction_index.get(did) or {}
             stop_trigger = (d.get("stop_trigger") or "").strip()
@@ -4072,7 +4201,16 @@ class PipelineOrchestrator:
             }
             return
 
-        final_system["_consumer_simulation"] = {"status": "ok", **(result or {})}
+        # `_scope` 记录这一轮到底复判了哪些 cell —— 不写的话 UI 上"全部通过"
+        # 会被读成"整个矩阵都过了",而实际只判了 weak 那一档。
+        final_system["_consumer_simulation"] = {
+            "status": "ok",
+            "_scope": (
+                "weak_only" if len(_target_cells) < len(prompt_cells) else "all"
+            ),
+            "_cells_checked": [c.get("cell_id") for c in _target_cells],
+            **(result or {}),
+        }
 
         # Cells where the modeled consumer would scroll = interest_align
         # second-layer fail. Append to strategic_warnings so UI surfaces them.
@@ -4102,8 +4240,9 @@ class PipelineOrchestrator:
                 })
         else:
             logger.info(
-                "[consumer_sim] all %d cells passed 2nd-level consumer check",
-                len(prompt_cells),
+                "[consumer_sim] 复判的 %d 个 cell 全部通过第二层校验"
+                "(矩阵共 %d 个)",
+                len(_target_cells), len(prompt_cells),
             )
 
 

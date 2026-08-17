@@ -337,6 +337,43 @@ ORDER BY week DESC;
 
 ---
 
+## 6. 终审输入为什么要 allowlist (v0.33.2)
+
+`chancellery_final` 跑 kimi-k3 ($3 in / $15 out),是全流水线单价最高的一档,
+而它拿到的曾经是**整个 `final_system`**。
+
+到终审这一步,`final_system` 上已经堆了 8 个上游阶段挂的诊断数据。而
+`chancellery.md` 全文只引用两样东西:`prompt_matrix`,和 orchestrator 单独
+注入的 `narrative_director_summary`。
+
+最刺眼的是 **demo 正文被送了三遍**:
+
+| 位置 | 提示词有引用吗 |
+|------|----------------|
+| `prompt_matrix[i].demo_output` | ✅ 唯一被引用的那份 |
+| `demo_outputs[i].output_content` | ❌ 从未提及 |
+| `_red_blue_stats.details[i].refined_demo_output` | ❌ 从未提及 |
+
+12 个格子的实测:瘦身前 104K 字符 → 瘦身后 54K,**砍掉 49%**。
+
+### 这是 v0.30.5 那批 dead drop 的镜像问题
+
+v0.30.5 修的是「数据注入了但提示词不知道去读」(漏信号);这次是「数据注入了
+而提示词根本不需要读」(烧钱)。同一个根因:**没人管 `final_system` 上到底
+该有什么** —— 每个阶段都往上挂自己的诊断包,没有一个环节负责清理。
+
+### 为什么用 allowlist 而不是 blocklist
+
+blocklist 挡不住"以后又有人往 `final_system` 上挂新字段"这个复发路径,而这
+正是问题的来源。代价是将来提示词要用新字段时得记着去
+`agents/chancellery.py::_FINAL_REVIEW_KEEP_KEYS` 加一行 —— 所以被丢掉的 key
+会打日志(`[chancellery_final] 输入瘦身:丢掉 N 个…`),drift 是可见的。
+
+改 `chancellery.md` 让终审引用新字段时,**必须同步加进 allowlist**,否则
+提示词让它看的东西根本不在输入里。
+
+---
+
 ## 后续 sprint backlog (audit 2026-05-22 未实施项)
 
 | ID | 主题 | 工时 | 触发条件 |

@@ -2,9 +2,55 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.33.1"
+VERSION = "v0.33.2"
 VERSION_DATE = "2026-08-17"
 VERSION_NOTES = (
+    "v0.33.2 perf: 按 token 而不是按调用次数重排成本,砍掉四处高消耗低收益。"
+    "⚠️ 方法论前提:先按【调用次数】排过一版成本序,结论是'红蓝精炼跑全量最贵'。"
+    "按 token 重算之后那个结论是错的 —— 红蓝的提示词只有 1848 字符、输出是个"
+    "attacks 列表、而且红队找不到问题就直接跳过蓝队(已有优化),token 上很便宜。"
+    "真正的消耗集中在:工部构建、策略辩论的 k3 输出、终审的 k3 输入。所以本版"
+    "【不动红蓝】,改打这四处:"
+    "(1) 终审输入 allowlist 瘦身 —— 单项收益最大。chancellery_final 跑 kimi-k3"
+    "($3/$15,单价最高),拿到的是【整个 final_system】,而 chancellery.md 全文"
+    "只引用 prompt_matrix 和单独注入的 narrative_director_summary。demo 正文被"
+    "送了三遍(prompt_matrix.demo_output / demo_outputs[].output_content /"
+    "_red_blue_stats.details[].refined_demo_output),加上 _persona_reactions、"
+    "_structure_review、_consumer_simulation、vibe_critic_result 这些提示词一个"
+    "字没提的诊断包。12 格子实测 104K 字符 → 54K,砍 49%。这是 v0.30.5 修的那批"
+    "dead drop 的镜像:那次是'注入了但提示词不知道读'(漏信号),这次是'注入了而"
+    "提示词根本不需要读'(烧钱),同一个根因 —— 没人管 final_system 上该有什么。"
+    "用 allowlist 不用 blocklist:后者挡不住'以后又有人往上挂新字段'的复发路径,"
+    "而那正是问题来源;丢掉的 key 打日志让 drift 可见。详见 architecture.md 第 6 节。"
+    "(2) MAX_DEBATE_TURNS 8 → 4。中书省每轮重吐完整大 plan(5-7 directions +"
+    "matrix_skeleton)跑 k3 的 $15/1M 输出档,正是它把 MAX_TOKENS_STRATEGY 逼到"
+    "48000 的。砍的理由不是省钱,是【对抗性本来就是跛的】:config 自己在"
+    "THINKING_STAGES 承认门下省跑 deepseek-v4-flash、端点不认 thinking 参数、"
+    "所以实际没有 extended thinking。'k3 深推理'对'廉价档浅判断',第 3、4 个"
+    "来回的边际收益很低而成本线性翻倍。门下省仍可提前 approve,4 是上限非固定开销。"
+    "(3) 消费者模拟只跑 critic 判 interest_align=weak 的 cell。它调的【就是同一个"
+    "persona_simulator】,而同批 demo 已被画像 agent 判过两遍(主+alt),这是第三遍;"
+    "且它自称'interest_align 的第二层校验',可 vibe_critic 的四乘数硬门槛已经逐 cell"
+    "判过 interest_align —— pass 的复判多半同答案,fail 的早进了 rewriter/告警。"
+    "只有 weak 那档(critic 自己都拿不准的)值得花第二票。数据取 P1 建的"
+    "_vibe_cell_reviews,零额外成本;拿不到 review 时退回全量(critic 挂了时恰恰"
+    "最需要这层校验)。结果里写 _scope 标明复判范围,避免 UI 上'全部通过'被读成"
+    "'整个矩阵都过了'。"
+    "(4) 画像弱 cell 判据:任一 backend 否决 → 两个 backend 都否决。改的是【成本"
+    "不对称】不是准确率:并集规则下多一个 backend 主要提高误报率,而误报代价极不"
+    "对称 —— 弱 cell → strategic_warnings → 触发 strategic_escalation → 回中书省"
+    "(k3)改方向 → 再跑一整轮 vibe_loop。一次几分钱的 DeepSeek 调用能触发全流水线"
+    "最贵的重入。交集要求跨厂家一致才算弱,这才是当初做双 backend 的本意。只有一个"
+    "backend 跑通时自动退化成它自己,不会因为少一票就永远判不出弱 cell。"
+    "(5) 叙事导演重建上限 3。诊断便宜(2101 字符提示词、只看 demo 前 500 字),贵的"
+    "全在重建 —— 每个 flagged cell 重跑一次 works_builder(token 消耗第一的 stage),"
+    "诊断出 8 个就等于把最贵的 stage 又跑 8 次。它管的跨 cell 撞车另有两处覆盖"
+    "(_find_cross_cell_duplicates 确定性零成本跑两遍 + vibe_critic 第 3 步),"
+    "三重覆盖里只有这一路触发最贵的重建。超出上限的按 severity 排序后转"
+    "strategic_warnings 交人工,不静默丢弃 —— 无声截断会被读成'这些问题不存在'。"
+    "(3)(4)(5) 全部走 config flag,默认新行为,改一行即可回退。"
+)
+_VERSION_NOTES_V0331 = (
     "v0.33.1 fix: 拆三颗互相独立的雷 —— 约束打架 / 结构审重复 / 路径撞车。"
     "(A) works_builder 的输出预算是【自相矛盾】的,这是 v0.32.3、v0.32.4 反复"
     "出现空烧和截断的真根。真因不是'模块多字数少',是 demo 正文在输出里写了"
@@ -622,7 +668,23 @@ MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3 (legacy, us
 # Secretariat speaks on even turns, chancellery on odd. So MAX_DEBATE_TURNS=8
 # means 4 exchanges (each agent speaks 4 times). Chancellery can approve
 # at any odd turn to end early. Last chancellery turn is force-approve.
-MAX_DEBATE_TURNS = 8
+# ⚠️ v0.33.2: 8 → 4(即 2 个来回)。
+#
+# 这是全流水线最贵的非格子环节:中书省每一轮都要重吐**完整大 plan**
+# (5-7 个 tactical_directions + 十几个 active_cells 的 matrix_skeleton),
+# 跑 kimi-k3 的 $15/1M 输出档,而且正是它把 MAX_TOKENS_STRATEGY 逼到 48000 的
+# (见那个常量上方记的两次截断事故)。8 轮 = 中书省吐 4 次完整 plan。
+#
+# 砍到 4 的理由不是"省钱",是**对抗性本来就是跛的**:config 自己在
+# THINKING_STAGES 那里承认,门下省现在跑 deepseek-v4-flash,而 DeepSeek 端点
+# 不认 thinking 参数,所以门下省【实际上没有 extended thinking】。
+# 于是这场辩论是「k3 深推理提案」对「廉价档浅判断」—— 第 3、4 个来回能挑出
+# 前两个来回没挑出的东西的概率很低,但成本是线性翻倍的。
+#
+# 门下省仍可在任意奇数轮 approve 提前收敛,所以 4 轮是上限不是固定开销。
+# 想换回深度对抗:把 KIMI_DEEPSEEK_MAP["chancellery"] 改成 PRIMARY/FLAGSHIP
+# (thinking 会自动恢复),那时再考虑抬回 6-8。
+MAX_DEBATE_TURNS = 4
 
 # final_review (工部产出的 prompt_matrix) 的轮次上限。第一次跑流水线 = round 1；
 # 用户每点一次「应用修订意见并重跑」round +1。超过 MAX_FINAL_REJECTIONS 后强制
@@ -1102,6 +1164,58 @@ STRATEGIC_LOOP_MAX_ITERATIONS = 1
 # final_system._consumer_simulation,UI 显示;cell 若被目标用户 scroll,会
 # 追加进 strategic_warnings 走人工审查通道。
 ENABLE_CONSUMER_SIMULATION = True
+
+# v0.33.2: 消费者模拟只跑【critic 判 interest_align=weak】的 cell,不再全量跑。
+#
+# 病灶:到消费者模拟这一步,同一批 demo 已经被画像类 agent 判过两遍
+# (persona_simulator 主 + alt 双 backend),而消费者模拟调的**就是同一个
+# persona_simulator**,只是 mode 换成 consumer_simulation、判据从
+# target_audience 换成 stop_trigger —— 同一个 agent 对同一批内容判第三遍。
+#
+# 更关键的是它的定位:"interest_align 的第二层校验"。但 vibe_critic 的四乘数
+# 硬门槛**已经逐 cell 判过 interest_align 了**。对 critic 判 pass 的 cell 再
+# 全量复判一遍,拿到的多半是同一个答案;对 critic 判 fail 的 cell,它们要么
+# 已经进了 rewriter 要么已经进了 strategic_warnings,也不需要这一票。
+#
+# 真正有价值的是 **weak** 那一档 —— critic 自己都拿不准的。把二次意见花在
+# 这里,才是"第二层校验"该有的样子。
+#
+# 数据来源是 P1 建的 orchestrator._vibe_cell_reviews(vibe_loop 跨轮次累积的
+# cell_reviews),零额外成本。拿不到 review 时(critic 挂了 / resume 路径)
+# 退回全量跑 —— 那种情况下恰恰最需要第二层校验。
+CONSUMER_SIM_ONLY_WEAK_ALIGN = True
+
+# v0.33.2: 画像模拟的"弱 cell"判据从【任一 backend 全 skip】改成
+# 【两个 backend 都全 skip】。
+#
+# 病灶是**成本不对称**,不是准确率。原来的并集规则方向很明确:多加一个
+# backend 主要提高的是误报率(6 个画像里任意一组 3 票全 skip 就判弱),
+# 而误报的代价极不对称 ——
+#   弱 cell → strategic_warnings → 触发 ENABLE_STRATEGIC_ESCALATION
+#          → 回中书省(kimi-k3)改方向 → **再跑一整轮 vibe_loop**
+# 一次几分钱的 DeepSeek 调用,能触发全流水线最贵的一次重入。
+#
+# 交集规则要求两个不同厂家、不同 distribution 的画像**都**一致否决才算弱。
+# 这才是当初双 backend 的本意:跨厂家一致 = 强信号;单边否决 = 噪声。
+# 设 False 回到 v0.30.8~v0.33.1 的并集行为。
+PERSONA_WEAK_REQUIRES_BOTH_BACKENDS = True
+
+# v0.33.2: 叙事导演的 cell 重建上限。
+#
+# 叙事导演诊断出跨 cell 问题后会**逐个重跑 works_builder** 来重建 cell ——
+# 而 works_builder 是全流水线 token 消耗第一的 stage(15.8K 字符系统提示词 +
+# 完整 cell_plan + brief + 4500 字符输出)。诊断本身很便宜(2101 字符提示词、
+# 只看 demo 前 500 字),贵的全在重建。
+#
+# 它管的"钩子重复 / 跨 cell 撞车"还有另外两处覆盖:
+#   - `_find_cross_cell_duplicates` —— 确定性、零成本,而且跑两遍
+#     (builder 结束一次 + vibe 之后一次)
+#   - `vibe_critic.md` 第 3 步「跨 cell 一致性检查(batch 内必做)」
+# 三重覆盖里只有叙事导演这一路会触发最贵的重建。
+#
+# 设上限而不是直接关掉:它的"正反面叙事比例失衡"这类判断确实是另外两处
+# 看不到的。0 = 只诊断不重建(纯 advisory);None = 不限(v0.33.1 及之前的行为)。
+NARRATIVE_DIRECTOR_MAX_REBUILDS = 3
 
 # ── Advisory stage concurrency ────────────────────────────────────────────
 RED_BLUE_CONCURRENCY = 5
