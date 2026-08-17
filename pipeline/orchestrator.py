@@ -69,6 +69,11 @@ from pipeline.retrieve_samples import (
 )
 from pipeline.logger_utils import mask_secrets
 from pipeline.batch_sampler import run_batch_sampling
+from pipeline.prose_gate import (
+    format_hard_hits_for_rewriter,
+    run_prose_gate,
+    scan_text as prose_scan_text,
+)
 from pipeline.quality_metrics import (
     deterministic_structure_audit,
     persist_quality_score,
@@ -732,6 +737,60 @@ class PipelineOrchestrator:
                     "output_content": _demo_txt,
                 })
             final_system["demo_outputs"] = _rebuilt_demos
+
+            # 6.955 机审闸 · 跨篇指纹(v0.33.5)。零 LLM 成本。
+            #
+            # 这一层抓的是**结构重合**,和已有的跨 cell 查重是两回事:
+            #   - _find_cross_cell_duplicates / trigram Jaccard 抓【词面重合】
+            #     —— 换汤不换药
+            #   - 这里抓【结构重合】—— 每篇开头都时空锚定、每篇都插一句"说真的"、
+            #     每篇结尾落在同一句式。词面重合度可以很低,读者一眼流水线。
+            #     这是【换药不换汤】
+            #
+            # 蓝词和品牌词走白名单:蓝词必须**原样重复**(轮换同义词直接损伤搜索
+            # 权重),它们出现在每一篇里是正确行为,不能被算成批量指纹。
+            try:
+                _allow_terms = set()
+                for _k in ("brand_name", "product_name", "core_keywords",
+                           "blue_keywords"):
+                    _v = (structured_brief or {}).get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        _allow_terms.add(_v.strip())
+                    elif isinstance(_v, list):
+                        _allow_terms.update(
+                            str(x).strip() for x in _v if str(x).strip()
+                        )
+                _prose_report = run_prose_gate(
+                    final_system.get("prompt_matrix") or [],
+                    allow=frozenset(_allow_terms),
+                )
+                final_system["_prose_gate"] = _prose_report
+                _pglog = self.db.create_stage_log(
+                    self.run_id, "prose_gate",
+                    {"total_cells": _prose_report.get("total_cells", 0)},
+                )
+                _fp_hits = (
+                    _prose_report.get("batch_fingerprints", {})
+                    .get("fingerprint_hits", 0)
+                )
+                self.db.update_stage_log(
+                    _pglog["id"],
+                    status=(
+                        "completed_warn"
+                        if (_prose_report.get("failed_cells") or _fp_hits)
+                        else "completed"
+                    ),
+                    output_data=_prose_report,
+                )
+                logger.info(
+                    "[prose_gate] 出货前终扫:单篇 %d/%d 过 · 跨篇指纹命中 %d 项",
+                    _prose_report.get("total_cells", 0)
+                    - len(_prose_report.get("failed_cells") or []),
+                    _prose_report.get("total_cells", 0),
+                    _fp_hits,
+                )
+            except Exception:
+                logger.exception("[prose_gate] 终扫失败(non-fatal),继续出货")
 
             # 6.96 批量采样验收(v0.33.3)。这是整条流水线唯一一处用 N>1 的样本
             # 验收产出的地方 —— 前面 11 道质量闸看的都是每个 cell 唯一那篇 demo,
@@ -3576,6 +3635,51 @@ class PipelineOrchestrator:
                 # Even if Gemini didn't add new fails, stash its raw
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
+
+            # ── 机审闸(v0.33.5)───────────────────────────────────────
+            # 纯 Python 扫本轮 cell 的机械指纹(翻案句 / 商业黑话 / 伪精确行为量 /
+            # AI 空话 / 寒暄开场 / 列表体)。命中的强制加进 failed 列表走定点改写。
+            #
+            # 放在 critic **之后**是有意的:critic 是批处理(整批一次调用),
+            # 先跑机审并不能少掉那次调用,反而要多一轮编排。放这里则是纯加法 ——
+            # 借 critic 已经产出的 failed 列表做合并,机械命中的 cell 顺路进
+            # rewriter,不额外发起任何调用。
+            #
+            # 真正的省是在**下一轮**:round 2+ 只复检被改写过的 cell,机审在那时
+            # 免费复扫一遍,能抓到 rewriter「把 A 指纹改成 B 指纹」的情况 ——
+            # 那是机扫过了、读者没过的最隐蔽劣化路径。
+            _pg_forced: set[str] = set()
+            for _c in cells_to_critique:
+                _cid_pg = _c.get("cell_id")
+                if not _cid_pg or _cid_pg in {
+                    f.get("cell_id") for f in failed if f.get("cell_id")
+                }:
+                    continue
+                _pg = prose_scan_text(_c.get("demo_output") or "")
+                _c["_prose_soft_flags"] = _pg["soft"]
+                if not _pg["hard"]:
+                    continue
+                failed.append({
+                    "cell_id": _cid_pg,
+                    "platform": _c.get("platform", ""),
+                    "severity": "fail",
+                    # 机械命中属于 surface 的机械子类 —— 明确走 vibe_rewriter
+                    # 而不是 structural_rewriter:这不是叙事身份或缺口方向的
+                    # 问题,是句子层面的定点修。
+                    "root_cause_kind": "surface",
+                    "root_cause_explanation": "prose_gate 机审硬命中",
+                    "rewrite_directives": format_hard_hits_for_rewriter(
+                        {"hard_hits": _pg["hard"]}
+                    ),
+                    "_flagged_by": "prose_gate",
+                })
+                _pg_forced.add(_cid_pg)
+            if _pg_forced:
+                logger.info(
+                    "[prose_gate] 机审硬命中 %d 个 critic 判过的 cell,"
+                    "强制进重写(零 LLM 成本): %s",
+                    len(_pg_forced), sorted(_pg_forced),
+                )
 
             # v0.30.6 fix M1: Gemini 结构审标了 _structure_hint(missing_items
             # 非空)但 critic 让该 cell 过了 → 之前 hint 永远到不了 rewriter,

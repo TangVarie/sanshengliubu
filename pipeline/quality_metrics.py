@@ -52,57 +52,24 @@ import logging
 import re
 
 from pipeline.config import PLATFORM_VOICE_ALIASES, PLATFORM_VOICE_MARKERS
+from pipeline.prose_gate import (
+    first_sentence,
+    scan_text,
+    strip_trailing_hashtags as _strip_trailing_hashtags,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# ── 词表 · 与提示词同源 ──────────────────────────────────────────────────
+# first_sentence / strip_trailing_hashtags / scan_text 都来自 prose_gate,
+# 本模块不再自己定义任何词表或文本判定。
 #
-# ⚠️ 这三张表是 `pipeline/prompts/` 里几处禁用清单的 shadow copy,和
-# `docs/architecture.md` 第 4 节记的 `_SECRET_PATTERNS` 与 truth-vault 的
-# 对齐约定是同一个模式:**改一边要同步另一边**,否则评分标准和提示词要求
-# 就会悄悄分叉 —— 分数还在涨,产出已经不按新规矩走了。
+# v0.33.5 起所有机械文字判定收归 prose_gate 一家:此前评分器自己带了一份
+# AI 空话黑名单,机审闸再带一份,两份必然漂移 —— 而漂移的表现是最难查的那种:
+# 分数还在涨,闸门已经按新规矩走了。architecture.md 第 5 节记的"词表同步义务"
+# 本来就是在说这个风险,与其靠人记着同步,不如让它只有一份。
 #
-# 同源出处:
-#   - vibe_critic.md 第 0.5 步「AI 空话硬否决」黑名单
-#   - works_builder.md 范式 A (c)「禁止 AI 空话」+ (a)「禁止开场」
-#   - works_builder.md 范式 B「反 AI 腔禁用清单」
-#   - foundation.md「反面教材——这些都是伪网感」
-
-# 命中任意一条 = 红线 fail。全部取自上面三处提示词已经明令禁止的写法,
-# 所以命中意味着**执行模型违反了自己 system_prompt 里的硬规则**,判死没有争议。
-AI_CLICHE_BLACKLIST: tuple[str, ...] = (
-    # vibe_critic.md 第 0.5 步原样
-    "效果显著", "性价比高", "值得推荐", "适合所有人", "温和不刺激",
-    "希望对你有帮助", "综上所述", "总而言之",
-    "让我们一起", "姐妹们冲", "快快收藏",
-    # works_builder.md 范式 B 禁用清单补充
-    "分享几个小技巧", "记住这3点", "记住这三点", "以下几个要点",
-)
-
-# 只扫**第一句**。这些是寒暄式/自我介绍式开场,`foundation.md` 的网感三道闸
-# 第 1 条写得很直接:第一句是这些,直接判死。
-#
-# 为什么单独扫第一句而不是全文:"作为一个"出现在正文中段是正常的中文表达
-# (「作为一个参考」),只有出现在开场才是 AI 腔指纹。全文扫会制造假阳性,
-# 而红线层的价值全靠假阳性率低。
-BANNED_OPENING_PREFIXES: tuple[str, ...] = (
-    "今天给大家分享", "今天就给大家", "今天来聊聊", "今天想跟大家",
-    "作为一个", "作为一名", "身为一个",
-    "大家好", "Hi 姐妹们", "hi姐妹们", "嗨姐妹们", "姐妹们好",
-    "在如今", "在当今", "在这个", "随着",
-    "首先", "第一点",
-)
-
-# 列表体正文。`works_builder.md` 范式 B 明确「禁止 1./2./3. 列表式正文
-# (标题可以,正文不行)」——真人不会用编号列表发小红书。
-#
-# 判定要求连续出现 ≥2 个编号项才算,单个 "1." 可能只是在写价格或型号。
-_LIST_BODY_PATTERNS: tuple[re.Pattern, ...] = (
-    re.compile(r"(?:^|\n)\s*[1-9１-９][.、．)）]\s*\S"),
-    re.compile(r"(?:^|\n)\s*第[一二三四五六七八九]\s*[点条]"),
-)
-_SEQUENCE_MARKERS: tuple[str, ...] = ("首先", "其次", "再次", "最后", "综上")
+# 副作用是红线层跟着机审闸一起变强了(新增翻案句家族 / 商业黑话 / 伪精确
+# 行为量),这是想要的 —— 评分口径和闸门口径本来就该是同一套。
 
 
 # ── 高分层 · 具体性四要素 ───────────────────────────────────────────────
@@ -189,28 +156,6 @@ HIGH_SCORE_THRESHOLD = 5
 HIGH_SCORE_TOTAL = 6
 
 
-def first_sentence(text: str) -> str:
-    """取 demo 的第一句(到第一个 。！？或换行为止)。
-
-    和 `orchestrator._find_cross_cell_duplicates` 用同一套切分规则,保证
-    "跨 cell 首句撞车"这条红线和那边的重复检测口径一致。
-    """
-    if not text:
-        return ""
-    return re.split(r"[。！？!?\n]", text.strip(), maxsplit=1)[0].strip()
-
-
-def _strip_trailing_hashtags(text: str) -> str:
-    """剥掉尾部话题标签再做正文判定。
-
-    v0.32.3 的教训:小红书笔记本来就以「#按摩椅 #中秋送礼」收尾,不剥标签
-    就按正文规则判会 100% 误判。这里沿用同一个修法(半角 # 和全角 ＃ 都认)。
-    """
-    if not text:
-        return ""
-    return re.sub(r"(?:[\s\n]*[#＃][^\s#＃]+)+\s*$", "", text.strip()).strip()
-
-
 # ── 红线层 ───────────────────────────────────────────────────────────────
 
 def check_redlines(
@@ -220,6 +165,14 @@ def check_redlines(
 ) -> list[dict]:
     """跑红线层判定,返回**命中的违规项**列表(空 = 全过)。
 
+    v0.33.5 起本函数是 `prose_gate.scan_text` 的薄封装,只取 hard 档。
+    自己不再维护任何词表 —— 评分器和机审闸各带一份黑名单必然漂移,而漂移的
+    表现是最难查的那种:分数还在涨,闸门已经按新规矩走了。
+
+    副作用是红线层跟着机审闸一起变强了:除了原有的 AI 空话 / 寒暄开场 /
+    列表体 / 首句撞车,现在还包括翻案句家族、商业黑话、伪精确行为量。
+    这是想要的 —— 两边本来就该是同一套判定。
+
     Args:
         demo_output: 该 cell 最终交付的示例文稿。
         duplicate_opening: 该 cell 的首句是否和 matrix 里另一个 cell 相同。
@@ -228,57 +181,7 @@ def check_redlines(
     Returns:
         [{"rule": ..., "hit": ..., "detail": ...}, ...]
     """
-    violations: list[dict] = []
-    if not demo_output or not demo_output.strip():
-        return [{
-            "rule": "demo_missing",
-            "hit": "",
-            "detail": "demo_output 为空,无法评分",
-        }]
-
-    body = _strip_trailing_hashtags(demo_output)
-
-    # ① AI 空话黑名单 — 全文扫
-    for phrase in AI_CLICHE_BLACKLIST:
-        if phrase in body:
-            violations.append({
-                "rule": "ai_cliche",
-                "hit": phrase,
-                "detail": f"命中 AI 空话黑名单:{phrase!r}",
-            })
-
-    # ② 寒暄/自我介绍式开场 — 只扫第一句(见 BANNED_OPENING_PREFIXES 注释)
-    opening = first_sentence(body)
-    for prefix in BANNED_OPENING_PREFIXES:
-        if opening.startswith(prefix):
-            violations.append({
-                "rule": "banned_opening",
-                "hit": prefix,
-                "detail": f"第一句以禁用开场起手:{opening[:30]!r}",
-            })
-            break  # 一句话只报一次,不重复计数
-
-    # ③ 列表体正文 — 需要 ≥2 个编号项或 ≥2 个顺序词才算
-    numbered = sum(
-        len(pat.findall(body)) for pat in _LIST_BODY_PATTERNS
-    )
-    sequence_hits = sum(1 for m in _SEQUENCE_MARKERS if m in body)
-    if numbered >= 2 or sequence_hits >= 2:
-        violations.append({
-            "rule": "list_body",
-            "hit": f"编号项 {numbered} / 顺序词 {sequence_hits}",
-            "detail": "正文写成了列表体(禁止 1./2./3. 与 首先/其次/最后)",
-        })
-
-    # ④ 跨 cell 首句撞车 — matrix 层信号
-    if duplicate_opening:
-        violations.append({
-            "rule": "duplicate_opening",
-            "hit": opening[:40],
-            "detail": "第一句与 matrix 内另一个 cell 完全相同",
-        })
-
-    return violations
+    return scan_text(demo_output, duplicate_opening=duplicate_opening)["hard"]
 
 
 # ── 高分层 ───────────────────────────────────────────────────────────────
