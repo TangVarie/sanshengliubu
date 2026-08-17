@@ -2,9 +2,45 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.33.0"
+VERSION = "v0.33.1"
 VERSION_DATE = "2026-08-17"
 VERSION_NOTES = (
+    "v0.33.1 fix: 拆三颗互相独立的雷 —— 约束打架 / 结构审重复 / 路径撞车。"
+    "(A) works_builder 的输出预算是【自相矛盾】的,这是 v0.32.3、v0.32.4 反复"
+    "出现空烧和截断的真根。真因不是'模块多字数少',是 demo 正文在输出里写了"
+    "两遍:prompt_cells[i].demo_output 一遍,demo_outputs[].output_content "
+    "又一遍。而 orchestrator 第 6.95 步会从(已精炼的) prompt_matrix 整个重建 "
+    "demo_outputs,只留 persona_used —— 那份副本 100% 被丢弃。小红书 demo "
+    "300-800 字写两遍,直接把'单 cell ≤4500 字符'撑爆(2500+800+800+400 = "
+    "4500 起步),超了就截断→批次重试→单 cell 重试的三倍空烧。修法:"
+    "demo_outputs 只保留 cell_id + persona_used;顺带把 system_prompt 上限"
+    "从 1500-2500 调到 2000-3000 并给出逐模块的字符预算表(按 13 个必嵌模块"
+    "实测最低约 2400,原来的 2500 上限等于零余量、1500 下限根本不可能达成);"
+    "另修正规则编号重复(有两个 4. 和两个 5.)——在一个要求模型'回头数一遍'的"
+    "提示词里编号乱掉不是洁癖问题。"
+    "(B) 结构审 6 项里有 5 项 _validate_prompt_cell 早就用别名表确定性查过了"
+    "(五池/人设/合规存在性/关键词存在性/禁用清单存在性),花一次 LLM 调用重查"
+    "是纯重复。第 6 项『平台调性张冠李戴』其实也是确定性的(平台调性词表固定),"
+    "一并下沉到 quality_metrics.check_platform_voice。结构审提示词收敛到它"
+    "真正独有的职责:判断合规/关键词/禁用清单写的是【可执行的具体规则】还是"
+    "【应付差事的空话】——『注意合规即可』和『不得声称根治』字符串匹配都能查到"
+    "'合规'二字,只有模型分得出前者等于没写。新增 evidence 必填(原文摘抄),"
+    "堵住凭印象打分。确定性结果走已有的 _structure_hint 通道交给重写器,"
+    "不触发 builder 重试;模型挂掉时确定性那半边照常工作。"
+    "平台调性判定有意压低召回换精度:只有『自己平台调性词一个没命中 + 某个别家"
+    "平台命中 ≥2 个』才报 —— 单个外来词很可能是『不要写成抖音那种前3秒』这类"
+    "反例引用,按命中即报会误杀。"
+    "(C) 8 条突破路径的跨批次撞车(v0.30.6 记的 M2 遗留项)。cell_planner 分批"
+    "并行(BATCH_SIZE=5/CONCURRENCY=5),批次之间互不知道对方选了什么路径,"
+    "12 格子分 3 批同时跑撞车既必然又不可见 —— 而路径组合正是'几个方向打法不"
+    "重样'的核心机制。修法:orchestrator 在分批【之前】按 direction_id 确定性"
+    "预分配(PATH_LIBRARY + 互质偏移轮转 0/3/5,方向数 ≤8 时保证两两不同),"
+    "全量表塞进每个批次和单 cell 重试的输入。按 direction 而非按 cell 分配:"
+    "矩阵是 方向 × 平台,要不重样的是方向之间,同方向跨平台本就该共用一组。"
+    "方向编号按数字后缀自然排序,让分配不依赖 active_cells 到达顺序,"
+    "避免 resume 重跑时路径漂移。零 LLM 成本。"
+)
+_VERSION_NOTES_V0330 = (
     "v0.33.0 feature: 双层评分体系 —— 本仓库第一个【输出侧】质量度量。"
     "(1) 病灶:24 个 stage、11 道质量闸,但没有任何地方回答得了'这一版产出"
     "比上一版好吗'。R-022 飞轮 audit 追的是'数据库样本有没有被用上'"
@@ -543,6 +579,40 @@ PLATFORM_DEMO_LENGTH_RANGES: dict[str, tuple[int, int]] = {
 # Fallback when the platform isn't recognized.
 PLATFORM_DEMO_LENGTH_DEFAULT: tuple[int, int] = (50, 2000)
 
+# ── Platform voice markers（平台调性指纹）─────────────────────────────────
+# 每个平台**独有**的调性词。用途:检测 works_builder 把平台调性段写串了 ——
+# 小红书的 cell 里写着「前3秒钩子」(那是抖音的),或知乎 cell 写着「姐妹安利感」。
+# 词表出处是 works_builder.md 规则 6「平台口吻细节」。
+#
+# ⚠️ 只收**该平台独有**的词,不收跨平台通用词。反例:「钩子」五个平台都在用,
+# 收进来会让所有 cell 互相误报;「姐妹们」出现在 works_builder 的禁止开场
+# 清单里,任何平台的 system_prompt 都可能带它。选词标准是"看到这个词就能
+# 断定在讲哪个平台"。
+#
+# 判定规则见 quality_metrics.check_platform_voice —— 只有「自己平台的词一个
+# 没有 + 别家平台的词命中 ≥2 个」才报,单个外来词不报(很可能是"不要写成抖音
+# 那种前3秒"这类反例引用)。这是有意压低召回换精度:本仓库 v0.32.3/v0.32.4
+# 两次三轮空烧都是误判造成的。
+PLATFORM_VOICE_MARKERS: dict[str, tuple[str, ...]] = {
+    "小红书": ("姐妹安利", "安利感", "生活流", "碎片感", "绝绝子", "真的会谢",
+               "无语子", "yyds", "笔记正文", "收藏率"),
+    "抖音": ("前3秒", "前 3 秒", "头三秒", "完播", "口播", "分镜", "运镜",
+             "第一帧", "脚本时长"),
+    "b站": ("弹幕", "UP主", "up主", "三连", "钻研感", "我研究过", "我试过",
+            "视频简介"),
+    "知乎": ("谢邀", "答主", "高赞", "观点先行", "先说结论", "论据", "回答正文"),
+    "微博": ("超话", "转评赞", "热搜", "话题感", "@", "博文"),
+}
+# 平台名归一化:cell.platform 可能是中文名也可能是罗马字。和
+# PLATFORM_DEMO_LENGTH_RANGES 的 substring 匹配思路一致。
+PLATFORM_VOICE_ALIASES: dict[str, str] = {
+    "小红书": "小红书", "xiaohongshu": "小红书", "xhs": "小红书", "red": "小红书",
+    "抖音": "抖音", "douyin": "抖音", "tiktok": "抖音",
+    "b站": "b站", "bilibili": "b站", "哔哩": "b站",
+    "知乎": "知乎", "zhihu": "知乎",
+    "微博": "微博", "weibo": "微博",
+}
+
 # ── Chancellery review ─────────────────────────────────────────────────────
 
 MAX_CHANCELLERY_REJECTIONS = 2  # plan_review: force pass on round 3 (legacy, used by non-debate path)
@@ -617,6 +687,30 @@ MATRIX_CELLS_PER_BATCH = 1      # one cell per call (safest for JSON structure)
 # ── Cell Planner Batching ────────────────────────────────────────────────
 CELL_PLANNER_BATCH_SIZE = 5     # cells per cell-planner call
 CELL_PLANNER_CONCURRENCY = 5    # parallel cell-planner calls
+
+# ── 8 条突破路径的跨批次分配(v0.33.0,原 M2 遗留项)────────────────────────
+# 出处:works_cell_planner.md「8 条突破路径」。每个 cell_plan 要显式选 2-3 条。
+#
+# 问题:cell_planner 是**分批并行**跑的(BATCH_SIZE=5,CONCURRENCY=5),批次之间
+# 互不知道对方选了什么路径。12 个格子分 3 批同时跑,三批各自挑路径,撞车是必然
+# 且不可见的 —— 而路径组合正是"这几个方向的打法不重样"的核心机制。
+# config.py 的 v0.30.6 版本注记里记着「M2(cell_planner 跨批次共享 path 分配)
+# 留作后续单独决策」,这就是那个决策。
+#
+# 解法:orchestrator 在分批**之前**按 direction_id 确定性预分配,把结果塞进每个
+# 批次的输入。零 LLM 成本,且跨批次一致性由代码保证而不是靠模型自觉。
+#
+# 为什么按 direction 而不是按 cell 分配:矩阵是 方向 × 平台。需要不重样的是
+# **方向之间**(D1 和 D2 是两种打法);同一方向的不同平台(D1_xhs / D1_douyin)
+# 是同一种打法的平台适配,本来就该共用同一组路径。
+PATH_LIBRARY: tuple[str, ...] = (
+    "身份路径", "对象路径", "语言路径", "结构路径",
+    "评价路径", "场景路径", "信息差路径", "情绪路径",
+)
+# 第 i 个方向拿 PATH_LIBRARY[(i + off) % 8] for off in PATH_ROTATION_OFFSETS。
+# 3 和 5 都与 8 互质,所以相邻方向拿到的三元组不会有重叠模式,整体循环周期是 8
+# —— 方向数 ≤8 时保证任意两个方向的路径组合都不同。
+PATH_ROTATION_OFFSETS: tuple[int, ...] = (0, 3, 5)
 
 # ── Extended Thinking ─────────────────────────────────────────────────────
 # 6 strategy/review/compliance stages use extended thinking (budget_tokens

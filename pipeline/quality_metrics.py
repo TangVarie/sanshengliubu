@@ -51,6 +51,8 @@ from __future__ import annotations
 import logging
 import re
 
+from pipeline.config import PLATFORM_VOICE_ALIASES, PLATFORM_VOICE_MARKERS
+
 logger = logging.getLogger(__name__)
 
 
@@ -379,6 +381,102 @@ def check_high_score(
         "craft_missing": missing,
         "paradigm": _paradigm or "A_emotional_hook(默认)",
     }
+
+
+# ── 结构审的确定性部分 ───────────────────────────────────────────────────
+#
+# 结构审(kimi_structure_reviewer)原本查 6 类结构件,其中 4 类
+# (五池 / 人设 / 合规存在性 / 关键词存在性 / 禁用清单存在性)`_validate_prompt_cell`
+# 已经用别名表确定性地查过了 —— 花一次 LLM 调用重查一遍是纯重复。
+#
+# 剩下真正需要模型判断的只有「具体 vs 空话」("注意合规即可" vs "不得声称根治"),
+# 以及本函数处理的平台调性张冠李戴 —— 后者其实也是确定性的,所以下沉到这里。
+
+def check_platform_voice(system_prompt: str, platform: str) -> dict | None:
+    """检测 system_prompt 的平台调性段是不是写成了别的平台的。
+
+    返回 None = 没问题;返回 dict = 疑似写串了。
+
+    判定规则(**有意压低召回换精度**):只有「自己平台的调性词一个都没命中 +
+    某个别家平台的词命中 ≥2 个」才报。
+
+    为什么这么保守:单个外来词太容易是反例引用 —— 小红书的 prompt 里写
+    「不要写成抖音那种前3秒钩子」是完全正确的用法,按"命中即报"会误杀。
+    而"自己家的一个没有、别人家的好几个"这种组合,基本只可能是整段写错了平台。
+
+    本仓库有两次因为误判导致三轮空烧的事故(v0.32.3 / v0.32.4),所以这里
+    宁可漏报也不误报;而且结果只进 _structure_hint(交给重写器顺手补),
+    不触发 builder 重试。
+    """
+    if not system_prompt or not platform:
+        return None
+
+    plat_lower = platform.strip().lower()
+    own_key = None
+    for alias, canonical in PLATFORM_VOICE_ALIASES.items():
+        if alias in plat_lower:
+            own_key = canonical
+            break
+    if own_key is None:
+        return None      # 不认识的平台不判,别瞎报
+
+    own_hits = [
+        m for m in PLATFORM_VOICE_MARKERS.get(own_key, ())
+        if m in system_prompt
+    ]
+    if own_hits:
+        return None      # 自己家的调性词在,就算同时提到别家也大概率是反例引用
+
+    foreign: dict[str, list[str]] = {}
+    for key, markers in PLATFORM_VOICE_MARKERS.items():
+        if key == own_key:
+            continue
+        hits = [m for m in markers if m in system_prompt]
+        if len(hits) >= 2:
+            foreign[key] = hits
+    if not foreign:
+        return None
+
+    worst = max(foreign.items(), key=lambda kv: len(kv[1]))
+    return {
+        "platform": own_key,
+        "written_as": worst[0],
+        "foreign_markers": worst[1],
+        "detail": (
+            f"平台调性段疑似写成了「{worst[0]}」的:命中 "
+            f"{'/'.join(worst[1][:4])} 等 {len(worst[1])} 个{worst[0]}专属调性词,"
+            f"而本 cell 是「{own_key}」、一个{own_key}专属调性词都没有"
+        ),
+        "revision_hint": (
+            f"把 system_prompt 里的平台调性段改成「{own_key}」的口吻"
+            f"(参考 works_builder.md 规则 6),删掉{worst[0]}专属的表述"
+        ),
+    }
+
+
+def deterministic_structure_audit(prompt_cells: list[dict]) -> dict[str, dict]:
+    """对整批 cell 跑确定性结构审,返回 {cell_id: hint}。
+
+    hint 的形状和 kimi_structure_reviewer 写进 `_structure_hint` 的一致
+    (`missing_items` + `revision_hint`),所以两边的结果可以直接合并,
+    下游 vibe_loop 的强制补漏逻辑不需要改。
+    """
+    out: dict[str, dict] = {}
+    for cell in prompt_cells or []:
+        cid = cell.get("cell_id")
+        if not cid:
+            continue
+        pv = check_platform_voice(
+            cell.get("system_prompt") or "", cell.get("platform") or ""
+        )
+        if pv:
+            out[cid] = {
+                "missing_items": [f"平台调性写成了{pv['written_as']}的"],
+                "revision_hint": pv["revision_hint"],
+                "_detail": pv["detail"],
+                "_source": "deterministic",
+            }
+    return out
 
 
 # ── Matrix 级汇总 ────────────────────────────────────────────────────────

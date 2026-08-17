@@ -34,6 +34,8 @@ from pipeline.config import (
     MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
+    PATH_LIBRARY,
+    PATH_ROTATION_OFFSETS,
     PLATFORM_DEMO_LENGTH_DEFAULT,
     PLATFORM_DEMO_LENGTH_RANGES,
     RED_BLUE_CONCURRENCY,
@@ -61,7 +63,11 @@ from pipeline.retrieve_samples import (
     summarize_packs_by_platform,
 )
 from pipeline.logger_utils import mask_secrets
-from pipeline.quality_metrics import persist_quality_score, score_matrix
+from pipeline.quality_metrics import (
+    deterministic_structure_audit,
+    persist_quality_score,
+    score_matrix,
+)
 from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -1205,6 +1211,20 @@ class PipelineOrchestrator:
         shared_skeleton = works_arch.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(CELL_PLANNER_CONCURRENCY)
 
+        # ── 8 条突破路径的跨批次预分配(原 M2 遗留项)────────────────────
+        # cell_planner 分批并行跑,批次之间看不到对方选了什么路径 —— 而路径
+        # 组合正是"几个方向的打法不重样"的核心机制,撞车既必然又不可见。
+        # 这里在分批**之前**按 direction_id 确定性分配好,塞进每个批次的输入。
+        # 零 LLM 成本,跨批次一致性由代码保证而不是靠模型自觉。
+        # 按 direction 而非按 cell 分配的理由见 config.PATH_LIBRARY 的注释。
+        _path_allocation = _allocate_paths_by_direction(active_cells)
+        if _path_allocation:
+            logger.info(
+                "[cell_planner] 路径预分配(%d 个方向): %s",
+                len(_path_allocation),
+                {k: "/".join(v) for k, v in list(_path_allocation.items())[:8]},
+            )
+
         # Cell-level resume: scan this run's stage_logs for any cell_plans that
         # already completed successfully, so a resume doesn't re-run batches
         # that already burned tokens producing good output.
@@ -1262,6 +1282,9 @@ class PipelineOrchestrator:
                         "tactical_directions": plan.get("tactical_directions", []),
                         "target_platforms": plan.get("target_platforms", []),
                     },
+                    # 单 cell 重试也要带全量分配 —— 否则这个 cell 会在没有任何
+                    # 跨方向视野的情况下重挑路径,重试出来的格子反而最容易撞车。
+                    "_path_allocation": _path_allocation,
                     "_batch_info": {
                         "label": f"单cell修复 {cid}",
                         "round": "cell-retry",
@@ -1324,6 +1347,11 @@ class PipelineOrchestrator:
                             "tactical_directions": plan.get("tactical_directions", []),
                             "target_platforms": plan.get("target_platforms", []),
                         },
+                        # 跨批次路径预分配。传【全量】(所有方向,不只本批次的)
+                        # 是有意的:让本批次能看到别的批次分到了什么,自己就不会
+                        # 无意中往同一组路径上收敛。多传几十字节换掉一个必然的
+                        # 撞车,是划算的。
+                        "_path_allocation": _path_allocation,
                         "_batch_info": {
                             "label": f"批次 {batch_idx + 1} · {round_label}",
                             "round": round_label,
@@ -2926,6 +2954,24 @@ class PipelineOrchestrator:
         )
         log_id = log["id"]
 
+        # ── 确定性前置审(零 LLM 成本)────────────────────────────────────
+        # 结构审原本查 6 类结构件,其中 5 类(五池 / 人设 / 合规存在性 /
+        # 关键词存在性 / 禁用清单存在性)`_validate_prompt_cell` 在构建阶段
+        # 就已经用别名表确定性地查过了 —— 花一次 LLM 调用重查是纯重复。
+        #
+        # 平台调性张冠李戴这一类原本也交给模型,但它同样是确定性的
+        # (平台调性词表是固定的),所以下沉到 Python。剩给模型的只有
+        # 「具体 vs 空话」这一类真需要判断的(见 kimi_structure_reviewer.md)。
+        #
+        # 先跑确定性的,结果和模型的 hint 合并 —— 两边写的是同一个
+        # `_structure_hint` 形状,下游 vibe_loop 的强制补漏逻辑不用动。
+        _det_hints = deterministic_structure_audit(prompt_cells)
+        if _det_hints:
+            logger.info(
+                "[structure review] 确定性前置审命中 %d 个 cell(零成本): %s",
+                len(_det_hints), sorted(_det_hints.keys()),
+            )
+
         try:
             result = await run_kimi_structure_review(prompt_cells)
         except Exception as e:
@@ -2934,10 +2980,16 @@ class PipelineOrchestrator:
             logger.warning(
                 "[structure review] unexpected exception, skipping: %r", e
             )
+            # 模型挂了不影响确定性那半边 —— 照样把 hint 挂上去,让重写器修。
+            # 这正是下沉的价值之一:结构审的一部分不再依赖模型可用性。
+            _apply_structure_hints(prompt_cells, _det_hints)
             self.db.update_stage_log(
                 log_id,
                 status="skipped",
-                output_data={"_skip_reason": f"unexpected_exception: {e}"},
+                output_data={
+                    "_skip_reason": f"unexpected_exception: {e}",
+                    "deterministic_hints": _det_hints,
+                },
             )
             return
 
@@ -2964,14 +3016,19 @@ class PipelineOrchestrator:
             for item in incomplete
             if isinstance(item, dict) and item.get("cell_id")
         }
-        for cell in prompt_cells:
-            cid = cell.get("cell_id")
-            if cid in incomplete_by_id:
-                item = incomplete_by_id[cid]
-                cell["_structure_hint"] = {
-                    "missing_items": item.get("missing_items", []),
-                    "revision_hint": item.get("revision_hint", ""),
-                }
+        _model_hints = {
+            cid: {
+                "missing_items": item.get("missing_items", []),
+                "revision_hint": item.get("revision_hint", ""),
+                "_source": "model",
+            }
+            for cid, item in incomplete_by_id.items()
+        }
+        # 合并确定性 hint 和模型 hint —— 同一个 cell 两边都命中时取并集,
+        # 不是二选一:平台调性写串(确定性抓到)和合规写成空话(模型抓到)
+        # 是两个独立问题,rewriter 一次都要修。
+        _merged_hints = _merge_structure_hints(_det_hints, _model_hints)
+        _apply_structure_hints(prompt_cells, _merged_hints)
 
         # Stash the full review on final_system so chancellery_final
         # can see the structural context and terminal UI can display.
@@ -3005,6 +3062,9 @@ class PipelineOrchestrator:
                 "summary": result.get("summary", ""),
                 "cells_incomplete": incomplete,
                 "cell_reviews": result.get("cell_reviews", []),
+                # 确定性那半边单独记一份,便于在 UI / SQL 里区分
+                # "模型抓到的" 和 "Python 抓到的"。
+                "deterministic_hints": _det_hints,
             },
             model_used=usage.get("model"),
             tokens_used=int(usage.get("input_tokens", 0))
@@ -4498,6 +4558,88 @@ def _persist_audit_findings(
             iteration + 1,
             run_id,
         )
+
+
+def _allocate_paths_by_direction(active_cells: list[dict]) -> dict[str, list[str]]:
+    """按 direction_id 确定性分配「8 条突破路径」,返回 {direction_id: [路径,...]}。
+
+    为什么需要:cell_planner 分批并行执行(CELL_PLANNER_BATCH_SIZE=5 /
+    CONCURRENCY=5),每个批次独立给自己那几个 cell 挑路径,**批次之间互不知情**。
+    12 个格子分 3 批同时跑时路径撞车是必然的,而且没有任何地方能看出来 ——
+    偏偏路径组合就是"这几个方向的打法不重样"的核心机制。
+    (config.py v0.30.6 注记里的 M2 遗留项。)
+
+    为什么按 direction 而不是按 cell:矩阵是 方向 × 平台。要不重样的是**方向
+    之间**;同一方向的不同平台(D1_xhs / D1_douyin)是同一打法的平台适配,
+    本来就该共用同一组路径 —— 按 cell 分配反而会把一个方向拆成两种打法。
+
+    分配用固定偏移量的轮转(见 config.PATH_ROTATION_OFFSETS),不用随机:
+    随机在 resume / 重试时会给同一个方向分到不同路径,导致重跑结果漂移。
+    """
+    seen: list[str] = []
+    for c in active_cells or []:
+        did = c.get("direction_id")
+        if did and did not in seen:
+            seen.append(did)
+
+    # 按方向编号自然排序,让分配不依赖 active_cells 的到达顺序 —— 否则上游
+    # 任何一次排序变化都会让同一条 run 重跑时拿到不同的路径,resume 出来的
+    # 格子和第一次跑的对不上。纯字典序会把 D10 排到 D2 前面,所以抽数字后缀。
+    def _dir_sort_key(d: str) -> tuple[int, str]:
+        m = re.search(r"(\d+)", d)
+        return (int(m.group(1)) if m else 1 << 30, d)
+
+    seen.sort(key=_dir_sort_key)
+
+    allocation: dict[str, list[str]] = {}
+    n = len(PATH_LIBRARY)
+    for i, did in enumerate(seen):
+        allocation[did] = [
+            PATH_LIBRARY[(i + off) % n] for off in PATH_ROTATION_OFFSETS
+        ]
+    return allocation
+
+
+def _merge_structure_hints(
+    det_hints: dict[str, dict], model_hints: dict[str, dict]
+) -> dict[str, dict]:
+    """合并确定性结构审和模型结构审的 hint,同 cell 取并集。
+
+    两边查的是不相交的东西 —— 确定性那边查平台调性张冠李戴,模型那边查
+    「合规/关键词/禁用清单是具体规则还是空话」。同一个 cell 两边都命中时
+    是两个独立问题,rewriter 一次都要修,所以 missing_items 拼起来、
+    revision_hint 也拼起来,不是二选一。
+    """
+    merged: dict[str, dict] = {k: dict(v) for k, v in det_hints.items()}
+    for cid, mh in model_hints.items():
+        if cid not in merged:
+            merged[cid] = dict(mh)
+            continue
+        base = merged[cid]
+        base["missing_items"] = list(base.get("missing_items", [])) + [
+            m for m in mh.get("missing_items", [])
+            if m not in base.get("missing_items", [])
+        ]
+        _hints = [h for h in (base.get("revision_hint"), mh.get("revision_hint")) if h]
+        base["revision_hint"] = "；".join(_hints)
+        base["_source"] = "deterministic+model"
+    return merged
+
+
+def _apply_structure_hints(
+    prompt_cells: list[dict], hints: dict[str, dict]
+) -> None:
+    """把 hint 挂到对应 cell 的 `_structure_hint` 字段(原地修改)。
+
+    下游两个消费点:
+      - vibe_loop 的强制补漏(critic 判 pass 但结构缺 → force borderline)
+      - `_augment_rewrite_directives` 把它织进 rewrite_directives
+    """
+    by_id = {c.get("cell_id"): c for c in prompt_cells if c.get("cell_id")}
+    for cid, hint in hints.items():
+        cell = by_id.get(cid)
+        if cell is not None:
+            cell["_structure_hint"] = hint
 
 
 def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
