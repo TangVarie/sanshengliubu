@@ -468,10 +468,14 @@ for _rw in _regression_warnings:
         delta=f"{(_hs.get('current', 0) - _hs.get('baseline_median', 0)):+.0%} vs 历史中位数",
         delta_color="inverse",
     )
+    # 两条指标的基线是**两批不同的 run**，分开写。合成一个数字的话，"覆盖完整"
+    # 这个限定词会被安到红线头上——而红线基线根本没做这个筛选。
     st.caption(
-        f"基线取自该项目最近 {_d.get('baseline_runs', '?')} 条**评分覆盖完整**的 run 的中位数。"
-        "覆盖不全的 run 被排除在基线之外 —— 那些 run 的高分篇数是被低估的，"
-        "混进来会把标准拉低、真正的退步反而报不出来。"
+        f"红线基线：该项目最近 {_d.get('baseline_runs_redline', '?')} 条 run 的中位数"
+        "（红线是确定性判定，critic 挂没挂跟它无关，所以不筛覆盖度）。"
+        f"　高分篇基线：其中**评分覆盖完整**的 {_d.get('baseline_runs_high_score', '?')} 条 "
+        "run 的中位数 —— 覆盖不全的 run 高分篇数是被低估的，混进来会把标准拉低、"
+        "真正的退步反而报不出来。"
     )
 
 if strategic_warnings:

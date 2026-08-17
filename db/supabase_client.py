@@ -228,39 +228,100 @@ class SupabaseClient:
         列表再按 in_ 过滤,语义确定、payload 可控。
         """
         try:
-            runs = (
-                self.client.table("pipeline_runs")
-                .select("id,created_at")
-                .eq("project_id", project_id)
-                .order("created_at", desc=True)
-                .limit(limit + 5)   # 多取几条,后面要按 exclude 和空分数过滤
-                .execute()
-            ).data or []
-            run_ids = [
-                r["id"] for r in runs
-                if r.get("id") and r["id"] != exclude_run_id
-            ][:limit]
-            if not run_ids:
-                return []
+            # ⚠️ 不能先 `[:limit]` 再查分数。失败 / 被取消 / 中断的 run 也占
+            # 位置,它们没有 quality_score —— 先切片就等于把额度花在这些空 run
+            # 上,查完过滤掉,更早的**有效**分数则永远进不来。一个项目连着挂
+            # 几次之后,基线会永久凑不满 3 条,回归检测直接失效。
+            #
+            # 改成分页往前捞,直到集满 limit 条【真的有分数】的 run 为止。
+            collected: list[dict] = []
+            seen_runs: set[str] = set()
+            offset, page = 0, max(limit * 3, 30)
+            while len(collected) < limit and offset < 300:
+                runs = (
+                    self.client.table("pipeline_runs")
+                    .select("id,created_at")
+                    .eq("project_id", project_id)
+                    .order("created_at", desc=True)
+                    .range(offset, offset + page - 1)
+                    .execute()
+                ).data or []
+                if not runs:
+                    break
+                offset += page
+                run_ids = [
+                    r["id"] for r in runs
+                    if r.get("id") and r["id"] != exclude_run_id
+                ]
+                if not run_ids:
+                    continue
 
-            rows = (
-                self.client.table("stage_logs")
-                .select("run_id,created_at,output_data")
-                .eq("stage_name", "quality_score")
-                .in_("run_id", run_ids)
-                .order("created_at", desc=True)
-                .execute()
-            ).data or []
-            return [
-                r["output_data"] for r in rows
-                if isinstance(r.get("output_data"), dict)
-                and r["output_data"].get("total_cells")
-            ]
+                rows = (
+                    self.client.table("stage_logs")
+                    .select("run_id,created_at,output_data")
+                    .eq("stage_name", "quality_score")
+                    .in_("run_id", run_ids)
+                    .order("created_at", desc=True)
+                    .execute()
+                ).data or []
+
+                # ⚠️ 一条 run 可能有**多条** quality_score:失败重续和修订重跑
+                # 复用同一个 run_id,而 persist_quality_score 每次都插新行。
+                # 不去重的话,同一条 run 会在中位数里被重复加权,甚至靠自己
+                # 几条记录就凑满 BASELINE_MIN_RUNS —— 基线变成"跟自己比"。
+                # rows 已按时间倒序,每个 run_id 取第一条 = 最新那条。
+                for r in rows:
+                    rid = r.get("run_id")
+                    od = r.get("output_data")
+                    if not rid or rid in seen_runs:
+                        continue
+                    if not isinstance(od, dict) or not od.get("total_cells"):
+                        continue
+                    seen_runs.add(rid)
+                    collected.append(od)
+                    if len(collected) >= limit:
+                        break
+            return collected
         except Exception:
             logger.exception(
                 "[quality_history] 查询失败(non-fatal),回归哨兵本轮跳过"
             )
             return []
+
+    def try_resume_from_paused(self, run_id: str, project_id: str) -> bool:
+        """把 run + project 从 `paused_for_review` **原子地**切回 `running`。
+
+        只有当前状态确实还是 paused_for_review 才切,返回是否切成功。
+
+        为什么不能"先读再写":请旨等待里读状态和接受用户回复之间有个 TOCTOU
+        窗口 —— 两个标签页的场景下,如果强制取消恰好落在这个窗口里,无条件的
+        update 会把已经 failed 的 run 改回 running,**取消被静默吃掉、付费的
+        工作继续跑**。条件 UPDATE 把判断交给数据库,窗口就不存在了。
+        和 `try_claim_project_running` 是同一个模式(那个防的是两次点击竞态)。
+        """
+        def _do():
+            resp = (
+                self.client.table("pipeline_runs")
+                .update({"status": "running"})
+                .eq("id", run_id)
+                .eq("status", "paused_for_review")
+                .execute()
+            )
+            return bool(resp.data)
+        claimed = _with_write_retry(_do)
+        if claimed:
+            # run 抢到了才动 project —— 反过来会留下 project=running 但
+            # run=failed 的错位状态。
+            try:
+                self.client.table("projects").update(
+                    {"status": "running", "updated_at": _now()}
+                ).eq("id", project_id).eq("status", "paused_for_review").execute()
+            except Exception:
+                logger.warning(
+                    "[resume_from_paused] run 已切回 running 但 project 没切,"
+                    "UI 状态可能短暂不一致(不影响执行)"
+                )
+        return claimed
 
     def try_claim_project_running(
         self, project_id: str, allowed_from: list[str] | None = None

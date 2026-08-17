@@ -537,19 +537,25 @@ def detect_regression(
     不固定,策略升级还会加格子)。绝对数在同一批实验内部可比,跨 run 比必须归一。
     这和 UI 上"看绝对数翻倍"不矛盾:那是同口径的纵向对比,这里是跨口径的。
     """
-    # 只跟**覆盖完整**的历史比。critic 挂过的那几条 run 高分篇数是被低估的,
-    # 混进基线会把标准拉低,于是真正的退步反而报不出来。
-    usable = [
+    # ⚠️ 两条指标要**各自建基线**,不能共用一份。
+    #
+    # 高分层必须只跟"critic 覆盖完整"的历史比 —— 挂过 critic 的 run 高分篇数
+    # 是被低估的,混进基线会把标准拉低、真正的退步反而报不出来。
+    #
+    # 但红线通过率是**确定性判定**(正则命中),critic 挂没挂跟它毫无关系。
+    # 拿高分层的覆盖度去过滤红线基线,后果是:一个项目只要连着几条 run 的 critic
+    # 不完整,就连红线回归也一起测不了了 —— 而那恰恰是最该报警的时候。
+    redline_hist = [h for h in history if h.get("total_cells")][:BASELINE_WINDOW]
+    high_hist = [
         h for h in history
         if h.get("total_cells")
         and h.get("high_score_coverage_cells") == h.get("total_cells")
-    ]
-    if len(usable) < BASELINE_MIN_RUNS:
-        return None
+    ][:BASELINE_WINDOW]
 
-    usable = usable[:BASELINE_WINDOW]
     cur_total = scorecard.get("total_cells") or 0
     if not cur_total:
+        return None
+    if len(redline_hist) < BASELINE_MIN_RUNS and len(high_hist) < BASELINE_MIN_RUNS:
         return None
     # 本轮自己覆盖不全时不判高分层 —— 那个数字本来就不可比。
     cur_full_coverage = (
@@ -557,24 +563,27 @@ def detect_regression(
     )
 
     base_redline = _median([
-        float(h.get("redline_pass_rate") or 0.0) for h in usable
+        float(h.get("redline_pass_rate") or 0.0) for h in redline_hist
     ])
     base_high = _median([
         (h.get("high_score_cells") or 0) / (h.get("total_cells") or 1)
-        for h in usable
+        for h in high_hist
     ])
     cur_redline = float(scorecard.get("redline_pass_rate") or 0.0)
     cur_high = (scorecard.get("high_score_cells") or 0) / cur_total
 
     issues: list[str] = []
-    if cur_redline < base_redline - REDLINE_NOISE_BAND:
+    if (len(redline_hist) >= BASELINE_MIN_RUNS
+            and cur_redline < base_redline - REDLINE_NOISE_BAND):
         issues.append(
-            f"红线通过率 {cur_redline:.0%} < 近 {len(usable)} 条 run 的中位数 "
+            f"红线通过率 {cur_redline:.0%} < 近 {len(redline_hist)} 条 run 的中位数 "
             f"{base_redline:.0%}。红线是确定性判定、不受生成抖动影响，"
             f"跌了就是真跌 —— 多半是某条规则被改动引入，或提示词里对应的"
             f"约束被削弱了"
         )
-    if cur_full_coverage and cur_high < base_high - HIGH_SCORE_NOISE_BAND:
+    if (cur_full_coverage
+            and len(high_hist) >= BASELINE_MIN_RUNS
+            and cur_high < base_high - HIGH_SCORE_NOISE_BAND):
         issues.append(
             f"高分篇率 {cur_high:.0%} < 中位数 {base_high:.0%}，"
             f"跌幅超出噪声带 {HIGH_SCORE_NOISE_BAND:.0%}。这一项受生成抖动影响，"
@@ -586,7 +595,12 @@ def detect_regression(
 
     return {
         "regressed": True,
-        "baseline_runs": len(usable),
+        # ⚠️ 不要再合并出一个"总基线条数"。两条指标的基线是**不同的两批 run**
+        # (红线用全部有格子的 run,高分层只用评分覆盖完整的),取 max 出来的
+        # 那个数字哪条指标都不对应 —— UI 拿它写"N 条覆盖完整的 run"就是在
+        # 撒谎:红线中位数根本不是从那批算的。要展示就分开展示。
+        "baseline_runs_redline": len(redline_hist),
+        "baseline_runs_high_score": len(high_hist),
         "redline": {"current": round(cur_redline, 4),
                     "baseline_median": round(base_redline, 4)},
         "high_score_rate": {"current": round(cur_high, 4),
