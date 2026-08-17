@@ -227,6 +227,25 @@ async def sample_one_cell(
         import time as _time
         from pipeline.agents import _get_active_limiter
 
+        # ⚠️ v0.34.2:只重试**瞬时**故障。上一版把内层的 call_with_retry 关掉
+        # 之后,我用一个宽泛的 `except Exception` 接管了重试 —— 而被替换掉的那层
+        # 是会分类的(只重限流/超时/连接/5xx)。后果:没配 key、模型名不对、400
+        # 参数错这类**永远不会自愈**的错误,每个样本都要白等 2+4 秒再失败三次,
+        # 60 个样本叠加起来会把线程池和整条流水线拖住很久。
+        #
+        # 分类靠错误文本而不是异常类型:辅助层把一切都包成 KimiCallFailed,
+        # 类型层面已经区分不出来了。宁可漏判成"不可重试"(快速失败)也不要漏判成
+        # "可重试"(慢速失败)—— 前者的代价是少一次本来也未必成功的重试。
+        _TRANSIENT_MARKERS = (
+            "429", "rate limit", "rate_limit", "too many",
+            "timeout", "timed out", "connection", "connect error",
+            "500", "502", "503", "504", "overloaded", "temporarily",
+        )
+
+        def _is_transient(exc: Exception) -> bool:
+            m = str(exc).lower()
+            return any(k in m for k in _TRANSIENT_MARKERS)
+
         _lim = _get_active_limiter()
         _last: Exception | None = None
         for _attempt in range(3):
@@ -257,6 +276,9 @@ async def sample_one_cell(
                         _lim.note_rate_limited(stage_name="batch_sampling")
                     except Exception:
                         pass
+                # 永久性错误立刻抛,不要空等 6 秒重试三次
+                if not _is_transient(_e):
+                    raise
                 if _attempt < 2:
                     _time.sleep(2.0 * (2 ** _attempt))
         raise _last if _last else RuntimeError("采样调用失败(未知原因)")

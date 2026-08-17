@@ -255,6 +255,13 @@ class PipelineOrchestrator:
                     # 策略升级会改 direction,恢复时 plan 必须跟矩阵同代,
                     # 否则下游拿旧锚点判新内容。
                     "_plan": plan,
+                    # ⚠️ 策略升级会**清掉受影响 cell 的画像反应**(那些判决针对的
+                    # 是升级前的 prompt,留着就是过期诊断)。但 _persona_merged
+                    # 标记存的是**清理前**的完整包,恢复顺序又是"先 persona 后
+                    # refined_c" —— 不把清理后的包一起存进快照的话,陈旧反应会
+                    # 在恢复后复活,出现在产出和 UI 上,而对应 cell 早被重写了。
+                    # 这正是本轮要治的「恢复 ≠ 重跑」在我自己的修复里又犯了一次。
+                    "_persona_reactions": final_system.get("_persona_reactions"),
                 },
             )
             logger.info("[checkpoint] 已存矩阵快照 %s", tag)
@@ -271,7 +278,8 @@ class PipelineOrchestrator:
             return False
         final_system["prompt_matrix"] = snap["prompt_matrix"]
         for _k in ("_narrative_director_result", "_red_blue_stats",
-                   "vibe_critic_result", "strategic_warnings"):
+                   "vibe_critic_result", "strategic_warnings",
+                   "_persona_reactions"):
             if snap.get(_k) is not None:
                 final_system[_k] = snap[_k]
         # 把累积评审恢复到**实例**上,不是 final_system 上 —— 恢复的位置必须
@@ -380,33 +388,33 @@ class PipelineOrchestrator:
 
         start = time.time()
         while time.time() - start < CLARIFICATION_TIMEOUT:
+            # ⚠️ 取消检查必须在**接受回复之前**。放在后面的话有竞态:两个标签页
+            # 之间,如果"用户回复了请旨"和"用户点了强制取消"发生在同一个轮询间隔里,
+            # 下一轮会先看到回复,然后无条件把已经 failed 的 run 和 project 改回
+            # running —— 取消被静默吃掉,付费的工作继续跑。
+            _cancelled_now = False
+            try:
+                _run_now = self.db.get_pipeline_run(self.run_id) or {}
+                _st = (_run_now.get("status") or "").strip().lower()
+                # 这里**必须**把 paused_for_review 当正常态 —— 本函数自己刚把
+                # 状态设成它。只有既不是 running 也不是 paused 才算被取消。
+                if _st and _st not in ("running", "paused_for_review"):
+                    _cancelled_now = True
+            except Exception:
+                # 查询抖动不该中断请旨等待 —— 和 _check_cancelled 同一个取舍
+                pass
+            if _cancelled_now:
+                raise PipelineCancelled(
+                    f"请旨等待期间 run 状态变为 {_st!r}(多半是用户点了强制取消),"
+                    f"停止等待。"
+                )
+
             log = self.db.get_stage_log_by_id(log_id)
             if log and log.get("human_intervention"):
                 # User has responded — resume
                 self.db.update_pipeline_run(self.run_id, status="running")
                 self.db.update_project(self.project_id, status="running")
                 return log["human_intervention"]
-
-            # ⚠️ 请旨等待期间也要查取消。stage 边界的检查在这里帮不上忙 ——
-            # 这个循环最长会待 CLARIFICATION_TIMEOUT(默认 3600 秒),期间
-            # 用户强制取消的话,数据库状态早就变了,但线程和心跳还会活满一小时。
-            #
-            # 判据和 _check_cancelled 有一点不同:这里**必须**把
-            # paused_for_review 当成正常态(本函数自己刚把状态设成它),所以
-            # 只在状态既不是 running 也不是 paused_for_review 时才停。
-            try:
-                _run_now = self.db.get_pipeline_run(self.run_id) or {}
-                _st = (_run_now.get("status") or "").strip().lower()
-                if _st and _st not in ("running", "paused_for_review"):
-                    raise PipelineCancelled(
-                        f"请旨等待期间 run 状态变为 {_st!r}(多半是用户点了"
-                        f"强制取消),停止等待。"
-                    )
-            except PipelineCancelled:
-                raise
-            except Exception:
-                # 查询抖动不该中断请旨等待 —— 和 _check_cancelled 同一个取舍
-                pass
 
             await asyncio.sleep(CLARIFICATION_POLL_INTERVAL)
 
@@ -801,7 +809,18 @@ class PipelineOrchestrator:
             else:
                 _warn_before = len(final_system.get("strategic_warnings") or [])
                 await self._run_persona_simulation(final_system, structured_brief)
+                # ⚠️ 只有真跑通了才写 resume 标记。两个 backend 都失败时
+                # _run_persona_simulation 是**正常返回**的(把 status 写成
+                # "failed" 而不是抛异常),照写 completed 标记的话,resume 会
+                # 永久跳过画像 —— 哪怕原始失败只是一次限流或短暂故障。
+                # 老的"查 stage_log"逻辑在这种情况下是会重试的,不能比它更差。
+                _pm_ok = (
+                    (final_system.get("_persona_reactions") or {}).get("status")
+                    == "ok"
+                )
                 try:
+                    if not _pm_ok:
+                        raise RuntimeError("skip-marker")
                     _pmlog = self.db.create_stage_log(
                         self.run_id, "_persona_merged",
                         {"cells": len(final_system.get("prompt_matrix") or [])},
@@ -818,7 +837,13 @@ class PipelineOrchestrator:
                         },
                     )
                 except Exception:
-                    logger.warning("[persona_sim] resume 标记落库失败")
+                    if _pm_ok:
+                        logger.warning("[persona_sim] resume 标记落库失败")
+                    else:
+                        logger.warning(
+                            "[persona_sim] 双 backend 都失败,**不写** resume 标记 "
+                            "—— 下次继续执行时会重试(可能只是限流/短暂故障)"
+                        )
 
             # 5c+++++. Gemini 结构审（advisory）— audits each prompt_cell for
             # structural completeness (5 pools / persona / compliance /
@@ -888,10 +913,22 @@ class PipelineOrchestrator:
                     _rp = getattr(self, "_restored_plan", None)
                     if isinstance(_rp, dict) and _rp.get("tactical_directions"):
                         plan = _rp
+                        # ⚠️ 派生索引也要一起重建。只换 plan 的话
+                        # self._direction_index 还是 run() 开头按**升级前**的
+                        # direction 建的,而 _run_consumer_simulation 读的正是
+                        # 这个索引 —— 会拿旧的 stop_trigger 去评判升级后的 cell,
+                        # 产出错误的告警送进终审。
+                        # 活路径(_run_strategic_escalation)里是同时更新两者的,
+                        # 恢复路径必须对齐。
+                        self._direction_index = {
+                            d.get("direction_id"): d
+                            for d in _rp.get("tactical_directions", [])
+                            if d.get("direction_id")
+                        }
                         logger.info(
-                            "[resume] 跳过策略升级,并换回升级后的 plan"
-                            "(%d 个 direction)",
-                            len(_rp.get("tactical_directions") or []),
+                            "[resume] 跳过策略升级,换回升级后的 plan 并重建"
+                            "direction 索引(%d 个 direction)",
+                            len(self._direction_index),
                         )
                     else:
                         logger.warning(
@@ -1483,8 +1520,17 @@ class PipelineOrchestrator:
                             self.run_id, stage_name
                         ) or []
                         if _turn_logs:
+                            # ⚠️ **同时**要把 status 改成 completed。这一轮如果
+                            # 触发过请旨且超了 MAX_CLARIFICATION_PER_AGENT,
+                            # _run_with_clarification 会带着部分产出返回,而那条
+                            # stage_log 还停在 needs_input ——
+                            # _load_completed_stages 只收 status=="completed" 的行,
+                            # 于是"已落库的批准"其实读不出来,下游一失败还是重跑
+                            # 整个策略辩论。只改 output_data 是个不完整的修复。
                             self.db.update_stage_log(
-                                _turn_logs[-1]["id"], output_data=response
+                                _turn_logs[-1]["id"],
+                                status="completed",
+                                output_data=response,
                             )
                         else:
                             logger.warning(
