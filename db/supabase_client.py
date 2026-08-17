@@ -228,34 +228,60 @@ class SupabaseClient:
         列表再按 in_ 过滤,语义确定、payload 可控。
         """
         try:
-            runs = (
-                self.client.table("pipeline_runs")
-                .select("id,created_at")
-                .eq("project_id", project_id)
-                .order("created_at", desc=True)
-                .limit(limit + 5)   # 多取几条,后面要按 exclude 和空分数过滤
-                .execute()
-            ).data or []
-            run_ids = [
-                r["id"] for r in runs
-                if r.get("id") and r["id"] != exclude_run_id
-            ][:limit]
-            if not run_ids:
-                return []
+            # ⚠️ 不能先 `[:limit]` 再查分数。失败 / 被取消 / 中断的 run 也占
+            # 位置,它们没有 quality_score —— 先切片就等于把额度花在这些空 run
+            # 上,查完过滤掉,更早的**有效**分数则永远进不来。一个项目连着挂
+            # 几次之后,基线会永久凑不满 3 条,回归检测直接失效。
+            #
+            # 改成分页往前捞,直到集满 limit 条【真的有分数】的 run 为止。
+            collected: list[dict] = []
+            seen_runs: set[str] = set()
+            offset, page = 0, max(limit * 3, 30)
+            while len(collected) < limit and offset < 300:
+                runs = (
+                    self.client.table("pipeline_runs")
+                    .select("id,created_at")
+                    .eq("project_id", project_id)
+                    .order("created_at", desc=True)
+                    .range(offset, offset + page - 1)
+                    .execute()
+                ).data or []
+                if not runs:
+                    break
+                offset += page
+                run_ids = [
+                    r["id"] for r in runs
+                    if r.get("id") and r["id"] != exclude_run_id
+                ]
+                if not run_ids:
+                    continue
 
-            rows = (
-                self.client.table("stage_logs")
-                .select("run_id,created_at,output_data")
-                .eq("stage_name", "quality_score")
-                .in_("run_id", run_ids)
-                .order("created_at", desc=True)
-                .execute()
-            ).data or []
-            return [
-                r["output_data"] for r in rows
-                if isinstance(r.get("output_data"), dict)
-                and r["output_data"].get("total_cells")
-            ]
+                rows = (
+                    self.client.table("stage_logs")
+                    .select("run_id,created_at,output_data")
+                    .eq("stage_name", "quality_score")
+                    .in_("run_id", run_ids)
+                    .order("created_at", desc=True)
+                    .execute()
+                ).data or []
+
+                # ⚠️ 一条 run 可能有**多条** quality_score:失败重续和修订重跑
+                # 复用同一个 run_id,而 persist_quality_score 每次都插新行。
+                # 不去重的话,同一条 run 会在中位数里被重复加权,甚至靠自己
+                # 几条记录就凑满 BASELINE_MIN_RUNS —— 基线变成"跟自己比"。
+                # rows 已按时间倒序,每个 run_id 取第一条 = 最新那条。
+                for r in rows:
+                    rid = r.get("run_id")
+                    od = r.get("output_data")
+                    if not rid or rid in seen_runs:
+                        continue
+                    if not isinstance(od, dict) or not od.get("total_cells"):
+                        continue
+                    seen_runs.add(rid)
+                    collected.append(od)
+                    if len(collected) >= limit:
+                        break
+            return collected
         except Exception:
             logger.exception(
                 "[quality_history] 查询失败(non-fatal),回归哨兵本轮跳过"

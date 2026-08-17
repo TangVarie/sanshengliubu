@@ -213,23 +213,53 @@ async def sample_one_cell(
         让主链路的自适应限流器误以为**自己**太快,于是把速率减半 —— 主链路被
         一个它管不着的旁路拖慢了。
 
+        ⚠️ v0.34.1:限流器必须包住**每一次真实请求**,不能包住整个带重试的
+        helper。`call_kimi_text` 内部默认还有 3 次重试,包在外面的话:三次请求
+        只占一个滑动窗口时间戳、只占一个并发槽,而且采样侧的 429 永远不会调到
+        限流器的自适应退避钩子。结果是限流被 429 触发时最需要它的那一刻恰好
+        失效 —— 60 个逻辑样本可以打出多达 180 次真实请求,而限流器以为只有 60。
+        所以这里把内层重试关掉(max_attempts=1),自己做退避,每次尝试单独取槽,
+        并在 429 时显式通知限流器退避。
+
         `slot()` 是同步上下文管理器,而本函数已经在 to_thread 里跑,直接 with
         即可。限流器不可用时(Vertex 模式会返回 None)退回裸调用。
         """
+        import time as _time
         from pipeline.agents import _get_active_limiter
+
         _lim = _get_active_limiter()
-        if _lim is None:
-            return call_kimi_text(
-                system_prompt, user_message,
-                model=PRIMARY_MODEL,
-                max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
-            )
-        with _lim.slot(stage_name="batch_sampling"):
-            return call_kimi_text(
-                system_prompt, user_message,
-                model=PRIMARY_MODEL,
-                max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
-            )
+        _last: Exception | None = None
+        for _attempt in range(3):
+            try:
+                if _lim is None:
+                    return call_kimi_text(
+                        system_prompt, user_message,
+                        model=PRIMARY_MODEL,
+                        max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
+                        max_attempts=1,
+                    )
+                with _lim.slot(stage_name="batch_sampling"):
+                    return call_kimi_text(
+                        system_prompt, user_message,
+                        model=PRIMARY_MODEL,
+                        max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
+                        max_attempts=1,
+                    )
+            except Exception as _e:
+                _last = _e
+                _msg = str(_e).lower()
+                # 采样侧撞到限流也要让限流器知道 —— 不通知的话它只按主链路的
+                # 429 调速,而采样正是那个把配额吃掉的旁路。
+                if _lim is not None and (
+                    "429" in _msg or "rate" in _msg or "too many" in _msg
+                ):
+                    try:
+                        _lim.note_rate_limited(stage_name="batch_sampling")
+                    except Exception:
+                        pass
+                if _attempt < 2:
+                    _time.sleep(2.0 * (2 ** _attempt))
+        raise _last if _last else RuntimeError("采样调用失败(未知原因)")
 
     async def _one(idx: int) -> tuple[str | None, dict, str | None]:
         seed = 1 + idx * BATCH_SAMPLE_SEED_STEP
@@ -396,14 +426,42 @@ async def run_batch_sampling(
     bad = [r for r in reports if not (isinstance(r, dict) and r.get("status") == "ok")]
 
     if not ok_reports:
+        # ⚠️ partial 的 cell 可能已经成功付费生成过一两篇 —— 全部 cell 都走
+        # partial 时不能直接返回一个没有 _usage 的失败结构,否则 orchestrator
+        # 上报成本为 0,而钱是真花了。本模块 docstring 承诺过"成本单独上报,
+        # 悄悄花钱比花钱更糟",这里必须兑现。
+        _bad_cost = sum(
+            float((r.get("_usage") or {}).get("cost_usd", 0.0))
+            for r in bad if isinstance(r, dict)
+        )
+        _bad_in = sum(
+            int((r.get("_usage") or {}).get("input_tokens", 0))
+            for r in bad if isinstance(r, dict)
+        )
+        _bad_out = sum(
+            int((r.get("_usage") or {}).get("output_tokens", 0))
+            for r in bad if isinstance(r, dict)
+        )
         return {
             "status": "failed",
-            "reason": "所有 cell 的采样都失败了(多半是辅助层未配置或限流)",
+            "reason": (
+                "没有任何 cell 取回足够样本(多半是辅助层未配置、限流、或"
+                "部分故障)。已发生的调用成本仍如实上报。"
+            ),
             "cells_attempted": len(cells),
+            "cells_partial": sum(
+                1 for r in bad
+                if isinstance(r, dict) and r.get("status") == "partial"
+            ),
             "sample_errors": [
                 (r.get("errors") or [str(r)])[:1] for r in bad
                 if isinstance(r, dict)
             ][:3],
+            "_usage": {
+                "cost_usd": round(_bad_cost, 5),
+                "input_tokens": _bad_in,
+                "output_tokens": _bad_out,
+            },
         }
 
     total_samples = sum(r["n_ok"] for r in ok_reports)

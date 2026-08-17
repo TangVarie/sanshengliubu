@@ -149,6 +149,7 @@ def call_kimi_text(
     model: str | None = None,
     max_output_tokens: int | None = None,
     images: list[tuple[bytes, str]] | None = None,
+    max_attempts: int = 3,
 ) -> dict[str, Any]:
     """跑一次辅助调用,返回**原始文本**不做 JSON 解析。
 
@@ -168,6 +169,7 @@ def call_kimi_text(
         model=model,
         max_output_tokens=max_output_tokens,
         images=images,
+        max_attempts=max_attempts,
     )
 
 
@@ -225,6 +227,7 @@ def _call_kimi_raw(
     model: str | None = None,
     max_output_tokens: int | None = None,
     images: list[tuple[bytes, str]] | None = None,
+    max_attempts: int = 3,
 ) -> dict[str, Any]:
     """共享的调用主体 —— 建 client、重试、抽文本、算成本。
 
@@ -263,7 +266,7 @@ def _call_kimi_raw(
         from pipeline.llm_retry import call_with_retry
         response = call_with_retry(
             _do_call,
-            max_attempts=3,
+            max_attempts=max_attempts,
             initial_wait=2.0,
             max_wait=30.0,
             operation=f"kimi_assist:{model_id}",
