@@ -160,6 +160,109 @@ class PipelineOrchestrator:
         # 详见 _run_vibe_loop 里的累积点注释。
         self._vibe_cell_reviews: dict[str, dict] = {}
 
+    # ── 取消检查点 (v0.33.8) ──────────────────────────────────────────
+
+    def _check_cancelled(self, where: str) -> None:
+        """在 stage 边界查一次 run 状态,被取消就抛 PipelineCancelled。
+
+        `force_cancel_pipeline` 把 run 标成 failed 来解开 UI 的锁,但它杀不掉
+        本线程(Python 没法安全地 kill 守护线程)。没有这道检查的话,取消之后
+        线程会继续把剩下几十次调用跑完 —— 按钮解锁了,钱还在烧。
+
+        查询失败一律**当作没被取消**继续跑:一次 DB 抖动不该把一条正常的 run
+        判死。宁可漏一次取消,不要误杀。
+        """
+        try:
+            run = self.db.get_pipeline_run(self.run_id) or {}
+        except Exception:
+            logger.debug("[cancel-check] 查询失败,按未取消继续(%s)", where)
+            return
+        status = (run.get("status") or "").strip().lower()
+        # paused_for_review 是请旨等待,是正常态,不算取消。
+        if status and status not in ("running", "paused_for_review"):
+            raise PipelineCancelled(
+                f"run 状态已变为 {status!r}(多半是用户点了强制取消),"
+                f"在 {where} 处停止。已完成的阶段都留着,点「继续执行」可以接着跑。"
+            )
+
+    # ── 精炼链的断点重续 (v0.33.8) ────────────────────────────────────
+    #
+    # 此前 resume 只覆盖了前半条链(太子/中书省/尚书省/六部/工部架构,外加格子
+    # 规划和工部构建的 cell 级恢复)。**工部构建之后的整条精炼链没有任何 resume**:
+    # 叙事导演、红蓝、画像 ×2、结构审、网感循环、消费者模拟、批量采样、终审 ——
+    # 12 格子约 80-100 次调用,在终审挂掉后点「继续执行」会**全部重跑一遍**。
+    #
+    # 保护做在了错误的一半:单次最贵的工部构建有 cell 级恢复,而调用量最大的
+    # 后半条链完全裸奔。体感就是"明明只差最后一步,重续却跑了十几分钟"。
+    #
+    # 两类阶段要分开处理:
+    #   - **不改 prompt_matrix 的**(画像/结构审/消费者模拟/采样)—— 它们只往
+    #     final_system 挂诊断数据,查一下 done 就能跳过,把数据恢复回去即可
+    #   - **改 prompt_matrix 的**(叙事导演/红蓝/网感循环)—— 跳过它们必须同时
+    #     恢复被改写过的矩阵,否则会拿未精炼的正文去出货。这类用矩阵快照
+
+    def _restore_advisory_stage(
+        self, stage: str, final_system: dict, done: dict, field: str
+    ) -> bool:
+        """恢复一个**不改 prompt_matrix** 的 advisory 阶段。返回 True = 已跳过。
+
+        这类阶段只往 final_system 挂一个诊断字段,恢复它就等于恢复了全部效果。
+        """
+        payload = done.get(stage)
+        if not payload:
+            return False
+        final_system[field] = payload
+        logger.info("[resume] 跳过 %s(复用上次结果)", stage)
+        return True
+
+    def _checkpoint_matrix(self, tag: str, final_system: dict) -> None:
+        """给**改过 prompt_matrix** 的阶段打一个矩阵快照。
+
+        存整个 prompt_matrix 而不是 diff:diff 要处理 cell 增删和字段级合并,
+        复杂度和出错面都远大于直接存一份。12 格子约 50KB,一条 run 最多两次快照
+        —— 用 100KB 的写入换掉 80 次 LLM 调用的重跑,这笔账很划算。
+        """
+        try:
+            log = self.db.create_stage_log(
+                self.run_id, f"_matrix_ckpt_{tag}",
+                {"cells": len(final_system.get("prompt_matrix") or [])},
+            )
+            self.db.update_stage_log(
+                log["id"], status="completed",
+                output_data={
+                    "prompt_matrix": final_system.get("prompt_matrix") or [],
+                    # 这两个诊断字段是被快照阶段产出的,一起存,避免恢复后
+                    # UI 上"跑过但看不到结果"。
+                    "_narrative_director_result": final_system.get(
+                        "_narrative_director_result"
+                    ),
+                    "_red_blue_stats": final_system.get("_red_blue_stats"),
+                    "vibe_critic_result": final_system.get("vibe_critic_result"),
+                },
+            )
+            logger.info("[checkpoint] 已存矩阵快照 %s", tag)
+        except Exception:
+            # 快照失败只是丢了重续能力,不该影响这一轮的产出。
+            logger.warning("[checkpoint] 存 %s 快照失败(不影响本轮)", tag)
+
+    def _restore_matrix_checkpoint(
+        self, tag: str, final_system: dict, done: dict
+    ) -> bool:
+        """从快照恢复 prompt_matrix。返回 True = 恢复成功、对应阶段可跳过。"""
+        snap = done.get(f"_matrix_ckpt_{tag}")
+        if not snap or not snap.get("prompt_matrix"):
+            return False
+        final_system["prompt_matrix"] = snap["prompt_matrix"]
+        for _k in ("_narrative_director_result", "_red_blue_stats",
+                   "vibe_critic_result"):
+            if snap.get(_k) is not None:
+                final_system[_k] = snap[_k]
+        logger.info(
+            "[resume] 从快照 %s 恢复 %d 个 cell,跳过对应精炼阶段",
+            tag, len(snap["prompt_matrix"]),
+        )
+        return True
+
     # ── Completed stages cache (for resume) ───────────────────────────
 
     def _load_completed_stages(self) -> dict[str, dict]:
@@ -433,6 +536,8 @@ class PipelineOrchestrator:
                         structured_brief.setdefault(_k, _brief_dict[_k])
                 self.db.update_project(self.project_id, brief=structured_brief)
 
+            self._check_cancelled("太子之后")
+
             # 1a. User-pasted reference posts (B) — if page 2 recorded
             # any xiaohongshu.com URLs onto project.brief._reference_post_urls,
             # ask Gemini to fetch each via url_context and attach the
@@ -520,6 +625,8 @@ class PipelineOrchestrator:
             else:
                 plan = await self._strategy_loop(structured_brief)
 
+            self._check_cancelled("策略辩论之后")
+
             # 3. 尚书省 — dispatch
             if "dispatcher" in done:
                 logger.info("Resuming: skipping dispatcher (already completed)")
@@ -530,6 +637,8 @@ class PipelineOrchestrator:
 
             # 4. 六部（前五部并行，跳过已完成的）
             ministry_outputs = await self._run_ministries(tasks, structured_brief, plan, done)
+
+            self._check_cancelled("六部之后")
 
             # 5a. 工部·架构 — global skeleton design (Opus, small output)
             if "ministry_works" in done:
@@ -582,6 +691,8 @@ class PipelineOrchestrator:
             # Assemble full works_plan for builder
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
+            self._check_cancelled("格子规划之后")
+
             # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
             final_system = await self._run_works_builders(works_plan, structured_brief)
 
@@ -591,22 +702,39 @@ class PipelineOrchestrator:
                     f"works_plan keys: {list(works_plan.keys())}"
                 )
 
-            # 5c+. 叙事导演（Claude, 跨 cell 一致性+差异化诊断）
-            # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
-            # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
-            await self._run_narrative_director(final_system, works_plan, structured_brief)
+            self._check_cancelled("工部构建之后")
 
-            # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
-            # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
-            # 直接替换回 prompt_matrix，所以后续 vibe/终审看到的是
-            # 已经被精炼过的版本。
-            await self._run_red_blue_refinement(final_system)
+            # ── 精炼层 A:叙事导演 + 红蓝(都会改写 prompt_matrix)──────
+            # 这两个跑完打一次矩阵快照。resume 时优先看有没有更靠后的快照
+            # (refined_b),没有再看这个 —— 恢复了就把这两步整个跳过。
+            if not self._restore_matrix_checkpoint("refined_b", final_system, done) \
+                    and not self._restore_matrix_checkpoint(
+                        "refined_a", final_system, done):
+                # 5c+. 叙事导演（跨 cell 一致性+差异化诊断）
+                # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
+                # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
+                await self._run_narrative_director(
+                    final_system, works_plan, structured_brief
+                )
+
+                # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
+                # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
+                # 直接替换回 prompt_matrix，所以后续 vibe/终审看到的是
+                # 已经被精炼过的版本。
+                await self._run_red_blue_refinement(final_system)
+
+                # 这里是重续价值最高的一个点:上面两步 12 格子约 13-25 次调用,
+                # 而它们之后还有终审等好几个可能失败的环节。
+                self._checkpoint_matrix("refined_a", final_system)
 
             # 5c++++. 画像模拟审稿 — 3 个模拟读者对每个 cell 的 demo
             # 给出 0.5 秒反应（click/skip/save）。结果存到
             # final_system._persona_reactions 让 UI 展示，也作为
             # vibe_critic 的补充输入。
-            await self._run_persona_simulation(final_system, structured_brief)
+            if not self._restore_advisory_stage(
+                "persona_simulator", final_system, done, "_persona_reactions"
+            ):
+                await self._run_persona_simulation(final_system, structured_brief)
 
             # 5c+++++. Gemini 结构审（advisory）— audits each prompt_cell for
             # structural completeness (5 pools / persona / compliance /
@@ -615,10 +743,23 @@ class PipelineOrchestrator:
             # directives so the vibe stage also catches structural gaps,
             # not just taste issues. Advisory-only: any Gemini failure →
             # log warn, proceed with unchanged final_system.
-            await self._run_gemini_structure_review_stage(final_system)
+            if not self._restore_advisory_stage(
+                "ministry_works_structure_review", final_system, done,
+                "_structure_review",
+            ):
+                await self._run_gemini_structure_review_stage(final_system)
 
-            # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
-            final_system = await self._run_vibe_loop(final_system, structured_brief)
+            self._check_cancelled("精炼层之后")
+
+            # ── 精炼层 B:网感循环(会改写 prompt_matrix)────────────────
+            # 有 refined_b 快照就整个跳过 —— 这一步含 critic + rewriter 最多
+            # 3 轮,是精炼链里调用量第二大的。
+            if not self._restore_matrix_checkpoint("refined_b", final_system, done):
+                # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
+                final_system = await self._run_vibe_loop(
+                    final_system, structured_brief
+                )
+                self._checkpoint_matrix("refined_b", final_system)
 
             # 5d+. 策略层自动升级(v0.29.1, C.2.1)— 如果 vibe_loop 留下了
             # strategic_warnings(interest_align / reward_signal 级错配,
@@ -637,9 +778,30 @@ class PipelineOrchestrator:
             # 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。
             # 被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
             if ENABLE_CONSUMER_SIMULATION:
-                await self._run_consumer_simulation(
-                    final_system, structured_brief, plan,
-                )
+                # 消费者模拟复用的是 persona_simulator 这个 agent,所以它写的
+                # stage_log 名字和画像模拟**撞车**,没法靠 stage 名判断跑没跑过。
+                # 单独写一条 `_consumer_sim_done` 作为 resume 标记。
+                _cs_prev = done.get("_consumer_sim_done")
+                if _cs_prev:
+                    final_system["_consumer_simulation"] = _cs_prev
+                    logger.info("[resume] 跳过消费者模拟(复用上次结果)")
+                else:
+                    await self._run_consumer_simulation(
+                        final_system, structured_brief, plan,
+                    )
+                    try:
+                        _cslog = self.db.create_stage_log(
+                            self.run_id, "_consumer_sim_done",
+                            {"scope": (final_system.get("_consumer_simulation")
+                                       or {}).get("_scope", "?")},
+                        )
+                        self.db.update_stage_log(
+                            _cslog["id"], status="completed",
+                            output_data=final_system.get("_consumer_simulation")
+                            or {"status": "skipped"},
+                        )
+                    except Exception:
+                        logger.warning("[consumer_sim] resume 标记落库失败")
 
             # 5e. Cross-cell duplicate re-check after vibe. Builder's own
             # check (at end of _run_works_builders) catches builder-produced
@@ -662,6 +824,8 @@ class PipelineOrchestrator:
                     "流水线已终止以防交付重复内容。重跑一次应能抽到不同样本；"
                     "如果反复出现同一对 cell 冲突，考虑调整 vibe_rewriter 提示词里的样本差异化约束。"
                 )
+
+            self._check_cancelled("网感循环之后")
 
             # 6. 门下省终审
             # Track review round for the final-review force-pass mechanism.
@@ -801,7 +965,12 @@ class PipelineOrchestrator:
             # 跑在终审之后是有意的:采样的是**最终出货的那版 system_prompt**。
             # 【观测,不拦】—— 不阻塞、不触发重写、不影响 verdict。没有历史分布
             # 就设阈值等于凭猜,先攒数据。详见 batch_sampler 模块 docstring。
-            if ENABLE_BATCH_SAMPLING:
+            if ENABLE_BATCH_SAMPLING and done.get("batch_sampling"):
+                # 采样是整条精炼链里调用量最大的一步(12 格子 × 5 篇 = 60 次),
+                # 而它跑在最后、后面还有落库 —— 重续时最不该重跑的就是它。
+                final_system["_batch_sampling"] = done["batch_sampling"]
+                logger.info("[resume] 跳过批量采样(复用上次的 60 次调用结果)")
+            elif ENABLE_BATCH_SAMPLING:
                 try:
                     _sampling = await run_batch_sampling(
                         final_system.get("prompt_matrix") or [],
@@ -914,6 +1083,22 @@ class PipelineOrchestrator:
             )
             self.db.update_project(self.project_id, status=final_status)
 
+        except PipelineCancelled as e:
+            # 用户主动取消 —— 不是故障,不写 traceback marker,也不覆盖状态
+            # (force_cancel 已经把 run 标成 failed 了)。写一条干净的说明,
+            # 让详情页显示"这是你自己取消的"而不是一堆吓人的堆栈。
+            logger.info("[cancel] %s", e)
+            try:
+                _clog = self.db.create_stage_log(
+                    self.run_id, "_cancelled",
+                    {"cancelled_at": datetime.now(timezone.utc).isoformat()},
+                )
+                self.db.update_stage_log(
+                    _clog["id"], status="failed", error_message=str(e),
+                )
+            except Exception:
+                logger.warning("[cancel] 取消标记落库失败(不影响结果)")
+            raise
         except Exception as e:
             logger.exception("Pipeline failed")
             # Persist the failure where the UI can actually show it. run()'s
@@ -1109,6 +1294,24 @@ class PipelineOrchestrator:
                     f"verdict={verdict}, "
                     f"challenges={len(response.get('challenges', []))}"
                 )
+
+                # v0.33.8: 无质疑即收敛。门下省这一轮一条 challenge 都没提,
+                # 说明对抗已经跑到头了 —— 再走一个「中书省修订 → 门下省再审」
+                # 的完整往返,中书省要重吐一次完整大 plan(跑 k3 的 $15/1M 输出
+                # 档,这条链上最贵的部分),换回来的多半是同一份方案。
+                #
+                # 只在**非末轮**做这个判断:末轮本来就要放行,不需要提前。
+                _challenges = response.get("challenges") or []
+                if (
+                    verdict != "approved"
+                    and not _challenges
+                    and not _is_last_chancellery_turn
+                ):
+                    logger.info(
+                        "[strategy_debate] turn %d 门下省未提出任何质疑,"
+                        "提前收敛(省下一个完整往返)", turn,
+                    )
+                    verdict = "approved"
 
                 if verdict == "approved":
                     logger.info(
@@ -4518,6 +4721,21 @@ class TrendScoutRequiredError(RuntimeError):
     fail-fast: at that point only the 太子 stage has been paid for, whereas
     silently proceeding without calibration data skews the whole strategy
     and forces a full rerun.
+    """
+
+
+class PipelineCancelled(RuntimeError):
+    """用户在流水线中途点了「强制取消」。
+
+    v0.33.8 新增。此前 `force_cancel_pipeline` 只翻数据库状态来解开 UI 的锁 ——
+    它的 docstring 自己写明了 Python 杀不掉挂起的守护线程。后果是:点了取消之后
+    **按钮解锁了、钱还在烧**,僵尸线程会一直跑到自己结束或 TCP 超时。
+
+    现在流水线在每个 stage 边界查一次 run 状态,不再是 running 就抛这个异常,
+    让线程自己走正常的退出路径。代价是每条 run 多约 20 次极轻量的 DB 读。
+
+    注意这只能在**两次调用之间**生效 —— 已经发出去的那一次 HTTP 请求仍然要等它
+    自己返回。真正卡在网络层的调用还是得靠超时兜底,那不是这一层能解决的。
     """
 
 

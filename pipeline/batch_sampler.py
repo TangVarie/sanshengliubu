@@ -202,6 +202,35 @@ async def sample_one_cell(
     if not sp.strip():
         return {"cell_id": cid, "status": "skipped", "reason": "system_prompt 为空"}
 
+    def _call_under_limiter(system_prompt: str, user_message: str) -> dict:
+        """在**主链路的限流器**下发这次采样调用。
+
+        v0.33.8 修正:此前采样完全绕开 `_SlidingWindowLimiter` —— 辅助层
+        (kimi_client)本来就不走主限流器,那对二审/结构审这种一次一两个调用的
+        岗位没问题,但采样是 60 次。
+
+        后果是两条链共用同一个上游配额、却只有一条在自律:采样打出去的 429 会
+        让主链路的自适应限流器误以为**自己**太快,于是把速率减半 —— 主链路被
+        一个它管不着的旁路拖慢了。
+
+        `slot()` 是同步上下文管理器,而本函数已经在 to_thread 里跑,直接 with
+        即可。限流器不可用时(Vertex 模式会返回 None)退回裸调用。
+        """
+        from pipeline.agents import _get_active_limiter
+        _lim = _get_active_limiter()
+        if _lim is None:
+            return call_kimi_text(
+                system_prompt, user_message,
+                model=PRIMARY_MODEL,
+                max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
+            )
+        with _lim.slot(stage_name="batch_sampling"):
+            return call_kimi_text(
+                system_prompt, user_message,
+                model=PRIMARY_MODEL,
+                max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
+            )
+
     async def _one(idx: int) -> tuple[str | None, dict, str | None]:
         seed = 1 + idx * BATCH_SAMPLE_SEED_STEP
         msg = build_sample_user_message(cell, brief, seed)
@@ -211,11 +240,9 @@ async def sample_one_cell(
                 # 阻塞会把采样串行化(60 次 × 数秒 = 好几分钟)。丢进线程池换回
                 # 并发。这是本模块和其它辅助层调用点唯一的写法差异,原因就是量级。
                 res = await asyncio.to_thread(
-                    call_kimi_text,
+                    _call_under_limiter,
                     sp,
                     msg,
-                    model=PRIMARY_MODEL,
-                    max_output_tokens=BATCH_SAMPLE_MAX_OUTPUT_TOKENS,
                 )
                 return res.get("text", ""), res, None
             except (KimiNotConfigured, KimiCallFailed) as e:
