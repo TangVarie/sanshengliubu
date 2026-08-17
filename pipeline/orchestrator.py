@@ -1024,27 +1024,68 @@ class PipelineOrchestrator:
                     "round_number": (turn // 2) + 1,
                 }
 
-                # Force pass on last chancellery turn
-                if turn >= max_turns - 1:
+                # v0.33.6: 最后一轮**照常调用门下省**,只把 verdict 覆写成
+                # approved,而不是凭空合成一个批准。
+                #
+                # 原来的写法是"到最后一轮直接编一个 approved 出来,不调模型"。
+                # 配合 MAX_DEBATE_TURNS=4 后果很严重:turn 0 提案 → turn 1 审议
+                # (唯一一次真审) → turn 2 中书省按意见修订 → turn 3 命中
+                # `turn >= max_turns - 1` 直接橡皮图章。也就是**修订后的方案
+                # 从来没有被审过**,而修订恰恰是最需要复核的那一版。
+                #
+                # 现在:最后一轮仍然真跑一次审议,拿到 challenges 后再强制放行并
+                # 把风险写进 overall_assessment。多花一次 deepseek-v4-flash 调用
+                # (最便宜的一档),换回"交付的方案一定被对抗性看过至少一遍"。
+                _is_last_chancellery_turn = turn >= max_turns - 1
+                agent = self.chancellery
+                orig_stage = agent.stage_name
+                agent.stage_name = stage_name
+                try:
+                    response = await agent.run(input_data, self.run_id, self.db)
+                except Exception as _dbt_err:
+                    # 最后一轮审议挂了不能把整条 run 拖死 —— 退回旧的合成批准,
+                    # 但把失败原因写进 assessment,不假装审过。
+                    if not _is_last_chancellery_turn:
+                        raise
+                    logger.warning(
+                        "[strategy_debate] 末轮审议调用失败,退回合成批准: %r",
+                        _dbt_err,
+                    )
                     response = {
                         "verdict": "approved",
                         "challenges": [],
-                        "overall_assessment": "⚠️ 辩论达到最大轮次，强制通过",
+                        "overall_assessment": (
+                            f"⚠️ 末轮审议调用失败({type(_dbt_err).__name__}),"
+                            "本方案**未经最终对抗性复核**即放行,交付前请人工过一遍"
+                        ),
                     }
-                    log = self.db.create_stage_log(
-                        self.run_id, stage_name, input_data
+                finally:
+                    agent.stage_name = orig_stage
+
+                if _is_last_chancellery_turn and (
+                    (response.get("verdict") or "").strip().lower() != "approved"
+                ):
+                    _held = response.get("challenges") or []
+                    logger.warning(
+                        "[strategy_debate] 末轮门下省仍有 %d 条质疑,"
+                        "但已达轮次上限 —— 强制放行并把质疑写进 assessment",
+                        len(_held),
                     )
-                    self.db.update_stage_log(
-                        log["id"], status="completed", output_data=response
-                    )
-                else:
-                    agent = self.chancellery
-                    orig_stage = agent.stage_name
-                    agent.stage_name = stage_name
-                    try:
-                        response = await agent.run(input_data, self.run_id, self.db)
-                    finally:
-                        agent.stage_name = orig_stage
+                    response = {
+                        **response,
+                        "verdict": "approved",
+                        "_forced_pass": True,
+                        "overall_assessment": (
+                            f"⚠️ 辩论达最大轮次({max_turns})强制通过。"
+                            f"门下省末轮仍提出 {len(_held)} 条未解决的质疑,"
+                            f"已保留在 challenges 字段,交付前请人工复核:"
+                            + "；".join(
+                                str(c.get("point") or c)[:60] for c in _held[:3]
+                            )
+                            + (f"（原评语）{response.get('overall_assessment', '')}"
+                               if response.get("overall_assessment") else "")
+                        ),
+                    }
 
                 debate_history.append({
                     "role": "chancellery",
@@ -2095,11 +2136,17 @@ class PipelineOrchestrator:
         _cap = NARRATIVE_DIRECTOR_MAX_REBUILDS
         _deferred: list[dict] = []
         if _cap is not None and len(cells_to_revise) > _cap:
+            # ⚠️ 字段名是 `priority` 不是 `severity` —— narrative_director.md
+            # 的输出契约里写的是 priority(high/medium)。读错字段会让所有条目
+            # 落到同一个兜底档,排序变成 no-op,cap 就成了"按模型返回顺序砍",
+            # 后面的 high 可能被前面的 medium 挤掉。两个名字都认,priority 优先。
             _sev_rank = {"high": 0, "critical": 0, "medium": 1, "low": 2}
             _sorted = sorted(
                 cells_to_revise,
                 key=lambda r: _sev_rank.get(
-                    (r.get("severity") or "").strip().lower(), 1
+                    ((r.get("priority") or r.get("severity") or "")
+                     .strip().lower()),
+                    1,
                 ),
             )
             _deferred = _sorted[_cap:]
@@ -2111,6 +2158,13 @@ class PipelineOrchestrator:
                 len(_deferred) + _cap, _cap, len(_deferred),
                 [c.get("cell_id") for c in _deferred],
             )
+            # ⚠️ 必须同步裁剪 review 自己的 cells_to_revise。终审的
+            # narrative_director_summary.cells_rebuilt 是从这个列表推出来的
+            # (见 agents/chancellery.py::run_final_review),不裁剪的话被推迟的
+            # cell 会以"已重建"的身份呈给终审 —— 而 chancellery.md 明写
+            # 「cells_rebuilt 非空 → 优先抽查它们的 demo 看问题是否真解决」,
+            # 于是终审会去抽查一个根本没重建过的 cell,那道检查就废了。
+            review["cells_to_revise"] = list(cells_to_revise)
             review["_deferred_rebuilds"] = [
                 {
                     "cell_id": c.get("cell_id"),
@@ -4034,6 +4088,29 @@ class PipelineOrchestrator:
             f"Vibe loop exhausted {max_iterations} iterations "
             f"(hard cap {hard_cap}), proceeding with remaining issues"
         )
+
+        # ⚠️ 走到这里 = 撞上轮次上限退出,而**上一步刚做完重写**。
+        # 被重写过的 cell 正文已经换了,但 _vibe_cell_reviews 里存的还是改写
+        # **之前**那版的判词 —— 拿旧的 multiplier_gate / template_test 去配新的
+        # demo,评分器算出来的两个来源不同代:实验里会把改进读成退步、把退步读成
+        # 改进。这正是 P1 建评分体系时要避免的那类失真,不修就等于评分器自己
+        # 在制造噪声。
+        #
+        # 处理是**作废**而不是补评:删掉这些条目后 check_high_score 对应维度
+        # 返回 None(=没测),这些 cell 不进高分篇计数,同时
+        # high_score_coverage_cells 会掉下来 —— UI 上已经有「覆盖不满 →
+        # 高分层数字不可比」的提示,读数的人能看见。
+        # 补评要多花一次 critic 调用,而这一轮的结论本来就是"没收敛",
+        # 花钱买一个已知不合格样本的精确分数不划算。
+        _stale = rewritten_ids & set(self._vibe_cell_reviews.keys())
+        if _stale:
+            for _sid in _stale:
+                self._vibe_cell_reviews.pop(_sid, None)
+            logger.warning(
+                "[vibe_loop] 达轮次上限后仍有 %d 个 cell 是刚改写未复检的,"
+                "作废其陈旧评审以免评分口径串代: %s",
+                len(_stale), sorted(_stale),
+            )
         return final_system
 
     async def _run_strategic_escalation(
@@ -4293,7 +4370,20 @@ class PipelineOrchestrator:
         # 退回全量 —— critic 挂了的情况下恰恰最需要这层校验。
         _target_cells = prompt_cells
         _reviews = getattr(self, "_vibe_cell_reviews", None) or {}
-        if CONSUMER_SIM_ONLY_WEAK_ALIGN and _reviews:
+        # ⚠️ 只有 critic **评全了**才敢按 weak 过滤。截断/畸形的 critic 响应
+        # 可能只返回一个 cell 的评审,如果那个恰好是 pass,_weak_ids 就是空集,
+        # 于是整个矩阵被跳过、还对外宣称"没有 weak 档" —— 这是 fail-open。
+        # 覆盖不全时退回全量:那种情况下恰恰最需要第二层校验。
+        _all_ids = {c.get("cell_id") for c in prompt_cells if c.get("cell_id")}
+        _covered = _all_ids & set(_reviews.keys())
+        _full_coverage = bool(_all_ids) and _covered == _all_ids
+        if not _full_coverage and _reviews:
+            logger.warning(
+                "[consumer_sim] critic 只评了 %d/%d 个 cell,覆盖不全 —— "
+                "退回全量复判(不按 weak 过滤)",
+                len(_covered), len(_all_ids),
+            )
+        if CONSUMER_SIM_ONLY_WEAK_ALIGN and _full_coverage:
             _weak_ids = {
                 cid for cid, rv in _reviews.items()
                 if ((rv.get("multiplier_gate") or {}).get("interest_align") or "")

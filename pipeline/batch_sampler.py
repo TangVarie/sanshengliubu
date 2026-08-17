@@ -225,19 +225,44 @@ async def sample_one_cell(
 
     results = await asyncio.gather(*[_one(i) for i in range(n)])
 
-    samples: list[str] = []
+    # (seed, text) 一起存 —— 只存 text 的话,某次调用失败后列表被压缩,
+    # 后面 enumerate 会给成功的样本安上**错的 seed**(seed 1 失败、seed 21 成功
+    # 时,报告会把那篇记成 seed 1)。而 per-seed 诊断正是用来判断 prompt 的
+    # seed 轮转有没有生效的,记错了这层诊断就废了。
+    seeded: list[tuple[int, str]] = []
     errors: list[str] = []
     cost = 0.0
     in_tok = out_tok = 0
-    for text, usage, err in results:
+    for _idx, (text, usage, err) in enumerate(results):
         if err:
             errors.append(err)
             continue
         if text:
-            samples.append(text)
+            seeded.append((1 + _idx * BATCH_SAMPLE_SEED_STEP, text))
         cost += float(usage.get("cost_usd", 0.0) or 0.0)
         in_tok += int(usage.get("input_tokens", 0) or 0)
         out_tok += int(usage.get("output_tokens", 0) or 0)
+
+    samples = [t for _, t in seeded]
+
+    # ⑨ 样本太少不算"采样成功"。只回来 1 篇时 measure_diversity 会报
+    # 首句去重率 100%(一篇当然不重复),矩阵层和 UI 会把它当健康数据收下 ——
+    # 而这恰恰最容易发生在限流/部分故障的时候,于是 baseline 被污染成
+    # "越不稳定看起来越好"。至少要 3 篇才谈得上分布。
+    if len(samples) < min(3, n):
+        return {
+            "cell_id": cid,
+            "status": "partial",
+            "n_requested": n,
+            "n_ok": len(samples),
+            "reason": (
+                f"只取回 {len(samples)}/{n} 篇,不足以测分布 —— 本 cell 不计入"
+                f"聚合指标(多为限流或部分故障)"
+            ),
+            "errors": errors[:3],
+            "_usage": {"cost_usd": cost, "input_tokens": in_tok,
+                       "output_tokens": out_tok},
+        }
 
     if not samples:
         return {
@@ -258,7 +283,7 @@ async def sample_one_cell(
     tally: dict[str, int] = {}
     paradigm = cell.get("paradigm")
     craft_ok = 0
-    for i, s in enumerate(samples):
+    for i, (_seed, s) in enumerate(seeded):
         v = check_redlines(s)
         for x in v:
             tally[x["rule"]] = tally.get(x["rule"], 0) + 1
@@ -269,7 +294,7 @@ async def sample_one_cell(
             craft_ok += 1
         per_sample.append({
             "idx": i,
-            "seed": 1 + i * BATCH_SAMPLE_SEED_STEP,
+            "seed": _seed,          # 真实发出去的 seed,不是列表下标推算的
             "opening": first_sentence(_strip_trailing_hashtags(s))[:60],
             "chars": len(s),
             "redline_violations": [x["rule"] for x in v],

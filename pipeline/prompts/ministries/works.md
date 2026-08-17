@@ -37,7 +37,14 @@
 3. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
 3. 差异化工具包的每个池至少包含 5 个可选项
 4. persona_integration_strategy 必须覆盖所有在吏部输出中出现的人设类型
-5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language），下游 cell 才有人设可用
+5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language/**origin_path/pet_phrases/number_memory**）
+
+   ⚠️ 后三个字段(v0.33.6 新增)**必须原样带下来,不许在转写时丢掉**：
+   - `origin_path`（怎么用上这个产品的）是活人感的最高杠杆——人设有了来路才不是一张标签卡
+   - `pet_phrases`（这个人设自己的口头禅）是防批量指纹的：全批共用一套插入词，单篇是人味十篇是流水线
+   - `number_memory`（有理由记得哪些数）管数字的来路，防止满篇伪精确
+   这三项在吏部产出里，你这一步是它们到达工部构建的**唯一通路**——转写时漏掉，
+   下游就再也拿不到，等于吏部白写。
 6. **shared_skeleton 必须有 title_rules 子模块**——全局标题规则（竖线 `|` 禁令、字数范围、蓝词植入原则、口语化要求），各方向 system_prompt 引用此模块，避免每个方向各写一套互相矛盾
 
 ## 修订模式（接收终审驳回反馈时必读）
@@ -129,7 +136,10 @@ C13 群体处境型 / C14 静态定格型 / C15 自我修正型
         "personality_tags": ["INFJ", "省钱", "孝顺嘴硬"],
         "product_relationship": "刚开始用 X，被同事种草",
         "brand_awareness_level": "中—认知核心卖点但不会熟练复述",
-        "temporal_language": "三月初/上周二/这两天"
+        "temporal_language": "三月初/上周二/这两天",
+        "origin_path": "同事在工位上摸出来一支，说她姐姐做代购顺的；之前一直用超市开架款，冬天嘴角起皮",
+        "pet_phrases": ["讲道理", "我寻思"],
+        "number_memory": "记得小票上 89 块和这是第二支；用了多久只会说『快用完了』"
       },
       "P02": "...（每个人设都要按上面字段写齐）"
     },

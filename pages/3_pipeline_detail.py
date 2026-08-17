@@ -947,6 +947,95 @@ if _scorecard.get("total_cells"):
             if _pc.get("craft_missing"):
                 st.caption(f"　　缺工艺要素：{'、'.join(_pc['craft_missing'])}")
 
+# ── 机审闸 prose_gate ───────────────────────────────────────────────────
+# 数据来自 stage_name='prose_gate'。零 LLM 成本的纯正则扫描。
+#
+# ⚠️ 跨篇指纹这一层**跑在终审之后**，所以它影响不了 verdict —— 也就是说
+# fingerprint_hits > 0 时产出照样出货。不在这里显示的话，那个告警就只存在于
+# 服务端日志里，等于没有。这正是本轮改造反复强调的「无声截断会被读成
+# 『这些问题不存在』」，不能自己再犯一次。
+_pg_log = log_map.get("prose_gate")
+_pg = (_pg_log or {}).get("output_data") or {}
+if _pg.get("status") == "ok":
+    st.divider()
+    st.subheader("机审闸（prose_gate）")
+
+    _pg_total = _pg.get("total_cells", 0)
+    _pg_failed = _pg.get("failed_cells") or []
+    _fp = _pg.get("batch_fingerprints") or {}
+    _fp_hits = _fp.get("fingerprint_hits", 0)
+
+    _g1, _g2 = st.columns(2)
+    _g1.metric(
+        "单篇机审通过",
+        f"{_pg_total - len(_pg_failed)}/{_pg_total}",
+        delta=None if not _pg_failed else f"{len(_pg_failed)} 个有硬命中",
+        delta_color="off" if not _pg_failed else "inverse",
+        help="翻案句 / 商业黑话 / 伪精确行为量 / AI 空话 / 寒暄开场 / 列表体。"
+             "纯正则判定，命中即走定点改写。",
+    )
+    _g2.metric(
+        "跨篇指纹命中",
+        f"{_fp_hits}",
+        delta=None if not _fp_hits else "这批有流水线感",
+        delta_color="off" if not _fp_hits else "inverse",
+        help="抓的是**结构重合**（每篇都插同一句、结尾同一句式），"
+             "和跨 cell 查重抓的**词面重合**是两回事。"
+             "⚠️ 这一层跑在终审之后，不影响出货判决——需要人看。",
+    )
+
+    if _fp_hits:
+        st.warning(
+            "**这批内容有批量指纹，交付前请人工过一遍。** 以下是重合的具体位置："
+        )
+        for _label, _key, _fmt in [
+            ("共用修辞模板", "shared_templates",
+             lambda k, v: f"「{k}」出现在 {v['ratio']:.0%} 的格子：{'、'.join(v['cells'][:6])}"),
+            ("共用插入词", "shared_inserts",
+             lambda k, v: f"「{k}」出现在 {v['ratio']:.0%} 的格子：{'、'.join(v['cells'][:6])}"),
+        ]:
+            _items = _fp.get(_key) or {}
+            if _items:
+                st.markdown(f"**{_label}**")
+                for _k, _v in list(_items.items())[:6]:
+                    st.caption(f"　　{_fmt(_k, _v)}")
+        for _label, _key in [("重复开头指纹", "opening_dup"),
+                             ("重复结尾指纹", "ending_dup")]:
+            _items = _fp.get(_key) or {}
+            if _items:
+                st.markdown(f"**{_label}**")
+                for _k, _v in list(_items.items())[:5]:
+                    st.caption(f"　　`{_k}…` ← {'、'.join(_v)}")
+        _grams = _fp.get("hot_4grams") or {}
+        if _grams:
+            st.caption(
+                "跨篇高频四字串（已排除品牌词/蓝词）：　"
+                + "　·　".join(f"「{g}」×{n}" for g, n in list(_grams.items())[:8])
+            )
+
+    _pg_tally = _pg.get("hard_tally") or {}
+    if _pg_tally:
+        _PGL = {"ai_cliche": "AI 空话", "pivot": "翻案句", "jargon": "商业黑话",
+                "pseudo_precise": "伪精确行为量", "banned_opening": "寒暄式开场",
+                "list_body": "列表体正文", "duplicate_opening": "首句撞车",
+                "demo_missing": "内容为空"}
+        st.caption(
+            "单篇硬命中分布：　"
+            + "　·　".join(f"{_PGL.get(k, k)} {v}" for k, v in
+                           sorted(_pg_tally.items(), key=lambda kv: -kv[1]))
+        )
+
+    with st.expander(f"逐格子机审明细（{_pg_total} 个）", expanded=False):
+        for _pc in (_pg.get("per_cell") or []):
+            _mk = "✓" if _pc.get("gate_verdict") == "pass" else "✗"
+            st.markdown(
+                f"**{_mk} {_pc.get('cell_id', '?')}**　`{_pc.get('platform', '')}`"
+            )
+            for _h in (_pc.get("hard_hits") or []):
+                st.caption(f"　　✗ {_h.get('detail', '')}")
+            for _s in (_pc.get("soft_flags") or []):
+                st.caption(f"　　· （软标）{_s.get('detail', '')}")
+
 # ── 批量采样验收 ────────────────────────────────────────────────────────
 # 数据来自 stage_name='batch_sampling'。这是整条流水线唯一一处用 N>1 的样本
 # 验收产出的地方——前面 11 道质量闸看的都是每个 cell 唯一那篇 demo，而交付物
