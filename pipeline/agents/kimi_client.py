@@ -142,6 +142,35 @@ def _build_content(
     return blocks or user_message
 
 
+def call_kimi_text(
+    system_prompt: str,
+    user_message: str,
+    *,
+    model: str | None = None,
+    max_output_tokens: int | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+) -> dict[str, Any]:
+    """跑一次辅助调用,返回**原始文本**不做 JSON 解析。
+
+    v0.33.3 新增,给批量采样(pipeline/batch_sampler.py)用:采样要的是执行
+    模型按 system_prompt 写出来的**一篇内容**,那本来就不是 JSON,套
+    `call_kimi_json` 会在 `_extract_json` 那里退化成 `_parse_error`。
+
+    返回:
+      - "text":          str,模型输出的原文(已 strip,保证非空)
+      - "input_tokens" / "output_tokens" / "cost_usd" / "model": 同 call_kimi_json
+
+    异常契约和 `call_kimi_json` 一致:只抛 KimiNotConfigured / KimiCallFailed。
+    """
+    return _call_kimi_raw(
+        system_prompt,
+        user_message,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        images=images,
+    )
+
+
 def call_kimi_json(
     system_prompt: str,
     user_message: str,
@@ -171,6 +200,36 @@ def call_kimi_json(
     只抛 KimiNotConfigured / KimiCallFailed。JSON 解析失败【不】抛异常 ——
     退化成 {"_parse_error": ..., "_raw_text": ...} 交给调用方决定是忽略还是
     当软失败,和 v0.31 的契约一致。
+    """
+    raw = _call_kimi_raw(
+        system_prompt,
+        user_message,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        images=images,
+    )
+    return {
+        "data": _extract_json(raw["text"]),
+        "input_tokens": raw["input_tokens"],
+        "output_tokens": raw["output_tokens"],
+        "cost_usd": raw["cost_usd"],
+        "model": raw["model"],
+        "grounding_urls": [],
+    }
+
+
+def _call_kimi_raw(
+    system_prompt: str,
+    user_message: str,
+    *,
+    model: str | None = None,
+    max_output_tokens: int | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+) -> dict[str, Any]:
+    """共享的调用主体 —— 建 client、重试、抽文本、算成本。
+
+    `call_kimi_json` 和 `call_kimi_text` 的唯一区别是拿到 text 之后解不解析,
+    所以那部分留在各自的外壳里,这里只做到"拿到非空文本"为止。
     """
     if not ENABLE_KIMI_ASSIST:
         raise KimiNotConfigured(
@@ -236,15 +295,12 @@ def call_kimi_json(
             "多半是 max_tokens 太小被截断。"
         )
 
-    parsed = _extract_json(text)
-
     return {
-        "data": parsed,
+        "text": text,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": _estimate_cost_usd(input_tokens, output_tokens, model_id),
         "model": model_id,
-        "grounding_urls": [],
     }
 
 

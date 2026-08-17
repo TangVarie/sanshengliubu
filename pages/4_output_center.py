@@ -79,6 +79,34 @@ if _matrix_for_summary:
         "通常不需要看。"
     )
 
+    # 跨批次多样性的诚实交底。参考方法论里这条是明确要求的:不能让运营
+    # 以为这是终极方案,否则跑到第 10 批发现重复率高会以为是 prompt 写坏了。
+    with st.expander("连着跑多批 / 多账号时怎么降重复（必读一次）", expanded=False):
+        st.markdown(
+            """
+每条 prompt 的**开头切入池**带了 15 个编号角度（`C01`-`C15`），批量生成时会自动
+覆盖 ≥8 个不同编号、同编号一批内不超过 2 次，并在每篇开头标出本篇用的编号。
+
+**连着跑多批**：把上一批用过的编号填进 `used_angles` 变量（如 `C03 C07 C11`），
+这一批就会避开它们。不填也能跑，只是不启用回避。
+
+**多账号同时发**：给每个账号填一个不同的 `account_profile`（如
+`偏好 C01/C04/C12，语言偏短句，声调散淡`），批次内 ≥60% 的篇目会向该档案倾斜，
+从根部分岔，避免"5 个账号发出来像一个人写的"。
+
+---
+
+⚠️ **这是补偿方案，不是根治。**
+
+大模型是无状态的——它不知道你昨天用同一条 prompt 生成过什么，也不知道别的账号
+生成过什么。提示词层能做的只有「你手动告诉它上批用了什么，它避开」。
+
+真正的跨批次去重需要工作台做三件事：维护已生产资产库、每次生成自动注入避重池、
+账号间自动分配差异化档案。这三件事没做之前，跑到第 20-30 批仍然会开始撞车——
+届时该推的是工作台改造，不是继续改 prompt。
+            """.strip()
+        )
+
     for _idx, _c in enumerate(_unique_cells, 1):
         _cid = _c.get("cell_id", "?")
         _dname = _c.get("direction_name", "")
@@ -410,6 +438,42 @@ elif consumer_sim and consumer_sim.get("judgments"):
 # rewriter 改不了,需要用户人工介入(回 secretariat 改 direction,或回
 # cell_planner 改 product_role)。红色 callout,直接挂在 vibe 结果下面。
 strategic_warnings = prompt_system.get("strategic_warnings") or []
+
+# 回归哨兵的告警是 run 级的（跟项目历史比），不是 cell 级的策略隐患。
+# 下面那个 expander 按 cell_id + root_cause_explanation 渲染，塞进去会显示成
+# 一行空白。所以先摘出来单独给个显眼位置，剩下的再走原通道。
+_regression_warnings = [
+    w for w in strategic_warnings
+    if w.get("type") == "quality_regression"
+]
+strategic_warnings = [
+    w for w in strategic_warnings
+    if w.get("type") != "quality_regression"
+]
+for _rw in _regression_warnings:
+    st.error(_rw.get("message", "本轮质量分低于历史水平"))
+    _d = _rw.get("detail") or {}
+    _rl, _hs = _d.get("redline") or {}, _d.get("high_score_rate") or {}
+    _c1, _c2 = st.columns(2)
+    _c1.metric(
+        "红线通过率",
+        f"{_rl.get('current', 0):.0%}",
+        delta=f"{(_rl.get('current', 0) - _rl.get('baseline_median', 0)):+.0%} vs 历史中位数",
+        delta_color="inverse",
+    )
+    _c2.metric(
+        "高分篇率",
+        f"{_hs.get('current', 0):.0%}"
+        + ("" if _hs.get("_scored", True) else "（本轮覆盖不全，未参与判定）"),
+        delta=f"{(_hs.get('current', 0) - _hs.get('baseline_median', 0)):+.0%} vs 历史中位数",
+        delta_color="inverse",
+    )
+    st.caption(
+        f"基线取自该项目最近 {_d.get('baseline_runs', '?')} 条**评分覆盖完整**的 run 的中位数。"
+        "覆盖不全的 run 被排除在基线之外 —— 那些 run 的高分篇数是被低估的，"
+        "混进来会把标准拉低、真正的退步反而报不出来。"
+    )
+
 if strategic_warnings:
     with st.expander(
         f"策略层隐患({len(strategic_warnings)} 条)——这些 cell 流水线跑完了但策略层有漏洞",

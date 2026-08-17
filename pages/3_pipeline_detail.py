@@ -853,6 +853,277 @@ elif _run_failed and not _any_failed_log:
         "可以点下方「重跑流水线」重来；若反复发生请查看服务端运行日志。"
     )
 
+# ── 质量评分（双层评分体系）─────────────────────────────────────────────
+# 数据来自 stage_name='quality_score' 那一行，由 pipeline/quality_metrics.py
+# 在出货前算好落库。零 LLM 成本：红线层是纯 Python 判定，高分层读 vibe_critic
+# 已有的 cell_reviews。
+#
+# 两个数字的读法完全不同，UI 上必须分开呈现，否则很容易被当成一个综合分：
+#   · 红线通过率 → 追 100%，任何一条没到都意味着有废稿要复核
+#   · 高分篇数   → 看**绝对数**，跨 run 对比要的是 "4/12 → 8/12" 这种翻倍。
+#     有意不显示百分比：把它当通过率优化会压掉方差，而方差正是爆款的来源。
+_score_log = log_map.get("quality_score")
+_scorecard = (_score_log or {}).get("output_data") or {}
+if _scorecard.get("total_cells"):
+    st.divider()
+    _total = _scorecard["total_cells"]
+    _rl_cells = _scorecard.get("redline_pass_cells", 0)
+    _rl_rate = _scorecard.get("redline_pass_rate", 0.0)
+    _hs = _scorecard.get("high_score_cells", 0)
+    _cov = _scorecard.get("high_score_coverage_cells", 0)
+
+    st.subheader("质量评分")
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.metric(
+        "红线通过",
+        f"{_rl_cells}/{_total}",
+        delta=None if _rl_rate >= 1.0 else f"{_total - _rl_cells} 个格子有硬伤",
+        delta_color="off" if _rl_rate >= 1.0 else "inverse",
+        help="命中即废稿的硬伤：AI 空话黑名单 / 寒暄开场 / 列表体正文 / 跨格子首句撞车。"
+             "目标是 100%，没到就说明有格子不该出货。",
+    )
+    _c2.metric(
+        "高分篇",
+        f"{_hs}/{_total}",
+        help=f"高分层 6 项里拿到 {_scorecard.get('high_score_threshold', '5/6')} 且红线全过。"
+             "跨 run 对比看这个**绝对数**的变化（如 4/12 → 8/12），不看百分比——"
+             "把它当通过率优化会把爆款压成均值。",
+    )
+    _c3.metric(
+        "评分覆盖",
+        f"{_cov}/{_total}",
+        delta=None if _cov >= _total else "高分层数字不可比",
+        delta_color="off" if _cov >= _total else "inverse",
+        help="高分层 6 项全部测到的格子数。vibe_critic 故障或 resume 路径会让它掉下来——"
+             "这时高分篇数是被低估的，不要当成质量下降。",
+    )
+
+    _tally = _scorecard.get("redline_violation_tally") or {}
+    if _tally:
+        _RULE_LABEL = {
+            "ai_cliche": "AI 空话黑名单",
+            "banned_opening": "寒暄式开场",
+            "list_body": "列表体正文",
+            "duplicate_opening": "跨格子首句撞车",
+            "demo_missing": "demo 为空",
+        }
+        st.caption(
+            "红线违规分布：　"
+            + "　·　".join(
+                f"{_RULE_LABEL.get(k, k)} {v}" for k, v in sorted(
+                    _tally.items(), key=lambda kv: -kv[1]
+                )
+            )
+        )
+
+    # 「味道对但踩了硬伤」的格子单独提出来 —— 这类修复性价比最高，
+    # 改掉一条红线就能进高分篇。
+    _blocked = [
+        pc for pc in (_scorecard.get("per_cell") or [])
+        if pc.get("high_score_blocked_by_redline")
+    ]
+    if _blocked:
+        st.info(
+            f"有 {len(_blocked)} 个格子高分层已达标、只差红线："
+            + "、".join(pc.get("cell_id", "?") for pc in _blocked)
+            + "　—— 这几个改掉红线就能进高分篇，是修复性价比最高的。"
+        )
+
+    with st.expander(f"逐格子明细（{_total} 个）", expanded=False):
+        for _pc in (_scorecard.get("per_cell") or []):
+            _mark = "★" if _pc.get("is_high_score") else (
+                "⚠" if _pc.get("high_score_blocked_by_redline") else "·"
+            )
+            _rl = "✓" if _pc.get("redline_pass") else "✗"
+            st.markdown(
+                f"**{_mark} {_pc.get('cell_id', '?')}**　"
+                f"`{_pc.get('platform', '')}`　"
+                f"红线 {_rl}　高分层 {_pc.get('high_score_earned', 0)}"
+                f"/{_pc.get('high_score_scored', 0)}　"
+                f"范式 {_pc.get('paradigm', '?')}"
+            )
+            for _v in (_pc.get("redline_violations") or []):
+                st.caption(f"　　✗ {_v.get('detail', '')}")
+            if _pc.get("craft_missing"):
+                st.caption(f"　　缺工艺要素：{'、'.join(_pc['craft_missing'])}")
+
+# ── 机审闸 prose_gate ───────────────────────────────────────────────────
+# 数据来自 stage_name='prose_gate'。零 LLM 成本的纯正则扫描。
+#
+# ⚠️ 跨篇指纹这一层**跑在终审之后**，所以它影响不了 verdict —— 也就是说
+# fingerprint_hits > 0 时产出照样出货。不在这里显示的话，那个告警就只存在于
+# 服务端日志里，等于没有。这正是本轮改造反复强调的「无声截断会被读成
+# 『这些问题不存在』」，不能自己再犯一次。
+_pg_log = log_map.get("prose_gate")
+_pg = (_pg_log or {}).get("output_data") or {}
+if _pg.get("status") == "ok":
+    st.divider()
+    st.subheader("机审闸（prose_gate）")
+
+    _pg_total = _pg.get("total_cells", 0)
+    _pg_failed = _pg.get("failed_cells") or []
+    _fp = _pg.get("batch_fingerprints") or {}
+    _fp_hits = _fp.get("fingerprint_hits", 0)
+
+    _g1, _g2 = st.columns(2)
+    _g1.metric(
+        "单篇机审通过",
+        f"{_pg_total - len(_pg_failed)}/{_pg_total}",
+        delta=None if not _pg_failed else f"{len(_pg_failed)} 个有硬命中",
+        delta_color="off" if not _pg_failed else "inverse",
+        help="翻案句 / 商业黑话 / 伪精确行为量 / AI 空话 / 寒暄开场 / 列表体。"
+             "纯正则判定，命中即走定点改写。",
+    )
+    _g2.metric(
+        "跨篇指纹命中",
+        f"{_fp_hits}",
+        delta=None if not _fp_hits else "这批有流水线感",
+        delta_color="off" if not _fp_hits else "inverse",
+        help="抓的是**结构重合**（每篇都插同一句、结尾同一句式），"
+             "和跨 cell 查重抓的**词面重合**是两回事。"
+             "⚠️ 这一层跑在终审之后，不影响出货判决——需要人看。",
+    )
+
+    if _fp_hits:
+        st.warning(
+            "**这批内容有批量指纹，交付前请人工过一遍。** 以下是重合的具体位置："
+        )
+        for _label, _key, _fmt in [
+            ("共用修辞模板", "shared_templates",
+             lambda k, v: f"「{k}」出现在 {v['ratio']:.0%} 的格子：{'、'.join(v['cells'][:6])}"),
+            ("共用插入词", "shared_inserts",
+             lambda k, v: f"「{k}」出现在 {v['ratio']:.0%} 的格子：{'、'.join(v['cells'][:6])}"),
+        ]:
+            _items = _fp.get(_key) or {}
+            if _items:
+                st.markdown(f"**{_label}**")
+                for _k, _v in list(_items.items())[:6]:
+                    st.caption(f"　　{_fmt(_k, _v)}")
+        for _label, _key in [("重复开头指纹", "opening_dup"),
+                             ("重复结尾指纹", "ending_dup")]:
+            _items = _fp.get(_key) or {}
+            if _items:
+                st.markdown(f"**{_label}**")
+                for _k, _v in list(_items.items())[:5]:
+                    st.caption(f"　　`{_k}…` ← {'、'.join(_v)}")
+        _grams = _fp.get("hot_4grams") or {}
+        if _grams:
+            st.caption(
+                "跨篇高频四字串（已排除品牌词/蓝词）：　"
+                + "　·　".join(f"「{g}」×{n}" for g, n in list(_grams.items())[:8])
+            )
+
+    _pg_tally = _pg.get("hard_tally") or {}
+    if _pg_tally:
+        _PGL = {"ai_cliche": "AI 空话", "pivot": "翻案句", "jargon": "商业黑话",
+                "pseudo_precise": "伪精确行为量", "banned_opening": "寒暄式开场",
+                "list_body": "列表体正文", "duplicate_opening": "首句撞车",
+                "demo_missing": "内容为空"}
+        st.caption(
+            "单篇硬命中分布：　"
+            + "　·　".join(f"{_PGL.get(k, k)} {v}" for k, v in
+                           sorted(_pg_tally.items(), key=lambda kv: -kv[1]))
+        )
+
+    with st.expander(f"逐格子机审明细（{_pg_total} 个）", expanded=False):
+        for _pc in (_pg.get("per_cell") or []):
+            _mk = "✓" if _pc.get("gate_verdict") == "pass" else "✗"
+            st.markdown(
+                f"**{_mk} {_pc.get('cell_id', '?')}**　`{_pc.get('platform', '')}`"
+            )
+            for _h in (_pc.get("hard_hits") or []):
+                st.caption(f"　　✗ {_h.get('detail', '')}")
+            for _s in (_pc.get("soft_flags") or []):
+                st.caption(f"　　· （软标）{_s.get('detail', '')}")
+
+# ── 批量采样验收 ────────────────────────────────────────────────────────
+# 数据来自 stage_name='batch_sampling'。这是整条流水线唯一一处用 N>1 的样本
+# 验收产出的地方——前面 11 道质量闸看的都是每个 cell 唯一那篇 demo，而交付物
+# 是给批量生成用的 prompt。
+#
+# ⚠️ 当前是【观测，不拦】：这里的数字不影响出货，只用来攒分布。
+_bs_log = log_map.get("batch_sampling")
+_bs = (_bs_log or {}).get("output_data") or {}
+if _bs.get("status") == "ok":
+    st.divider()
+    st.subheader("批量采样验收")
+    st.caption(
+        f"拿最终 system_prompt 真跑了 {_bs.get('cells_sampled', 0)} 个格子 × "
+        f"{_bs.get('n_per_cell', 0)} 篇 = **{_bs.get('total_samples', 0)} 个样本**，"
+        f"只变 `{{{{seed}}}}` 其余变量固定。"
+        f"　成本 ${float((_bs.get('_usage') or {}).get('cost_usd', 0)):.4f}"
+        "　·　**观测模式：以下数字不影响出货判决**"
+    )
+
+    _s1, _s2, _s3 = st.columns(3)
+    _srate = _bs.get("redline_pass_rate", 0.0)
+    _s1.metric(
+        "样本红线通过",
+        f"{_bs.get('redline_clean_samples', 0)}/{_bs.get('total_samples', 0)}",
+        delta=None if _srate >= 1.0 else f"{_srate:.0%}",
+        delta_color="off" if _srate >= 1.0 else "inverse",
+        help="和上面「质量评分」用的是同一套红线规则，但样本空间不同："
+             "那边判的是唯一那篇 demo，这边判的是这个 prompt 真跑出来的一批。",
+    )
+    _uor = _bs.get("worst_cell_unique_opening_ratio")
+    _s2.metric(
+        "最差格子·首句去重率",
+        f"{_uor:.0%}" if _uor is not None else "—",
+        help="取各格子的**最差值**不取均值：一个格子严重趋同就是一个格子的批量废掉了，"
+             "被别的格子的好成绩平均掉就看不见了。",
+    )
+    _sim = _bs.get("worst_cell_max_similarity")
+    _s3.metric(
+        "最差格子·两两相似度",
+        f"{_sim:.2f}" if _sim is not None else "—",
+        help="字符 trigram 的 Jaccard 相似度。首句去重率会被「换词伪装」骗过去"
+             "（每篇开头都不同但其实是同一篇），这个指标抓得住。越低越好。",
+    )
+
+    _bt = _bs.get("redline_violation_tally") or {}
+    if _bt:
+        _RL = {"ai_cliche": "AI 空话黑名单", "banned_opening": "寒暄式开场",
+               "list_body": "列表体正文", "duplicate_opening": "首句重复",
+               "demo_missing": "样本为空"}
+        st.caption(
+            "样本红线违规分布：　"
+            + "　·　".join(f"{_RL.get(k, k)} {v}" for k, v in
+                           sorted(_bt.items(), key=lambda kv: -kv[1]))
+        )
+    if _bs.get("cells_not_sampled"):
+        st.warning(
+            f"有 {len(_bs['cells_not_sampled'])} 个格子未采样（超出单条 run 的采样上限）："
+            + "、".join(_bs["cells_not_sampled"][:8])
+        )
+
+    with st.expander(f"逐格子采样明细（{_bs.get('cells_sampled', 0)} 个）", expanded=False):
+        for _pc in (_bs.get("per_cell") or []):
+            _d = _pc.get("diversity") or {}
+            st.markdown(
+                f"**{_pc.get('cell_id', '?')}**　`{_pc.get('platform', '')}`　"
+                f"范式 {_pc.get('paradigm', '?')}　"
+                f"红线 {_pc.get('redline_clean_samples', 0)}/{_pc.get('n_ok', 0)}　"
+                f"工艺齐全 {_pc.get('craft_complete_samples', 0)}/{_pc.get('n_ok', 0)}　"
+                f"首句去重 {_d.get('unique_opening_ratio', 0):.0%}　"
+                f"相似度 max={_d.get('max_pairwise_similarity')}"
+            )
+            if _d.get("duplicate_openings"):
+                st.caption(f"　　重复首句：{_d['duplicate_openings'][0][:50]}")
+            for _ps in (_pc.get("per_sample") or []):
+                _flag = "✗" if _ps.get("redline_violations") else "·"
+                st.caption(
+                    f"　　{_flag} seed={_ps.get('seed')}　{_ps.get('chars')}字　"
+                    f"{_ps.get('opening', '')}"
+                    + (f"　[{'/'.join(_ps['redline_violations'])}]"
+                       if _ps.get("redline_violations") else "")
+                )
+elif _bs.get("status") in ("failed", "skipped"):
+    st.divider()
+    st.caption(
+        f"批量采样未产出（{_bs.get('status')}）：{_bs.get('reason', '未说明')}"
+        "　—— 采样是 advisory，不影响本次产出。"
+    )
+
 # ── Stage Details ──────────────────────────────────────────────────────────
 
 st.divider()

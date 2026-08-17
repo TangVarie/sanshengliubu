@@ -212,6 +212,56 @@ class SupabaseClient:
         )
         return resp.data
 
+    def get_quality_score_history(
+        self, project_id: str, *, limit: int = 10, exclude_run_id: str | None = None
+    ) -> list[dict]:
+        """取同一项目最近若干条 run 的质量分(stage_name='quality_score')。
+
+        回归哨兵用:拿当前 run 的分数跟历史比,掉出噪声带就报警。
+        单条 run 的分数没有意义 —— 只有跟自己的历史比才知道是涨是跌。
+
+        返回按时间倒序的 output_data 列表(已过滤掉空的)。取不到就返回 []
+        —— 哨兵是可观测性,查询失败不能影响出货。
+
+        为什么不做成一次 join:PostgREST 的嵌套查询在跨表过滤 + 排序时行为
+        不稳定(而且 stage_logs 的 output_data 很大)。分两步查、只取 run id
+        列表再按 in_ 过滤,语义确定、payload 可控。
+        """
+        try:
+            runs = (
+                self.client.table("pipeline_runs")
+                .select("id,created_at")
+                .eq("project_id", project_id)
+                .order("created_at", desc=True)
+                .limit(limit + 5)   # 多取几条,后面要按 exclude 和空分数过滤
+                .execute()
+            ).data or []
+            run_ids = [
+                r["id"] for r in runs
+                if r.get("id") and r["id"] != exclude_run_id
+            ][:limit]
+            if not run_ids:
+                return []
+
+            rows = (
+                self.client.table("stage_logs")
+                .select("run_id,created_at,output_data")
+                .eq("stage_name", "quality_score")
+                .in_("run_id", run_ids)
+                .order("created_at", desc=True)
+                .execute()
+            ).data or []
+            return [
+                r["output_data"] for r in rows
+                if isinstance(r.get("output_data"), dict)
+                and r["output_data"].get("total_cells")
+            ]
+        except Exception:
+            logger.exception(
+                "[quality_history] 查询失败(non-fatal),回归哨兵本轮跳过"
+            )
+            return []
+
     def try_claim_project_running(
         self, project_id: str, allowed_from: list[str] | None = None
     ) -> dict | None:

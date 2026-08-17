@@ -37,7 +37,14 @@
 3. shared_skeleton 必须包含刑部合规规则（硬编码）、户部关键词通用植入规则、兵部竞争策略通用部分
 3. 差异化工具包的每个池至少包含 5 个可选项
 4. persona_integration_strategy 必须覆盖所有在吏部输出中出现的人设类型
-5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language），下游 cell 才有人设可用
+5. **shared_skeleton 必须有 persona_library 子模块**——把吏部产出的全部人设转写成 P01/P02/... 的标准结构（name/age/occupation/city/life_scenario/language_style/personality_tags/product_relationship/brand_awareness_level/temporal_language/**origin_path/pet_phrases/number_memory**）
+
+   ⚠️ 后三个字段(v0.33.6 新增)**必须原样带下来,不许在转写时丢掉**：
+   - `origin_path`（怎么用上这个产品的）是活人感的最高杠杆——人设有了来路才不是一张标签卡
+   - `pet_phrases`（这个人设自己的口头禅）是防批量指纹的：全批共用一套插入词，单篇是人味十篇是流水线
+   - `number_memory`（有理由记得哪些数）管数字的来路，防止满篇伪精确
+   这三项在吏部产出里，你这一步是它们到达工部构建的**唯一通路**——转写时漏掉，
+   下游就再也拿不到，等于吏部白写。
 6. **shared_skeleton 必须有 title_rules 子模块**——全局标题规则（竖线 `|` 禁令、字数范围、蓝词植入原则、口语化要求），各方向 system_prompt 引用此模块，避免每个方向各写一套互相矛盾
 
 ## 修订模式（接收终审驳回反馈时必读）
@@ -56,6 +63,26 @@
    - title_rules 不统一 / 缺失 / 矛盾 → 在 shared_skeleton 里加全局 title_rules 模块
    - 跨方向规则冲突 → 在 shared_skeleton 里加全局裁定规则
    - 差异化工具包不够丰富 → 扩充 narrative_structures / opening_angles / emotion_baselines
+
+### ⚠️ `opening_angles` 必须是 15 条带编号的（跨批次多样性，v0.33.4）
+
+其余四个池「至少 5 个」就够，**只有 `opening_angles` 要求满 15 条且带 C01-C15 编号**。
+
+原因是这四个池管的是**批次内**的差异化，而开头切入角度还要管**跨批次**：
+运营不是跑一次就完了，是每天跑、连着跑几十批。5 种粒度的组合跑 5-10 批就用光，
+第 11 批必然和前面撞；拆到 15 种能撑 20-30 批。
+
+编号（而不是纯文字描述）是为了让「历史回避清单」能落地——运营粘贴
+「上批用过 C03/C07/C11」比粘贴一堆角度描述可操作得多。
+
+推荐直接用这套（可按品类替换具体名称，但**编号和数量不要动**）：
+
+```
+C01 物证发现型 / C02 数字刺激型 / C03 对话切片型 / C04 单方独白型 /
+C05 反常记录型 / C06 信息差揭露型 / C07 反直觉科学型 / C08 行业秘史型 /
+C09 权威身份断言 / C10 诚实退让型 / C11 代际对比型 / C12 个案观察型 /
+C13 群体处境型 / C14 静态定格型 / C15 自我修正型
+```
 4. **写一个 `_revision_response` 字段**到输出里，列出你针对每条 mandatory_revision 做了什么修改：
 
 ```json
@@ -109,13 +136,16 @@
         "personality_tags": ["INFJ", "省钱", "孝顺嘴硬"],
         "product_relationship": "刚开始用 X，被同事种草",
         "brand_awareness_level": "中—认知核心卖点但不会熟练复述",
-        "temporal_language": "三月初/上周二/这两天"
+        "temporal_language": "三月初/上周二/这两天",
+        "origin_path": "同事在工位上摸出来一支，说她姐姐做代购顺的；之前一直用超市开架款，冬天嘴角起皮",
+        "pet_phrases": ["讲道理", "我寻思"],
+        "number_memory": "记得小票上 89 块和这是第二支；用了多久只会说『快用完了』"
       },
       "P02": "...（每个人设都要按上面字段写齐）"
     },
     "differentiation_toolkit": {
       "narrative_structures": ["叙事结构1", "叙事结构2", "...至少5个"],
-      "opening_angles": ["切入视角1", "切入视角2", "...至少5个"],
+      "opening_angles": ["C01 物证发现型", "C02 数字刺激型", "...必须 15 个带编号"],
       "emotion_baselines": ["情绪基调1", "情绪基调2", "...至少5个"],
       "closing_styles": ["结尾方式1", "...至少5个"],
       "information_densities": ["信息密度档1", "...至少5个"]

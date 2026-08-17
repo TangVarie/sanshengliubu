@@ -14,8 +14,10 @@ from itertools import groupby
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    BATCH_SAMPLE_N,
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
+    ENABLE_BATCH_SAMPLING,
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
     DEFAULT_PLATFORM,
@@ -24,6 +26,9 @@ from pipeline.config import (
     ENABLE_STRUCTURAL_REWRITER,
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
+    CONSUMER_SIM_ONLY_WEAK_ALIGN,
+    NARRATIVE_DIRECTOR_MAX_REBUILDS,
+    PERSONA_WEAK_REQUIRES_BOTH_BACKENDS,
     STRATEGIC_LOOP_MAX_ITERATIONS,
     PIPELINE_HEARTBEAT_INTERVAL_SECONDS,
     SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED,
@@ -34,6 +39,8 @@ from pipeline.config import (
     MAX_FINAL_REJECTIONS,
     MATRIX_BATCH_CONCURRENCY,
     MATRIX_CELLS_PER_BATCH,
+    PATH_LIBRARY,
+    PATH_ROTATION_OFFSETS,
     PLATFORM_DEMO_LENGTH_DEFAULT,
     PLATFORM_DEMO_LENGTH_RANGES,
     RED_BLUE_CONCURRENCY,
@@ -61,6 +68,18 @@ from pipeline.retrieve_samples import (
     summarize_packs_by_platform,
 )
 from pipeline.logger_utils import mask_secrets
+from pipeline.batch_sampler import run_batch_sampling
+from pipeline.prose_gate import (
+    format_hard_hits_for_rewriter,
+    run_prose_gate,
+    scan_text as prose_scan_text,
+)
+from pipeline.quality_metrics import (
+    check_and_flag_regression,
+    deterministic_structure_audit,
+    persist_quality_score,
+    score_matrix,
+)
 from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -134,6 +153,115 @@ class PipelineOrchestrator:
         # 这个 agent 调用会报 RuntimeError,_run_persona_simulation 会软降级
         # 只用 Claude 系结果。
         self.persona_simulator_alt = PersonaSimulatorAlt()
+
+        # vibe_loop 跨轮次累积的 cell_reviews(cell_id -> 最后一次评审)。
+        # 质量评分的高分层数据源。刻意不挂在 final_system 上 —— 那个 dict
+        # 会被整体透传给 chancellery_final(kimi-k3),挂上去就是白烧输入。
+        # 详见 _run_vibe_loop 里的累积点注释。
+        self._vibe_cell_reviews: dict[str, dict] = {}
+
+    # ── 取消检查点 (v0.33.8) ──────────────────────────────────────────
+
+    def _check_cancelled(self, where: str) -> None:
+        """在 stage 边界查一次 run 状态,被取消就抛 PipelineCancelled。
+
+        `force_cancel_pipeline` 把 run 标成 failed 来解开 UI 的锁,但它杀不掉
+        本线程(Python 没法安全地 kill 守护线程)。没有这道检查的话,取消之后
+        线程会继续把剩下几十次调用跑完 —— 按钮解锁了,钱还在烧。
+
+        查询失败一律**当作没被取消**继续跑:一次 DB 抖动不该把一条正常的 run
+        判死。宁可漏一次取消,不要误杀。
+        """
+        try:
+            run = self.db.get_pipeline_run(self.run_id) or {}
+        except Exception:
+            logger.debug("[cancel-check] 查询失败,按未取消继续(%s)", where)
+            return
+        status = (run.get("status") or "").strip().lower()
+        # paused_for_review 是请旨等待,是正常态,不算取消。
+        if status and status not in ("running", "paused_for_review"):
+            raise PipelineCancelled(
+                f"run 状态已变为 {status!r}(多半是用户点了强制取消),"
+                f"在 {where} 处停止。已完成的阶段都留着,点「继续执行」可以接着跑。"
+            )
+
+    # ── 精炼链的断点重续 (v0.33.8) ────────────────────────────────────
+    #
+    # 此前 resume 只覆盖了前半条链(太子/中书省/尚书省/六部/工部架构,外加格子
+    # 规划和工部构建的 cell 级恢复)。**工部构建之后的整条精炼链没有任何 resume**:
+    # 叙事导演、红蓝、画像 ×2、结构审、网感循环、消费者模拟、批量采样、终审 ——
+    # 12 格子约 80-100 次调用,在终审挂掉后点「继续执行」会**全部重跑一遍**。
+    #
+    # 保护做在了错误的一半:单次最贵的工部构建有 cell 级恢复,而调用量最大的
+    # 后半条链完全裸奔。体感就是"明明只差最后一步,重续却跑了十几分钟"。
+    #
+    # 两类阶段要分开处理:
+    #   - **不改 prompt_matrix 的**(画像/结构审/消费者模拟/采样)—— 它们只往
+    #     final_system 挂诊断数据,查一下 done 就能跳过,把数据恢复回去即可
+    #   - **改 prompt_matrix 的**(叙事导演/红蓝/网感循环)—— 跳过它们必须同时
+    #     恢复被改写过的矩阵,否则会拿未精炼的正文去出货。这类用矩阵快照
+
+    def _restore_advisory_stage(
+        self, stage: str, final_system: dict, done: dict, field: str
+    ) -> bool:
+        """恢复一个**不改 prompt_matrix** 的 advisory 阶段。返回 True = 已跳过。
+
+        这类阶段只往 final_system 挂一个诊断字段,恢复它就等于恢复了全部效果。
+        """
+        payload = done.get(stage)
+        if not payload:
+            return False
+        final_system[field] = payload
+        logger.info("[resume] 跳过 %s(复用上次结果)", stage)
+        return True
+
+    def _checkpoint_matrix(self, tag: str, final_system: dict) -> None:
+        """给**改过 prompt_matrix** 的阶段打一个矩阵快照。
+
+        存整个 prompt_matrix 而不是 diff:diff 要处理 cell 增删和字段级合并,
+        复杂度和出错面都远大于直接存一份。12 格子约 50KB,一条 run 最多两次快照
+        —— 用 100KB 的写入换掉 80 次 LLM 调用的重跑,这笔账很划算。
+        """
+        try:
+            log = self.db.create_stage_log(
+                self.run_id, f"_matrix_ckpt_{tag}",
+                {"cells": len(final_system.get("prompt_matrix") or [])},
+            )
+            self.db.update_stage_log(
+                log["id"], status="completed",
+                output_data={
+                    "prompt_matrix": final_system.get("prompt_matrix") or [],
+                    # 这两个诊断字段是被快照阶段产出的,一起存,避免恢复后
+                    # UI 上"跑过但看不到结果"。
+                    "_narrative_director_result": final_system.get(
+                        "_narrative_director_result"
+                    ),
+                    "_red_blue_stats": final_system.get("_red_blue_stats"),
+                    "vibe_critic_result": final_system.get("vibe_critic_result"),
+                },
+            )
+            logger.info("[checkpoint] 已存矩阵快照 %s", tag)
+        except Exception:
+            # 快照失败只是丢了重续能力,不该影响这一轮的产出。
+            logger.warning("[checkpoint] 存 %s 快照失败(不影响本轮)", tag)
+
+    def _restore_matrix_checkpoint(
+        self, tag: str, final_system: dict, done: dict
+    ) -> bool:
+        """从快照恢复 prompt_matrix。返回 True = 恢复成功、对应阶段可跳过。"""
+        snap = done.get(f"_matrix_ckpt_{tag}")
+        if not snap or not snap.get("prompt_matrix"):
+            return False
+        final_system["prompt_matrix"] = snap["prompt_matrix"]
+        for _k in ("_narrative_director_result", "_red_blue_stats",
+                   "vibe_critic_result"):
+            if snap.get(_k) is not None:
+                final_system[_k] = snap[_k]
+        logger.info(
+            "[resume] 从快照 %s 恢复 %d 个 cell,跳过对应精炼阶段",
+            tag, len(snap["prompt_matrix"]),
+        )
+        return True
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -408,6 +536,8 @@ class PipelineOrchestrator:
                         structured_brief.setdefault(_k, _brief_dict[_k])
                 self.db.update_project(self.project_id, brief=structured_brief)
 
+            self._check_cancelled("太子之后")
+
             # 1a. User-pasted reference posts (B) — if page 2 recorded
             # any xiaohongshu.com URLs onto project.brief._reference_post_urls,
             # ask Gemini to fetch each via url_context and attach the
@@ -495,6 +625,8 @@ class PipelineOrchestrator:
             else:
                 plan = await self._strategy_loop(structured_brief)
 
+            self._check_cancelled("策略辩论之后")
+
             # 3. 尚书省 — dispatch
             if "dispatcher" in done:
                 logger.info("Resuming: skipping dispatcher (already completed)")
@@ -505,6 +637,8 @@ class PipelineOrchestrator:
 
             # 4. 六部（前五部并行，跳过已完成的）
             ministry_outputs = await self._run_ministries(tasks, structured_brief, plan, done)
+
+            self._check_cancelled("六部之后")
 
             # 5a. 工部·架构 — global skeleton design (Opus, small output)
             if "ministry_works" in done:
@@ -557,6 +691,8 @@ class PipelineOrchestrator:
             # Assemble full works_plan for builder
             works_plan = {**works_arch, "cell_plans": cell_plans}
 
+            self._check_cancelled("格子规划之后")
+
             # 5c. 工部·构建 — generate per-cell prompts (Sonnet, batched)
             final_system = await self._run_works_builders(works_plan, structured_brief)
 
@@ -566,22 +702,39 @@ class PipelineOrchestrator:
                     f"works_plan keys: {list(works_plan.keys())}"
                 )
 
-            # 5c+. 叙事导演（Claude, 跨 cell 一致性+差异化诊断）
-            # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
-            # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
-            await self._run_narrative_director(final_system, works_plan, structured_brief)
+            self._check_cancelled("工部构建之后")
 
-            # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
-            # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
-            # 直接替换回 prompt_matrix，所以后续 vibe/终审看到的是
-            # 已经被精炼过的版本。
-            await self._run_red_blue_refinement(final_system)
+            # ── 精炼层 A:叙事导演 + 红蓝(都会改写 prompt_matrix)──────
+            # 这两个跑完打一次矩阵快照。resume 时优先看有没有更靠后的快照
+            # (refined_b),没有再看这个 —— 恢复了就把这两步整个跳过。
+            if not self._restore_matrix_checkpoint("refined_b", final_system, done) \
+                    and not self._restore_matrix_checkpoint(
+                        "refined_a", final_system, done):
+                # 5c+. 叙事导演（跨 cell 一致性+差异化诊断）
+                # 看完整矩阵后判断：钩子类型有没有重复？人设有没有立住？
+                # 正反面叙事比例对不对？如果有问题，只重跑有问题的 cell。
+                await self._run_narrative_director(
+                    final_system, works_plan, structured_brief
+                )
+
+                # 5c+++. 红蓝对抗精炼 — Red Team 找 AI 腔，Blue Team 做最小修复
+                # 每个 cell 独立跑一次（并行，受 RPM 限速）。精修后的 demo
+                # 直接替换回 prompt_matrix，所以后续 vibe/终审看到的是
+                # 已经被精炼过的版本。
+                await self._run_red_blue_refinement(final_system)
+
+                # 这里是重续价值最高的一个点:上面两步 12 格子约 13-25 次调用,
+                # 而它们之后还有终审等好几个可能失败的环节。
+                self._checkpoint_matrix("refined_a", final_system)
 
             # 5c++++. 画像模拟审稿 — 3 个模拟读者对每个 cell 的 demo
             # 给出 0.5 秒反应（click/skip/save）。结果存到
             # final_system._persona_reactions 让 UI 展示，也作为
             # vibe_critic 的补充输入。
-            await self._run_persona_simulation(final_system, structured_brief)
+            if not self._restore_advisory_stage(
+                "persona_simulator", final_system, done, "_persona_reactions"
+            ):
+                await self._run_persona_simulation(final_system, structured_brief)
 
             # 5c+++++. Gemini 结构审（advisory）— audits each prompt_cell for
             # structural completeness (5 pools / persona / compliance /
@@ -590,10 +743,23 @@ class PipelineOrchestrator:
             # directives so the vibe stage also catches structural gaps,
             # not just taste issues. Advisory-only: any Gemini failure →
             # log warn, proceed with unchanged final_system.
-            await self._run_gemini_structure_review_stage(final_system)
+            if not self._restore_advisory_stage(
+                "ministry_works_structure_review", final_system, done,
+                "_structure_review",
+            ):
+                await self._run_gemini_structure_review_stage(final_system)
 
-            # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
-            final_system = await self._run_vibe_loop(final_system, structured_brief)
+            self._check_cancelled("精炼层之后")
+
+            # ── 精炼层 B:网感循环(会改写 prompt_matrix)────────────────
+            # 有 refined_b 快照就整个跳过 —— 这一步含 critic + rewriter 最多
+            # 3 轮,是精炼链里调用量第二大的。
+            if not self._restore_matrix_checkpoint("refined_b", final_system, done):
+                # 5d. 网感复检循环 — critic checks demo, rewriter fixes failed cells
+                final_system = await self._run_vibe_loop(
+                    final_system, structured_brief
+                )
+                self._checkpoint_matrix("refined_b", final_system)
 
             # 5d+. 策略层自动升级(v0.29.1, C.2.1)— 如果 vibe_loop 留下了
             # strategic_warnings(interest_align / reward_signal 级错配,
@@ -612,9 +778,30 @@ class PipelineOrchestrator:
             # 做 stop / scroll 二元判决,作为 interest_align 的第二层校验。
             # 被目标用户 scroll 的 cell 会追加进 strategic_warnings 让用户审查。
             if ENABLE_CONSUMER_SIMULATION:
-                await self._run_consumer_simulation(
-                    final_system, structured_brief, plan,
-                )
+                # 消费者模拟复用的是 persona_simulator 这个 agent,所以它写的
+                # stage_log 名字和画像模拟**撞车**,没法靠 stage 名判断跑没跑过。
+                # 单独写一条 `_consumer_sim_done` 作为 resume 标记。
+                _cs_prev = done.get("_consumer_sim_done")
+                if _cs_prev:
+                    final_system["_consumer_simulation"] = _cs_prev
+                    logger.info("[resume] 跳过消费者模拟(复用上次结果)")
+                else:
+                    await self._run_consumer_simulation(
+                        final_system, structured_brief, plan,
+                    )
+                    try:
+                        _cslog = self.db.create_stage_log(
+                            self.run_id, "_consumer_sim_done",
+                            {"scope": (final_system.get("_consumer_simulation")
+                                       or {}).get("_scope", "?")},
+                        )
+                        self.db.update_stage_log(
+                            _cslog["id"], status="completed",
+                            output_data=final_system.get("_consumer_simulation")
+                            or {"status": "skipped"},
+                        )
+                    except Exception:
+                        logger.warning("[consumer_sim] resume 标记落库失败")
 
             # 5e. Cross-cell duplicate re-check after vibe. Builder's own
             # check (at end of _run_works_builders) catches builder-produced
@@ -637,6 +824,8 @@ class PipelineOrchestrator:
                     "流水线已终止以防交付重复内容。重跑一次应能抽到不同样本；"
                     "如果反复出现同一对 cell 冲突，考虑调整 vibe_rewriter 提示词里的样本差异化约束。"
                 )
+
+            self._check_cancelled("网感循环之后")
 
             # 6. 门下省终审
             # Track review round for the final-review force-pass mechanism.
@@ -714,6 +903,155 @@ class PipelineOrchestrator:
                 })
             final_system["demo_outputs"] = _rebuilt_demos
 
+            # 6.955 机审闸 · 跨篇指纹(v0.33.5)。零 LLM 成本。
+            #
+            # 这一层抓的是**结构重合**,和已有的跨 cell 查重是两回事:
+            #   - _find_cross_cell_duplicates / trigram Jaccard 抓【词面重合】
+            #     —— 换汤不换药
+            #   - 这里抓【结构重合】—— 每篇开头都时空锚定、每篇都插一句"说真的"、
+            #     每篇结尾落在同一句式。词面重合度可以很低,读者一眼流水线。
+            #     这是【换药不换汤】
+            #
+            # 蓝词和品牌词走白名单:蓝词必须**原样重复**(轮换同义词直接损伤搜索
+            # 权重),它们出现在每一篇里是正确行为,不能被算成批量指纹。
+            try:
+                _allow_terms = set()
+                for _k in ("brand_name", "product_name", "core_keywords",
+                           "blue_keywords"):
+                    _v = (structured_brief or {}).get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        _allow_terms.add(_v.strip())
+                    elif isinstance(_v, list):
+                        _allow_terms.update(
+                            str(x).strip() for x in _v if str(x).strip()
+                        )
+                _prose_report = run_prose_gate(
+                    final_system.get("prompt_matrix") or [],
+                    allow=frozenset(_allow_terms),
+                )
+                final_system["_prose_gate"] = _prose_report
+                _pglog = self.db.create_stage_log(
+                    self.run_id, "prose_gate",
+                    {"total_cells": _prose_report.get("total_cells", 0)},
+                )
+                _fp_hits = (
+                    _prose_report.get("batch_fingerprints", {})
+                    .get("fingerprint_hits", 0)
+                )
+                self.db.update_stage_log(
+                    _pglog["id"],
+                    status=(
+                        "completed_warn"
+                        if (_prose_report.get("failed_cells") or _fp_hits)
+                        else "completed"
+                    ),
+                    output_data=_prose_report,
+                )
+                logger.info(
+                    "[prose_gate] 出货前终扫:单篇 %d/%d 过 · 跨篇指纹命中 %d 项",
+                    _prose_report.get("total_cells", 0)
+                    - len(_prose_report.get("failed_cells") or []),
+                    _prose_report.get("total_cells", 0),
+                    _fp_hits,
+                )
+            except Exception:
+                logger.exception("[prose_gate] 终扫失败(non-fatal),继续出货")
+
+            # 6.96 批量采样验收(v0.33.3)。这是整条流水线唯一一处用 N>1 的样本
+            # 验收产出的地方 —— 前面 11 道质量闸看的都是每个 cell 唯一那篇 demo,
+            # 而交付物是给批量生成用的 prompt。决定"第 7 篇会不会和第 3 篇一个味"
+            # 的 5 池 + 人设轮换机制,在此之前从来没被真正跑过一遍。
+            #
+            # 跑在终审之后是有意的:采样的是**最终出货的那版 system_prompt**。
+            # 【观测,不拦】—— 不阻塞、不触发重写、不影响 verdict。没有历史分布
+            # 就设阈值等于凭猜,先攒数据。详见 batch_sampler 模块 docstring。
+            if ENABLE_BATCH_SAMPLING and done.get("batch_sampling"):
+                # 采样是整条精炼链里调用量最大的一步(12 格子 × 5 篇 = 60 次),
+                # 而它跑在最后、后面还有落库 —— 重续时最不该重跑的就是它。
+                final_system["_batch_sampling"] = done["batch_sampling"]
+                logger.info("[resume] 跳过批量采样(复用上次的 60 次调用结果)")
+            elif ENABLE_BATCH_SAMPLING:
+                try:
+                    _sampling = await run_batch_sampling(
+                        final_system.get("prompt_matrix") or [],
+                        structured_brief or {},
+                        n=BATCH_SAMPLE_N,
+                    )
+                    final_system["_batch_sampling"] = _sampling
+                    _slog = self.db.create_stage_log(
+                        self.run_id,
+                        "batch_sampling",
+                        {"n_per_cell": BATCH_SAMPLE_N},
+                    )
+                    self.db.update_stage_log(
+                        _slog["id"],
+                        status=(
+                            "completed" if _sampling.get("status") == "ok"
+                            else "skipped"
+                        ),
+                        output_data=_sampling,
+                    )
+                    # 采样成本单独上报,和辅助层其它岗位一样不进 run token 熔断,
+                    # 但要让成本回显看得见 —— 悄悄花钱比花钱更糟。
+                    _su = _sampling.get("_usage") or {}
+                    if _su.get("cost_usd") or _su.get("output_tokens"):
+                        accumulate_auxiliary_cost(
+                            self.run_id,
+                            cost_usd=float(_su.get("cost_usd", 0.0)),
+                            input_tokens=int(_su.get("input_tokens", 0)),
+                            output_tokens=int(_su.get("output_tokens", 0)),
+                            source="batch_sampling",
+                        )
+                    if _sampling.get("status") == "ok":
+                        logger.info(
+                            "[batch_sample] %d 个 cell × %d 篇 = %d 样本 · "
+                            "红线 %.0f%% · 最差格子首句去重率 %s · "
+                            "最差格子两两相似度 %s · $%.4f",
+                            _sampling.get("cells_sampled", 0),
+                            _sampling.get("n_per_cell", 0),
+                            _sampling.get("total_samples", 0),
+                            _sampling.get("redline_pass_rate", 0.0) * 100,
+                            _sampling.get("worst_cell_unique_opening_ratio"),
+                            _sampling.get("worst_cell_max_similarity"),
+                            float(_su.get("cost_usd", 0.0)),
+                        )
+                except Exception:
+                    # 采样是 advisory —— 绝不能因为它把一条跑完的 run 判死。
+                    logger.exception("[batch_sample] 失败(non-fatal),继续出货")
+
+            # 6.97 质量评分(双层评分体系)。跑在这里是有意的:此时 prompt_matrix
+            # 已经过全部精炼阶段(红蓝 / 网感重写 / 结构补漏 / 策略升级),
+            # 打的分就是**真正出货的那一版**的分,而不是中间态。
+            #
+            # 零 LLM 成本:红线层是纯 Python 判定,高分层读 vibe_loop 累积的
+            # _vibe_cell_reviews。落库失败不阻塞(见 persist_quality_score)。
+            #
+            # 这是本仓库第一个**输出侧**的质量度量。在此之前只有输入侧遥测
+            # (R-022 飞轮 audit 追"样本有没有被用上"),没有任何东西回答得了
+            # "这一版比上一版好吗"。跨 run 对比的 SQL 见 docs/architecture.md 第 5 节。
+            try:
+                _scorecard = score_matrix(
+                    final_system.get("prompt_matrix") or [],
+                    getattr(self, "_vibe_cell_reviews", None) or {},
+                )
+                final_system["_quality_score"] = _scorecard
+                persist_quality_score(self.db, self.run_id, _scorecard)
+                # 回归哨兵:跟同项目历史比,掉出噪声带就写红字告警。
+                # 单条 run 的分数没有意义,只有跟自己的历史比才知道是涨是跌 ——
+                # 而没人会去手动比对每条 run 的两个数字。
+                _reg = check_and_flag_regression(
+                    self.db, self.project_id, self.run_id,
+                    _scorecard, final_system,
+                )
+                if _reg:
+                    _scorecard["_regression"] = _reg
+            except Exception:
+                # 评分器本身抛异常也不能把一条跑完的 run 判死 —— 它是可观测性,
+                # 不是硬不变量。和 _persist_audit_findings 同一个原则。
+                logger.exception(
+                    "[quality_score] 评分计算失败(non-fatal),继续出货"
+                )
+
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
 
@@ -745,6 +1083,22 @@ class PipelineOrchestrator:
             )
             self.db.update_project(self.project_id, status=final_status)
 
+        except PipelineCancelled as e:
+            # 用户主动取消 —— 不是故障,不写 traceback marker,也不覆盖状态
+            # (force_cancel 已经把 run 标成 failed 了)。写一条干净的说明,
+            # 让详情页显示"这是你自己取消的"而不是一堆吓人的堆栈。
+            logger.info("[cancel] %s", e)
+            try:
+                _clog = self.db.create_stage_log(
+                    self.run_id, "_cancelled",
+                    {"cancelled_at": datetime.now(timezone.utc).isoformat()},
+                )
+                self.db.update_stage_log(
+                    _clog["id"], status="failed", error_message=str(e),
+                )
+            except Exception:
+                logger.warning("[cancel] 取消标记落库失败(不影响结果)")
+            raise
         except Exception as e:
             logger.exception("Pipeline failed")
             # Persist the failure where the UI can actually show it. run()'s
@@ -865,27 +1219,68 @@ class PipelineOrchestrator:
                     "round_number": (turn // 2) + 1,
                 }
 
-                # Force pass on last chancellery turn
-                if turn >= max_turns - 1:
+                # v0.33.6: 最后一轮**照常调用门下省**,只把 verdict 覆写成
+                # approved,而不是凭空合成一个批准。
+                #
+                # 原来的写法是"到最后一轮直接编一个 approved 出来,不调模型"。
+                # 配合 MAX_DEBATE_TURNS=4 后果很严重:turn 0 提案 → turn 1 审议
+                # (唯一一次真审) → turn 2 中书省按意见修订 → turn 3 命中
+                # `turn >= max_turns - 1` 直接橡皮图章。也就是**修订后的方案
+                # 从来没有被审过**,而修订恰恰是最需要复核的那一版。
+                #
+                # 现在:最后一轮仍然真跑一次审议,拿到 challenges 后再强制放行并
+                # 把风险写进 overall_assessment。多花一次 deepseek-v4-flash 调用
+                # (最便宜的一档),换回"交付的方案一定被对抗性看过至少一遍"。
+                _is_last_chancellery_turn = turn >= max_turns - 1
+                agent = self.chancellery
+                orig_stage = agent.stage_name
+                agent.stage_name = stage_name
+                try:
+                    response = await agent.run(input_data, self.run_id, self.db)
+                except Exception as _dbt_err:
+                    # 最后一轮审议挂了不能把整条 run 拖死 —— 退回旧的合成批准,
+                    # 但把失败原因写进 assessment,不假装审过。
+                    if not _is_last_chancellery_turn:
+                        raise
+                    logger.warning(
+                        "[strategy_debate] 末轮审议调用失败,退回合成批准: %r",
+                        _dbt_err,
+                    )
                     response = {
                         "verdict": "approved",
                         "challenges": [],
-                        "overall_assessment": "⚠️ 辩论达到最大轮次，强制通过",
+                        "overall_assessment": (
+                            f"⚠️ 末轮审议调用失败({type(_dbt_err).__name__}),"
+                            "本方案**未经最终对抗性复核**即放行,交付前请人工过一遍"
+                        ),
                     }
-                    log = self.db.create_stage_log(
-                        self.run_id, stage_name, input_data
+                finally:
+                    agent.stage_name = orig_stage
+
+                if _is_last_chancellery_turn and (
+                    (response.get("verdict") or "").strip().lower() != "approved"
+                ):
+                    _held = response.get("challenges") or []
+                    logger.warning(
+                        "[strategy_debate] 末轮门下省仍有 %d 条质疑,"
+                        "但已达轮次上限 —— 强制放行并把质疑写进 assessment",
+                        len(_held),
                     )
-                    self.db.update_stage_log(
-                        log["id"], status="completed", output_data=response
-                    )
-                else:
-                    agent = self.chancellery
-                    orig_stage = agent.stage_name
-                    agent.stage_name = stage_name
-                    try:
-                        response = await agent.run(input_data, self.run_id, self.db)
-                    finally:
-                        agent.stage_name = orig_stage
+                    response = {
+                        **response,
+                        "verdict": "approved",
+                        "_forced_pass": True,
+                        "overall_assessment": (
+                            f"⚠️ 辩论达最大轮次({max_turns})强制通过。"
+                            f"门下省末轮仍提出 {len(_held)} 条未解决的质疑,"
+                            f"已保留在 challenges 字段,交付前请人工复核:"
+                            + "；".join(
+                                str(c.get("point") or c)[:60] for c in _held[:3]
+                            )
+                            + (f"（原评语）{response.get('overall_assessment', '')}"
+                               if response.get("overall_assessment") else "")
+                        ),
+                    }
 
                 debate_history.append({
                     "role": "chancellery",
@@ -899,6 +1294,24 @@ class PipelineOrchestrator:
                     f"verdict={verdict}, "
                     f"challenges={len(response.get('challenges', []))}"
                 )
+
+                # v0.33.8: 无质疑即收敛。门下省这一轮一条 challenge 都没提,
+                # 说明对抗已经跑到头了 —— 再走一个「中书省修订 → 门下省再审」
+                # 的完整往返,中书省要重吐一次完整大 plan(跑 k3 的 $15/1M 输出
+                # 档,这条链上最贵的部分),换回来的多半是同一份方案。
+                #
+                # 只在**非末轮**做这个判断:末轮本来就要放行,不需要提前。
+                _challenges = response.get("challenges") or []
+                if (
+                    verdict != "approved"
+                    and not _challenges
+                    and not _is_last_chancellery_turn
+                ):
+                    logger.info(
+                        "[strategy_debate] turn %d 门下省未提出任何质疑,"
+                        "提前收敛(省下一个完整往返)", turn,
+                    )
+                    verdict = "approved"
 
                 if verdict == "approved":
                     logger.info(
@@ -1174,6 +1587,20 @@ class PipelineOrchestrator:
         shared_skeleton = works_arch.get("shared_skeleton", {})
         semaphore = asyncio.Semaphore(CELL_PLANNER_CONCURRENCY)
 
+        # ── 8 条突破路径的跨批次预分配(原 M2 遗留项)────────────────────
+        # cell_planner 分批并行跑,批次之间看不到对方选了什么路径 —— 而路径
+        # 组合正是"几个方向的打法不重样"的核心机制,撞车既必然又不可见。
+        # 这里在分批**之前**按 direction_id 确定性分配好,塞进每个批次的输入。
+        # 零 LLM 成本,跨批次一致性由代码保证而不是靠模型自觉。
+        # 按 direction 而非按 cell 分配的理由见 config.PATH_LIBRARY 的注释。
+        _path_allocation = _allocate_paths_by_direction(active_cells)
+        if _path_allocation:
+            logger.info(
+                "[cell_planner] 路径预分配(%d 个方向): %s",
+                len(_path_allocation),
+                {k: "/".join(v) for k, v in list(_path_allocation.items())[:8]},
+            )
+
         # Cell-level resume: scan this run's stage_logs for any cell_plans that
         # already completed successfully, so a resume doesn't re-run batches
         # that already burned tokens producing good output.
@@ -1231,6 +1658,9 @@ class PipelineOrchestrator:
                         "tactical_directions": plan.get("tactical_directions", []),
                         "target_platforms": plan.get("target_platforms", []),
                     },
+                    # 单 cell 重试也要带全量分配 —— 否则这个 cell 会在没有任何
+                    # 跨方向视野的情况下重挑路径,重试出来的格子反而最容易撞车。
+                    "_path_allocation": _path_allocation,
                     "_batch_info": {
                         "label": f"单cell修复 {cid}",
                         "round": "cell-retry",
@@ -1293,6 +1723,11 @@ class PipelineOrchestrator:
                             "tactical_directions": plan.get("tactical_directions", []),
                             "target_platforms": plan.get("target_platforms", []),
                         },
+                        # 跨批次路径预分配。传【全量】(所有方向,不只本批次的)
+                        # 是有意的:让本批次能看到别的批次分到了什么,自己就不会
+                        # 无意中往同一组路径上收敛。多传几十字节换掉一个必然的
+                        # 撞车,是划算的。
+                        "_path_allocation": _path_allocation,
                         "_batch_info": {
                             "label": f"批次 {batch_idx + 1} · {round_label}",
                             "round": round_label,
@@ -1899,6 +2334,69 @@ class PipelineOrchestrator:
         )
         final_system["_narrative_director_result"] = review
 
+        # v0.33.2: 重建设上限。诊断很便宜(2101 字符提示词、只看 demo 前 500 字),
+        # 贵的全在重建 —— 每个 flagged cell 都要重跑一次 works_builder,
+        # 而那是全流水线 token 消耗第一的 stage。诊断出 8 个问题就等于把
+        # 最贵的 stage 又跑 8 次。
+        #
+        # 它管的"钩子重复/跨 cell 撞车"另有两处覆盖:`_find_cross_cell_duplicates`
+        # (确定性、零成本、跑两遍)和 vibe_critic 第 3 步的跨 cell 一致性检查。
+        # 三重覆盖里只有这一路会触发最贵的重建,所以这里限流。
+        #
+        # 按 severity 排序后取前 N 个:模型没给 severity 时按原顺序(它通常
+        # 已经把最严重的排在前面)。被截掉的写进 review 让终审和 UI 看得见,
+        # 不静默丢弃 —— 无声截断会被读成"这些问题不存在"。
+        _cap = NARRATIVE_DIRECTOR_MAX_REBUILDS
+        _deferred: list[dict] = []
+        if _cap is not None and len(cells_to_revise) > _cap:
+            # ⚠️ 字段名是 `priority` 不是 `severity` —— narrative_director.md
+            # 的输出契约里写的是 priority(high/medium)。读错字段会让所有条目
+            # 落到同一个兜底档,排序变成 no-op,cap 就成了"按模型返回顺序砍",
+            # 后面的 high 可能被前面的 medium 挤掉。两个名字都认,priority 优先。
+            _sev_rank = {"high": 0, "critical": 0, "medium": 1, "low": 2}
+            _sorted = sorted(
+                cells_to_revise,
+                key=lambda r: _sev_rank.get(
+                    ((r.get("priority") or r.get("severity") or "")
+                     .strip().lower()),
+                    1,
+                ),
+            )
+            _deferred = _sorted[_cap:]
+            cells_to_revise = _sorted[:_cap]
+            logger.warning(
+                "[narrative_director] 诊断出 %d 个待修 cell,按上限只重建前 %d 个"
+                "(重建=重跑 works_builder,最贵的 stage);其余 %d 个转 "
+                "strategic_warnings 交人工: %s",
+                len(_deferred) + _cap, _cap, len(_deferred),
+                [c.get("cell_id") for c in _deferred],
+            )
+            # ⚠️ 必须同步裁剪 review 自己的 cells_to_revise。终审的
+            # narrative_director_summary.cells_rebuilt 是从这个列表推出来的
+            # (见 agents/chancellery.py::run_final_review),不裁剪的话被推迟的
+            # cell 会以"已重建"的身份呈给终审 —— 而 chancellery.md 明写
+            # 「cells_rebuilt 非空 → 优先抽查它们的 demo 看问题是否真解决」,
+            # 于是终审会去抽查一个根本没重建过的 cell,那道检查就废了。
+            review["cells_to_revise"] = list(cells_to_revise)
+            review["_deferred_rebuilds"] = [
+                {
+                    "cell_id": c.get("cell_id"),
+                    "issue": c.get("issue", ""),
+                    "fix_instruction": c.get("fix_instruction", ""),
+                }
+                for c in _deferred
+            ]
+            for c in _deferred:
+                final_system.setdefault("strategic_warnings", []).append({
+                    "cell_id": c.get("cell_id"),
+                    "type": "narrative_rebuild_deferred",
+                    "root_cause_explanation": (
+                        "叙事导演诊断出跨 cell 问题,但本轮重建已达上限 "
+                        f"({_cap} 个) 未修复 —— {c.get('issue', '')}"
+                    ),
+                    "source": "narrative_director",
+                })
+
         # Selective rebuild: for each flagged cell, inject the director's
         # fix_instruction into the builder's input as a _narrative_directive
         # and re-run just that cell. Reuse the existing single-cell builder
@@ -2348,12 +2846,43 @@ class PipelineOrchestrator:
                         f"{_pid}: {(_r.get('reaction') or '')[:60]}"
                     )
 
-            _weak_set: set[str] = set()
+            # 每个 backend 独立投票:该 backend 至少给了 3 个画像判决且全 skip
+            # → 这个 backend 一致否决。
+            _vetoed_by: dict[str, set[str]] = {}
+            _backends_seen: set[str] = set()
             for (_cid, _src), _acts in _actions_by_cell_src.items():
-                # 该 backend 至少给了 3 个画像判决且全 skip → 这个 backend 一致否决
+                _backends_seen.add(_src)
                 if len(_acts) >= 3 and all(_a == "skip" for _a in _acts):
-                    _weak_set.add(_cid)
-            _weak_cell_ids = sorted(_weak_set)
+                    _vetoed_by.setdefault(_cid, set()).add(_src)
+
+            # v0.33.2: 判据从【任一 backend 否决】改成【所有跑通的 backend 都否决】。
+            #
+            # 改的是**成本不对称**不是准确率。并集规则下多一个 backend 主要是提高
+            # 误报率,而误报的代价极不对称:弱 cell → strategic_warnings →
+            # 触发 strategic_escalation → 回中书省(kimi-k3)改方向 → 再跑一整轮
+            # vibe_loop。一次几分钱的 DeepSeek 调用能触发全流水线最贵的重入。
+            #
+            # 交集要求两个不同厂家、不同 distribution 的画像都一致否决 —— 这才是
+            # 当初做双 backend 的本意:跨厂家一致=强信号,单边否决=噪声。
+            # 只有一个 backend 跑通时(另一个没配 key / 挂了)交集自动退化成
+            # 它自己,不会因为少一票就永远判不出弱 cell。
+            if PERSONA_WEAK_REQUIRES_BOTH_BACKENDS and len(_backends_seen) > 1:
+                _weak_cell_ids = sorted(
+                    cid for cid, srcs in _vetoed_by.items()
+                    if srcs >= _backends_seen
+                )
+                _single_sided = sorted(
+                    cid for cid, srcs in _vetoed_by.items()
+                    if not (srcs >= _backends_seen)
+                )
+                if _single_sided:
+                    logger.info(
+                        "[persona_sim] %d 个 cell 只被单边 backend 否决,按交集"
+                        "规则不判弱(避免廉价误报触发 strategic_escalation): %s",
+                        len(_single_sided), _single_sided,
+                    )
+            else:
+                _weak_cell_ids = sorted(_vetoed_by.keys())
 
             if _weak_cell_ids:
                 _matrix = final_system.get("prompt_matrix") or []
@@ -2895,6 +3424,24 @@ class PipelineOrchestrator:
         )
         log_id = log["id"]
 
+        # ── 确定性前置审(零 LLM 成本)────────────────────────────────────
+        # 结构审原本查 6 类结构件,其中 5 类(五池 / 人设 / 合规存在性 /
+        # 关键词存在性 / 禁用清单存在性)`_validate_prompt_cell` 在构建阶段
+        # 就已经用别名表确定性地查过了 —— 花一次 LLM 调用重查是纯重复。
+        #
+        # 平台调性张冠李戴这一类原本也交给模型,但它同样是确定性的
+        # (平台调性词表是固定的),所以下沉到 Python。剩给模型的只有
+        # 「具体 vs 空话」这一类真需要判断的(见 kimi_structure_reviewer.md)。
+        #
+        # 先跑确定性的,结果和模型的 hint 合并 —— 两边写的是同一个
+        # `_structure_hint` 形状,下游 vibe_loop 的强制补漏逻辑不用动。
+        _det_hints = deterministic_structure_audit(prompt_cells)
+        if _det_hints:
+            logger.info(
+                "[structure review] 确定性前置审命中 %d 个 cell(零成本): %s",
+                len(_det_hints), sorted(_det_hints.keys()),
+            )
+
         try:
             result = await run_kimi_structure_review(prompt_cells)
         except Exception as e:
@@ -2903,10 +3450,16 @@ class PipelineOrchestrator:
             logger.warning(
                 "[structure review] unexpected exception, skipping: %r", e
             )
+            # 模型挂了不影响确定性那半边 —— 照样把 hint 挂上去,让重写器修。
+            # 这正是下沉的价值之一:结构审的一部分不再依赖模型可用性。
+            _apply_structure_hints(prompt_cells, _det_hints)
             self.db.update_stage_log(
                 log_id,
                 status="skipped",
-                output_data={"_skip_reason": f"unexpected_exception: {e}"},
+                output_data={
+                    "_skip_reason": f"unexpected_exception: {e}",
+                    "deterministic_hints": _det_hints,
+                },
             )
             return
 
@@ -2933,14 +3486,19 @@ class PipelineOrchestrator:
             for item in incomplete
             if isinstance(item, dict) and item.get("cell_id")
         }
-        for cell in prompt_cells:
-            cid = cell.get("cell_id")
-            if cid in incomplete_by_id:
-                item = incomplete_by_id[cid]
-                cell["_structure_hint"] = {
-                    "missing_items": item.get("missing_items", []),
-                    "revision_hint": item.get("revision_hint", ""),
-                }
+        _model_hints = {
+            cid: {
+                "missing_items": item.get("missing_items", []),
+                "revision_hint": item.get("revision_hint", ""),
+                "_source": "model",
+            }
+            for cid, item in incomplete_by_id.items()
+        }
+        # 合并确定性 hint 和模型 hint —— 同一个 cell 两边都命中时取并集,
+        # 不是二选一:平台调性写串(确定性抓到)和合规写成空话(模型抓到)
+        # 是两个独立问题,rewriter 一次都要修。
+        _merged_hints = _merge_structure_hints(_det_hints, _model_hints)
+        _apply_structure_hints(prompt_cells, _merged_hints)
 
         # Stash the full review on final_system so chancellery_final
         # can see the structural context and terminal UI can display.
@@ -2974,6 +3532,9 @@ class PipelineOrchestrator:
                 "summary": result.get("summary", ""),
                 "cells_incomplete": incomplete,
                 "cell_reviews": result.get("cell_reviews", []),
+                # 确定性那半边单独记一份,便于在 UI / SQL 里区分
+                # "模型抓到的" 和 "Python 抓到的"。
+                "deterministic_hints": _det_hints,
             },
             model_used=usage.get("model"),
             tokens_used=int(usage.get("input_tokens", 0))
@@ -3204,6 +3765,24 @@ class PipelineOrchestrator:
                 })
                 break
 
+            # 跨轮次累积 cell_reviews。round 2+ 只复检被改写过的 cell(见上面
+            # cells_to_critique 的分支),所以最后一轮的 critic_result 里只有
+            # 那几个 cell —— round 1 就通过、之后再没被评过的 cell 完全不在
+            # 里面。质量评分要的是**每个 cell 最后一次评审**的全集,这里按
+            # cell_id 覆盖累积:后一轮的评审自然盖掉前一轮的。
+            # 纯读已有输出,零额外 LLM 成本。
+            #
+            # ⚠️ 存在 self 上而不是 final_system 上,这是有意的:
+            # chancellery_final 的输入是 `{"prompt_system": final_system}`
+            # 整体透传(见 agents/chancellery.py::run_final_review),挂到
+            # final_system 等于给全流水线最贵的那个 stage(kimi-k3 $3/$15)
+            # 白加十几 KB 输入换零收益。评分在终审之后才跑,存 self 完全够用。
+            # 策略升级会二次调用 _run_vibe_loop,共用同一个 self,累积正确。
+            for _rv in (critic_result.get("cell_reviews") or []):
+                _rv_cid = _rv.get("cell_id")
+                if _rv_cid:
+                    self._vibe_cell_reviews[_rv_cid] = _rv
+
             failed = critic_result.get("failed_cells", []) or []
             # Fail-CLOSED cross-check. vibe_critic.md 的契约:failed_cells 必须
             # 包含每个 severity != pass 的 cell,且任一 cell 失败时 verdict 必为
@@ -3323,6 +3902,51 @@ class PipelineOrchestrator:
                 # Even if Gemini didn't add new fails, stash its raw
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
+
+            # ── 机审闸(v0.33.5)───────────────────────────────────────
+            # 纯 Python 扫本轮 cell 的机械指纹(翻案句 / 商业黑话 / 伪精确行为量 /
+            # AI 空话 / 寒暄开场 / 列表体)。命中的强制加进 failed 列表走定点改写。
+            #
+            # 放在 critic **之后**是有意的:critic 是批处理(整批一次调用),
+            # 先跑机审并不能少掉那次调用,反而要多一轮编排。放这里则是纯加法 ——
+            # 借 critic 已经产出的 failed 列表做合并,机械命中的 cell 顺路进
+            # rewriter,不额外发起任何调用。
+            #
+            # 真正的省是在**下一轮**:round 2+ 只复检被改写过的 cell,机审在那时
+            # 免费复扫一遍,能抓到 rewriter「把 A 指纹改成 B 指纹」的情况 ——
+            # 那是机扫过了、读者没过的最隐蔽劣化路径。
+            _pg_forced: set[str] = set()
+            for _c in cells_to_critique:
+                _cid_pg = _c.get("cell_id")
+                if not _cid_pg or _cid_pg in {
+                    f.get("cell_id") for f in failed if f.get("cell_id")
+                }:
+                    continue
+                _pg = prose_scan_text(_c.get("demo_output") or "")
+                _c["_prose_soft_flags"] = _pg["soft"]
+                if not _pg["hard"]:
+                    continue
+                failed.append({
+                    "cell_id": _cid_pg,
+                    "platform": _c.get("platform", ""),
+                    "severity": "fail",
+                    # 机械命中属于 surface 的机械子类 —— 明确走 vibe_rewriter
+                    # 而不是 structural_rewriter:这不是叙事身份或缺口方向的
+                    # 问题,是句子层面的定点修。
+                    "root_cause_kind": "surface",
+                    "root_cause_explanation": "prose_gate 机审硬命中",
+                    "rewrite_directives": format_hard_hits_for_rewriter(
+                        {"hard_hits": _pg["hard"]}
+                    ),
+                    "_flagged_by": "prose_gate",
+                })
+                _pg_forced.add(_cid_pg)
+            if _pg_forced:
+                logger.info(
+                    "[prose_gate] 机审硬命中 %d 个 critic 判过的 cell,"
+                    "强制进重写(零 LLM 成本): %s",
+                    len(_pg_forced), sorted(_pg_forced),
+                )
 
             # v0.30.6 fix M1: Gemini 结构审标了 _structure_hint(missing_items
             # 非空)但 critic 让该 cell 过了 → 之前 hint 永远到不了 rewriter,
@@ -3677,6 +4301,29 @@ class PipelineOrchestrator:
             f"Vibe loop exhausted {max_iterations} iterations "
             f"(hard cap {hard_cap}), proceeding with remaining issues"
         )
+
+        # ⚠️ 走到这里 = 撞上轮次上限退出,而**上一步刚做完重写**。
+        # 被重写过的 cell 正文已经换了,但 _vibe_cell_reviews 里存的还是改写
+        # **之前**那版的判词 —— 拿旧的 multiplier_gate / template_test 去配新的
+        # demo,评分器算出来的两个来源不同代:实验里会把改进读成退步、把退步读成
+        # 改进。这正是 P1 建评分体系时要避免的那类失真,不修就等于评分器自己
+        # 在制造噪声。
+        #
+        # 处理是**作废**而不是补评:删掉这些条目后 check_high_score 对应维度
+        # 返回 None(=没测),这些 cell 不进高分篇计数,同时
+        # high_score_coverage_cells 会掉下来 —— UI 上已经有「覆盖不满 →
+        # 高分层数字不可比」的提示,读数的人能看见。
+        # 补评要多花一次 critic 调用,而这一轮的结论本来就是"没收敛",
+        # 花钱买一个已知不合格样本的精确分数不划算。
+        _stale = rewritten_ids & set(self._vibe_cell_reviews.keys())
+        if _stale:
+            for _sid in _stale:
+                self._vibe_cell_reviews.pop(_sid, None)
+            logger.warning(
+                "[vibe_loop] 达轮次上限后仍有 %d 个 cell 是刚改写未复检的,"
+                "作废其陈旧评审以免评分口径串代: %s",
+                len(_stale), sorted(_stale),
+            )
         return final_system
 
     async def _run_strategic_escalation(
@@ -3920,8 +4567,66 @@ class PipelineOrchestrator:
         # v0.30.6 fix M4: 每个 cell 带自己的 platform,避免多平台 brief
         # 里 douyin cell 被用 xhs 标准评判。
         fallback_audience = structured_brief.get("target_audience", "") or ""
+
+        # v0.33.2: 只对 critic 判 interest_align=weak 的 cell 做第二层校验。
+        #
+        # 到这一步同一批 demo 已经被画像类 agent 判过两遍(主 + alt 双 backend),
+        # 而本函数调的**就是同一个 persona_simulator**,只是换了 mode 和判据 ——
+        # 同一个 agent 对同一批内容判第三遍。
+        #
+        # 而它的定位是"interest_align 的第二层校验",可 vibe_critic 的四乘数
+        # 硬门槛已经逐 cell 判过 interest_align 了:判 pass 的再判一遍多半同答案,
+        # 判 fail 的早就进了 rewriter 或 strategic_warnings。真正值得花第二票的
+        # 只有 **weak** 那一档 —— critic 自己都拿不准的。
+        #
+        # 数据来自 vibe_loop 累积的 _vibe_cell_reviews(零额外成本)。拿不到时
+        # 退回全量 —— critic 挂了的情况下恰恰最需要这层校验。
+        _target_cells = prompt_cells
+        _reviews = getattr(self, "_vibe_cell_reviews", None) or {}
+        # ⚠️ 只有 critic **评全了**才敢按 weak 过滤。截断/畸形的 critic 响应
+        # 可能只返回一个 cell 的评审,如果那个恰好是 pass,_weak_ids 就是空集,
+        # 于是整个矩阵被跳过、还对外宣称"没有 weak 档" —— 这是 fail-open。
+        # 覆盖不全时退回全量:那种情况下恰恰最需要第二层校验。
+        _all_ids = {c.get("cell_id") for c in prompt_cells if c.get("cell_id")}
+        _covered = _all_ids & set(_reviews.keys())
+        _full_coverage = bool(_all_ids) and _covered == _all_ids
+        if not _full_coverage and _reviews:
+            logger.warning(
+                "[consumer_sim] critic 只评了 %d/%d 个 cell,覆盖不全 —— "
+                "退回全量复判(不按 weak 过滤)",
+                len(_covered), len(_all_ids),
+            )
+        if CONSUMER_SIM_ONLY_WEAK_ALIGN and _full_coverage:
+            _weak_ids = {
+                cid for cid, rv in _reviews.items()
+                if ((rv.get("multiplier_gate") or {}).get("interest_align") or "")
+                .strip().lower() == "weak"
+            }
+            if not _weak_ids:
+                logger.info(
+                    "[consumer_sim] critic 对全部 %d 个 cell 的 interest_align "
+                    "都不是 weak,跳过第二层校验(省一次调用)",
+                    len(prompt_cells),
+                )
+                final_system["_consumer_simulation"] = {
+                    "status": "skipped",
+                    "reason": (
+                        "vibe_critic 的 interest_align 判决里没有 weak 档 —— "
+                        "pass 的不需要复判,fail 的已走重写/告警通道。"
+                    ),
+                    "_scope": "weak_only",
+                }
+                return
+            _target_cells = [
+                c for c in prompt_cells if c.get("cell_id") in _weak_ids
+            ]
+            logger.info(
+                "[consumer_sim] 只复判 interest_align=weak 的 %d/%d 个 cell: %s",
+                len(_target_cells), len(prompt_cells), sorted(_weak_ids),
+            )
+
         slim_cells = []
-        for c in prompt_cells:
+        for c in _target_cells:
             did = c.get("direction_id")
             d = direction_index.get(did) or {}
             stop_trigger = (d.get("stop_trigger") or "").strip()
@@ -3963,7 +4668,16 @@ class PipelineOrchestrator:
             }
             return
 
-        final_system["_consumer_simulation"] = {"status": "ok", **(result or {})}
+        # `_scope` 记录这一轮到底复判了哪些 cell —— 不写的话 UI 上"全部通过"
+        # 会被读成"整个矩阵都过了",而实际只判了 weak 那一档。
+        final_system["_consumer_simulation"] = {
+            "status": "ok",
+            "_scope": (
+                "weak_only" if len(_target_cells) < len(prompt_cells) else "all"
+            ),
+            "_cells_checked": [c.get("cell_id") for c in _target_cells],
+            **(result or {}),
+        }
 
         # Cells where the modeled consumer would scroll = interest_align
         # second-layer fail. Append to strategic_warnings so UI surfaces them.
@@ -3993,8 +4707,9 @@ class PipelineOrchestrator:
                 })
         else:
             logger.info(
-                "[consumer_sim] all %d cells passed 2nd-level consumer check",
-                len(prompt_cells),
+                "[consumer_sim] 复判的 %d 个 cell 全部通过第二层校验"
+                "(矩阵共 %d 个)",
+                len(_target_cells), len(prompt_cells),
             )
 
 
@@ -4006,6 +4721,21 @@ class TrendScoutRequiredError(RuntimeError):
     fail-fast: at that point only the 太子 stage has been paid for, whereas
     silently proceeding without calibration data skews the whole strategy
     and forces a full rerun.
+    """
+
+
+class PipelineCancelled(RuntimeError):
+    """用户在流水线中途点了「强制取消」。
+
+    v0.33.8 新增。此前 `force_cancel_pipeline` 只翻数据库状态来解开 UI 的锁 ——
+    它的 docstring 自己写明了 Python 杀不掉挂起的守护线程。后果是:点了取消之后
+    **按钮解锁了、钱还在烧**,僵尸线程会一直跑到自己结束或 TCP 超时。
+
+    现在流水线在每个 stage 边界查一次 run 状态,不再是 running 就抛这个异常,
+    让线程自己走正常的退出路径。代价是每条 run 多约 20 次极轻量的 DB 读。
+
+    注意这只能在**两次调用之间**生效 —— 已经发出去的那一次 HTTP 请求仍然要等它
+    自己返回。真正卡在网络层的调用还是得靠超时兜底,那不是这一层能解决的。
     """
 
 
@@ -4451,6 +5181,88 @@ def _persist_audit_findings(
         )
 
 
+def _allocate_paths_by_direction(active_cells: list[dict]) -> dict[str, list[str]]:
+    """按 direction_id 确定性分配「8 条突破路径」,返回 {direction_id: [路径,...]}。
+
+    为什么需要:cell_planner 分批并行执行(CELL_PLANNER_BATCH_SIZE=5 /
+    CONCURRENCY=5),每个批次独立给自己那几个 cell 挑路径,**批次之间互不知情**。
+    12 个格子分 3 批同时跑时路径撞车是必然的,而且没有任何地方能看出来 ——
+    偏偏路径组合就是"这几个方向的打法不重样"的核心机制。
+    (config.py v0.30.6 注记里的 M2 遗留项。)
+
+    为什么按 direction 而不是按 cell:矩阵是 方向 × 平台。要不重样的是**方向
+    之间**;同一方向的不同平台(D1_xhs / D1_douyin)是同一打法的平台适配,
+    本来就该共用同一组路径 —— 按 cell 分配反而会把一个方向拆成两种打法。
+
+    分配用固定偏移量的轮转(见 config.PATH_ROTATION_OFFSETS),不用随机:
+    随机在 resume / 重试时会给同一个方向分到不同路径,导致重跑结果漂移。
+    """
+    seen: list[str] = []
+    for c in active_cells or []:
+        did = c.get("direction_id")
+        if did and did not in seen:
+            seen.append(did)
+
+    # 按方向编号自然排序,让分配不依赖 active_cells 的到达顺序 —— 否则上游
+    # 任何一次排序变化都会让同一条 run 重跑时拿到不同的路径,resume 出来的
+    # 格子和第一次跑的对不上。纯字典序会把 D10 排到 D2 前面,所以抽数字后缀。
+    def _dir_sort_key(d: str) -> tuple[int, str]:
+        m = re.search(r"(\d+)", d)
+        return (int(m.group(1)) if m else 1 << 30, d)
+
+    seen.sort(key=_dir_sort_key)
+
+    allocation: dict[str, list[str]] = {}
+    n = len(PATH_LIBRARY)
+    for i, did in enumerate(seen):
+        allocation[did] = [
+            PATH_LIBRARY[(i + off) % n] for off in PATH_ROTATION_OFFSETS
+        ]
+    return allocation
+
+
+def _merge_structure_hints(
+    det_hints: dict[str, dict], model_hints: dict[str, dict]
+) -> dict[str, dict]:
+    """合并确定性结构审和模型结构审的 hint,同 cell 取并集。
+
+    两边查的是不相交的东西 —— 确定性那边查平台调性张冠李戴,模型那边查
+    「合规/关键词/禁用清单是具体规则还是空话」。同一个 cell 两边都命中时
+    是两个独立问题,rewriter 一次都要修,所以 missing_items 拼起来、
+    revision_hint 也拼起来,不是二选一。
+    """
+    merged: dict[str, dict] = {k: dict(v) for k, v in det_hints.items()}
+    for cid, mh in model_hints.items():
+        if cid not in merged:
+            merged[cid] = dict(mh)
+            continue
+        base = merged[cid]
+        base["missing_items"] = list(base.get("missing_items", [])) + [
+            m for m in mh.get("missing_items", [])
+            if m not in base.get("missing_items", [])
+        ]
+        _hints = [h for h in (base.get("revision_hint"), mh.get("revision_hint")) if h]
+        base["revision_hint"] = "；".join(_hints)
+        base["_source"] = "deterministic+model"
+    return merged
+
+
+def _apply_structure_hints(
+    prompt_cells: list[dict], hints: dict[str, dict]
+) -> None:
+    """把 hint 挂到对应 cell 的 `_structure_hint` 字段(原地修改)。
+
+    下游两个消费点:
+      - vibe_loop 的强制补漏(critic 判 pass 但结构缺 → force borderline)
+      - `_augment_rewrite_directives` 把它织进 rewrite_directives
+    """
+    by_id = {c.get("cell_id"): c for c in prompt_cells if c.get("cell_id")}
+    for cid, hint in hints.items():
+        cell = by_id.get(cid)
+        if cell is not None:
+            cell["_structure_hint"] = hint
+
+
 def _classify_failed_cells(failed_cells: list[dict]) -> dict[str, list[dict]]:
     """Split failed cells by root_cause_kind for critic-rewriter routing.
 
@@ -4643,6 +5455,24 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             issues.append(
                 f"{cid}: system_prompt 差异化池命中 4/5（缺: {'/'.join(pools_missing)}），"
                 f"建议补齐但不强制重试"
+            )
+
+        # v0.33.4: 开头切入池必须是 15 条带编号的(跨批次多样性机制)。
+        #
+        # 其余四池"至少 5 个"就够 —— 它们管的是批次内差异化。只有开头角度还要
+        # 管**跨批次**:运营是每天跑、连着跑几十批,5 种粒度的组合跑 5-10 批就
+        # 用光,第 11 批必然撞。编号形式是为了让「上批已用 C03 C07」这种回避
+        # 指令能落地。
+        #
+        # 只数编号不查内容:C01-C15 这种编号在正常中文里几乎不会误命中,是个
+        # 高精度信号。判 SOFT 不判硬失败 —— 这是新增机制,老 run / 手工改过的
+        # prompt 不该因为它被打回重试(遵循本函数其余检查的一贯尺度)。
+        _angle_codes = set(re.findall(r"\bC(?:0[1-9]|1[0-5])\b", sp))
+        if len(_angle_codes) < 10:
+            issues.append(
+                f"{cid}: 开头切入池只有 {len(_angle_codes)} 条编号角度"
+                f"（跨批次多样性要求 15 条 C01-C15，少于 10 条时运营跑 5-10 批"
+                f"就会撞车），建议补齐但不强制重试"
             )
 
         # Batch generation rules — works_builder.md:24-29 requires 人设轮换
