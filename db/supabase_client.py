@@ -288,6 +288,41 @@ class SupabaseClient:
             )
             return []
 
+    def try_resume_from_paused(self, run_id: str, project_id: str) -> bool:
+        """把 run + project 从 `paused_for_review` **原子地**切回 `running`。
+
+        只有当前状态确实还是 paused_for_review 才切,返回是否切成功。
+
+        为什么不能"先读再写":请旨等待里读状态和接受用户回复之间有个 TOCTOU
+        窗口 —— 两个标签页的场景下,如果强制取消恰好落在这个窗口里,无条件的
+        update 会把已经 failed 的 run 改回 running,**取消被静默吃掉、付费的
+        工作继续跑**。条件 UPDATE 把判断交给数据库,窗口就不存在了。
+        和 `try_claim_project_running` 是同一个模式(那个防的是两次点击竞态)。
+        """
+        def _do():
+            resp = (
+                self.client.table("pipeline_runs")
+                .update({"status": "running"})
+                .eq("id", run_id)
+                .eq("status", "paused_for_review")
+                .execute()
+            )
+            return bool(resp.data)
+        claimed = _with_write_retry(_do)
+        if claimed:
+            # run 抢到了才动 project —— 反过来会留下 project=running 但
+            # run=failed 的错位状态。
+            try:
+                self.client.table("projects").update(
+                    {"status": "running", "updated_at": _now()}
+                ).eq("id", project_id).eq("status", "paused_for_review").execute()
+            except Exception:
+                logger.warning(
+                    "[resume_from_paused] run 已切回 running 但 project 没切,"
+                    "UI 状态可能短暂不一致(不影响执行)"
+                )
+        return claimed
+
     def try_claim_project_running(
         self, project_id: str, allowed_from: list[str] | None = None
     ) -> dict | None:

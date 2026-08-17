@@ -411,9 +411,24 @@ class PipelineOrchestrator:
 
             log = self.db.get_stage_log_by_id(log_id)
             if log and log.get("human_intervention"):
-                # User has responded — resume
-                self.db.update_pipeline_run(self.run_id, status="running")
-                self.db.update_project(self.project_id, status="running")
+                # User has responded — resume.
+                # 上面那次状态读和这里之间**还有**一个 TOCTOU 窗口:强制取消如果正好
+                # 落在窗口里,无条件的 update 会把已经 failed 的 run 改回 running。
+                # 所以恢复走条件 UPDATE —— 只有当前确实还停在 paused_for_review
+                # 才切,判断交给数据库做,窗口就不存在了。
+                if not self.db.try_resume_from_paused(self.run_id, self.project_id):
+                    _st_now = ""
+                    try:
+                        _st_now = (
+                            (self.db.get_pipeline_run(self.run_id) or {}).get("status") or ""
+                        )
+                    except Exception:
+                        pass
+                    raise PipelineCancelled(
+                        f"请旨收到回复,但 run 状态已不是 paused_for_review"
+                        f"(现在是 {_st_now or '未知'},多半是用户点了强制取消),"
+                        f"不恢复执行。"
+                    )
                 return log["human_intervention"]
 
             await asyncio.sleep(CLARIFICATION_POLL_INTERVAL)
@@ -869,25 +884,36 @@ class PipelineOrchestrator:
                     len(_sh_prev.get("hints") or {}),
                 )
             else:
-                await self._run_gemini_structure_review_stage(final_system)
-                try:
-                    _shlog = self.db.create_stage_log(
-                        self.run_id, "_structure_hints",
-                        {"cells": len(final_system.get("prompt_matrix") or [])},
+                _sh_ok = await self._run_gemini_structure_review_stage(final_system)
+                # ⚠️ 标记只在**模型那半边真跑成功**时写。模型挂了(未配置 /
+                # 限流 / 解析失败)时确定性前置审照样出 hint,矩阵上看起来"有
+                # 结构审结果",但模型能抓的那类问题(合规写成空话)一条没查。
+                # 这时候写标记 = 下次续跑直接跳过整个结构审,那半边永久漏掉。
+                # 不写标记,续跑会重试 —— 和上面 5c++++ 那些瞬时失败同一个取舍。
+                if not _sh_ok:
+                    logger.warning(
+                        "[structure_review] 模型半边未跑成(仅确定性 hint 生效),"
+                        "不写 resume 标记 —— 下次继续执行时会重试"
                     )
-                    self.db.update_stage_log(
-                        _shlog["id"], status="completed",
-                        output_data={
-                            "review": final_system.get("_structure_review") or {},
-                            "hints": {
-                                c["cell_id"]: c["_structure_hint"]
-                                for c in (final_system.get("prompt_matrix") or [])
-                                if c.get("cell_id") and c.get("_structure_hint")
+                else:
+                    try:
+                        _shlog = self.db.create_stage_log(
+                            self.run_id, "_structure_hints",
+                            {"cells": len(final_system.get("prompt_matrix") or [])},
+                        )
+                        self.db.update_stage_log(
+                            _shlog["id"], status="completed",
+                            output_data={
+                                "review": final_system.get("_structure_review") or {},
+                                "hints": {
+                                    c["cell_id"]: c["_structure_hint"]
+                                    for c in (final_system.get("prompt_matrix") or [])
+                                    if c.get("cell_id") and c.get("_structure_hint")
+                                },
                             },
-                        },
-                    )
-                except Exception:
-                    logger.warning("[structure_review] resume 标记落库失败")
+                        )
+                    except Exception:
+                        logger.warning("[structure_review] resume 标记落库失败")
 
             self._check_cancelled("精炼层之后")
 
@@ -938,7 +964,7 @@ class PipelineOrchestrator:
                         )
                 else:
                     _plan_before = plan
-                    final_system, plan = await self._run_strategic_escalation(
+                    final_system, plan, _esc_ok = await self._run_strategic_escalation(
                         final_system, structured_brief, plan,
                     )
                     # ⚠️ 升级成功后必须再打一次快照。它会改 direction 的策略锚点
@@ -950,8 +976,20 @@ class PipelineOrchestrator:
                     #
                     # 快照里带 plan:升级改的是 direction,不存的话恢复出来的矩阵
                     # 和 plan 对不上,下游按旧锚点判决。
-                    if plan is not _plan_before:
+                    #
+                    # ⚠️ "plan 变了"**不等于**"升级跑完了"。secretariat 改完锚点、
+                    # 但重跑 vibe_loop 抛异常时,plan 已经是新的(所以身份比较为真),
+                    # 可矩阵还是按**旧**锚点改写的那份 —— 这时候打快照 = 续跑跳过
+                    # 升级,新锚点下的改写永远不发生,且无声。所以要拿升级自己
+                    # 报的 _esc_ok 一起判。
+                    if _esc_ok and plan is not _plan_before:
                         self._checkpoint_matrix("refined_c", final_system, plan=plan)
+                    elif not _esc_ok:
+                        logger.warning(
+                            "[strategic_escalation] 升级未整套跑完(修订或重跑 vibe "
+                            "中途失败),不打 refined_c 快照 —— 下次继续执行会从"
+                            "refined_b 重来一遍升级"
+                        )
 
             # 5d++. 消费者模拟(v0.29.1, C.2.2)— 在终审前用 persona_simulator
             # 以 direction.stop_trigger 描述的具体目标用户扮演者对每个 cell
@@ -3629,7 +3667,7 @@ class PipelineOrchestrator:
 
     async def _run_gemini_structure_review_stage(
         self, final_system: dict
-    ) -> None:
+    ) -> bool:
         """Gemini 结构审（advisory）— 在工部构建之后、网感复检之前跑一次。
 
         审查每条 prompt_cell 的 5 池 / 人设 / 合规 / 关键词 / AI 禁用清单 /
@@ -3641,10 +3679,16 @@ class PipelineOrchestrator:
         Advisory-only：Gemini 未配置 / 调用失败 / 解析失败全部 → 跳过，
         不阻塞流水线。Gemini 的 token + 成本通过 accumulate_auxiliary_cost
         累到 pipeline_runs.total_cost_usd 里，不占 MAX_TOKENS_PER_RUN 预算。
+
+        返回值 = **模型那半边是否真跑成功**（不是"这个阶段有没有出错"）。
+        确定性前置审是纯 Python，永远算跑过；模型半边失败时返回 False，
+        调用方据此决定要不要写 resume 标记 —— 写了的话下次续跑会跳过整个
+        结构审，把模型能抓到的那类问题（"合规写成空话"）永久漏掉。
         """
         prompt_cells = final_system.get("prompt_matrix", []) or []
         if not prompt_cells:
-            return
+            # 没有矩阵可审 —— 重跑也审不出东西，算"已完成"，别让续跑空转。
+            return True
 
         stage_name = "ministry_works_structure_review"
         log = self.db.create_stage_log(
@@ -3691,7 +3735,7 @@ class PipelineOrchestrator:
                     "deterministic_hints": _det_hints,
                 },
             )
-            return
+            return False
 
         verdict = result.get("verdict", "skipped")
         usage = result.get("_gemini_usage") or {}
@@ -3752,7 +3796,7 @@ class PipelineOrchestrator:
                 + int(usage.get("output_tokens", 0)),
                 model_used=usage.get("model"),
             )
-            return
+            return False
 
         self.db.update_stage_log(
             log_id,
@@ -3783,6 +3827,7 @@ class PipelineOrchestrator:
                 "[structure review] all %d cells structurally complete",
                 len(prompt_cells),
             )
+        return True
 
     async def _run_vibe_loop(
         self,
@@ -4561,7 +4606,7 @@ class PipelineOrchestrator:
         final_system: dict,
         structured_brief: dict,
         plan: dict,
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict, dict, bool]:
         """策略层自动升级(v0.29.1, C.2.1)。
 
         vibe_loop 跑完后,若留下 strategic_warnings(rewriter 改不了的
@@ -4569,7 +4614,14 @@ class PipelineOrchestrator:
         (stop_trigger / reward_type / role_embodiment / ...),然后再
         跑一次 vibe_loop 让 critic + rewriter 用新锚点重新判决。
 
-        返回 (final_system, plan) 二元组 — plan 可能被更新。
+        返回 (final_system, plan, completed) 三元组 — plan 可能被更新。
+
+        `completed` = **这一轮升级是否整套跑完**(修订锚点 + 重跑 vibe_loop)。
+        只有它为 True 时调用方才该打 refined_c 快照:secretariat 改完锚点、
+        但重跑 vibe_loop 抛异常时,plan 已经换成新的了(所以"plan 变了没"
+        判断不出来),可矩阵还是**按旧锚点改写过的**那份。这时候打快照 =
+        续跑时直接跳过升级,新锚点下的改写永远不会发生,而且没有任何报错。
+        不打快照的话,续跑从 refined_b 起,warnings 还在,升级会重来一遍。
 
         硬上限 STRATEGIC_LOOP_MAX_ITERATIONS(默认 1):只允许一次自动
         升级,避免 direction 来回摆动。超过后 strategic_warnings 会继续
@@ -4584,7 +4636,7 @@ class PipelineOrchestrator:
         while iteration < max_iter:
             warnings = final_system.get("strategic_warnings") or []
             if not warnings:
-                return final_system, plan
+                return final_system, plan, True
 
             affected_direction_ids = sorted({
                 w.get("direction_id") for w in warnings
@@ -4594,7 +4646,7 @@ class PipelineOrchestrator:
                 # Warnings exist but have no direction_id (old critic output
                 # or Gemini-flagged). Nothing actionable at strategy layer —
                 # leave warnings for user.
-                return final_system, plan
+                return final_system, plan, True
 
             logger.warning(
                 "[strategic_escalation] round %d: %d cells flagged strategic "
@@ -4622,7 +4674,7 @@ class PipelineOrchestrator:
                     "[strategic_escalation] secretariat revision failed; "
                     "keeping original plan + warnings"
                 )
-                return final_system, plan
+                return final_system, plan, False
 
             # Merge revised directions into plan + self._direction_index.
             # Only the affected direction_ids are trusted to have been updated
@@ -4746,7 +4798,7 @@ class PipelineOrchestrator:
                     "[strategic_escalation] re-run vibe_loop failed; "
                     "leaving current state in place"
                 )
-                return final_system, plan
+                return final_system, plan, False
 
             iteration += 1
 
@@ -4760,7 +4812,7 @@ class PipelineOrchestrator:
                 max_iter,
                 len(remaining),
             )
-        return final_system, plan
+        return final_system, plan, True
 
     async def _run_consumer_simulation(
         self,

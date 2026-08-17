@@ -595,7 +595,10 @@ def detect_regression(
 
     return {
         "regressed": True,
-        "baseline_runs": max(len(redline_hist), len(high_hist)),
+        # ⚠️ 不要再合并出一个"总基线条数"。两条指标的基线是**不同的两批 run**
+        # (红线用全部有格子的 run,高分层只用评分覆盖完整的),取 max 出来的
+        # 那个数字哪条指标都不对应 —— UI 拿它写"N 条覆盖完整的 run"就是在
+        # 撒谎:红线中位数根本不是从那批算的。要展示就分开展示。
         "baseline_runs_redline": len(redline_hist),
         "baseline_runs_high_score": len(high_hist),
         "redline": {"current": round(cur_redline, 4),

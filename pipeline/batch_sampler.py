@@ -227,24 +227,20 @@ async def sample_one_cell(
         import time as _time
         from pipeline.agents import _get_active_limiter
 
-        # ⚠️ v0.34.2:只重试**瞬时**故障。上一版把内层的 call_with_retry 关掉
-        # 之后,我用一个宽泛的 `except Exception` 接管了重试 —— 而被替换掉的那层
-        # 是会分类的(只重限流/超时/连接/5xx)。后果:没配 key、模型名不对、400
-        # 参数错这类**永远不会自愈**的错误,每个样本都要白等 2+4 秒再失败三次,
-        # 60 个样本叠加起来会把线程池和整条流水线拖住很久。
+        # ⚠️ v0.34.2:只重试**瞬时**故障,而且**直接复用 llm_retry 的分类器**,
+        # 不自己手写一个。
         #
-        # 分类靠错误文本而不是异常类型:辅助层把一切都包成 KimiCallFailed,
-        # 类型层面已经区分不出来了。宁可漏判成"不可重试"(快速失败)也不要漏判成
-        # "可重试"(慢速失败)—— 前者的代价是少一次本来也未必成功的重试。
-        _TRANSIENT_MARKERS = (
-            "429", "rate limit", "rate_limit", "too many",
-            "timeout", "timed out", "connection", "connect error",
-            "500", "502", "503", "504", "overloaded", "temporarily",
-        )
-
-        def _is_transient(exc: Exception) -> bool:
-            m = str(exc).lower()
-            return any(k in m for k in _TRANSIENT_MARKERS)
+        # 上一版我把内层 call_with_retry 关掉后用宽泛 except 接管重试,丢掉了
+        # 分类;修的时候又手写了一张"瞬时标记"表 —— 那张表把所有 429 都当可重试,
+        # 而 `_is_transient` 里早就有一组**欠费停号**指纹(insufficient balance /
+        # please recharge / account is suspended / 余额不足),它们披着 429 的皮
+        # 但充值前永远不会成功。
+        #
+        # 这不是个新问题:v0.32.5 就是专门修这个的(原注记:"账户欠费被停不再当
+        # 普通限流重试…余额烧干后终审对着 suspended 账户重试 3 轮 × 3 个阶段")。
+        # 我在一条新代码路径上把它重新引入了一遍。教训很直接:**已有的分类器就用,
+        # 不要手写平行实现** —— 平行实现必然缺掉原版里那些踩坑攒出来的例外。
+        from pipeline.llm_retry import _is_transient
 
         _lim = _get_active_limiter()
         _last: Exception | None = None
