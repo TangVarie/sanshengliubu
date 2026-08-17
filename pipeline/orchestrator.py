@@ -5035,6 +5035,24 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
                 f"建议补齐但不强制重试"
             )
 
+        # v0.33.4: 开头切入池必须是 15 条带编号的(跨批次多样性机制)。
+        #
+        # 其余四池"至少 5 个"就够 —— 它们管的是批次内差异化。只有开头角度还要
+        # 管**跨批次**:运营是每天跑、连着跑几十批,5 种粒度的组合跑 5-10 批就
+        # 用光,第 11 批必然撞。编号形式是为了让「上批已用 C03 C07」这种回避
+        # 指令能落地。
+        #
+        # 只数编号不查内容:C01-C15 这种编号在正常中文里几乎不会误命中,是个
+        # 高精度信号。判 SOFT 不判硬失败 —— 这是新增机制,老 run / 手工改过的
+        # prompt 不该因为它被打回重试(遵循本函数其余检查的一贯尺度)。
+        _angle_codes = set(re.findall(r"\bC(?:0[1-9]|1[0-5])\b", sp))
+        if len(_angle_codes) < 10:
+            issues.append(
+                f"{cid}: 开头切入池只有 {len(_angle_codes)} 条编号角度"
+                f"（跨批次多样性要求 15 条 C01-C15，少于 10 条时运营跑 5-10 批"
+                f"就会撞车），建议补齐但不强制重试"
+            )
+
         # Batch generation rules — works_builder.md:24-29 requires 人设轮换
         # + 差异化旋钮轮转 to be baked into every system_prompt. Chancellery
         # has historically rejected for missing these. Mark as SOFT so we
