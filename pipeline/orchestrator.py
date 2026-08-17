@@ -14,8 +14,10 @@ from itertools import groupby
 
 from db.supabase_client import SupabaseClient
 from pipeline.config import (
+    BATCH_SAMPLE_N,
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
+    ENABLE_BATCH_SAMPLING,
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
     DEFAULT_PLATFORM,
@@ -66,6 +68,7 @@ from pipeline.retrieve_samples import (
     summarize_packs_by_platform,
 )
 from pipeline.logger_utils import mask_secrets
+from pipeline.batch_sampler import run_batch_sampling
 from pipeline.quality_metrics import (
     deterministic_structure_audit,
     persist_quality_score,
@@ -729,6 +732,63 @@ class PipelineOrchestrator:
                     "output_content": _demo_txt,
                 })
             final_system["demo_outputs"] = _rebuilt_demos
+
+            # 6.96 批量采样验收(v0.33.3)。这是整条流水线唯一一处用 N>1 的样本
+            # 验收产出的地方 —— 前面 11 道质量闸看的都是每个 cell 唯一那篇 demo,
+            # 而交付物是给批量生成用的 prompt。决定"第 7 篇会不会和第 3 篇一个味"
+            # 的 5 池 + 人设轮换机制,在此之前从来没被真正跑过一遍。
+            #
+            # 跑在终审之后是有意的:采样的是**最终出货的那版 system_prompt**。
+            # 【观测,不拦】—— 不阻塞、不触发重写、不影响 verdict。没有历史分布
+            # 就设阈值等于凭猜,先攒数据。详见 batch_sampler 模块 docstring。
+            if ENABLE_BATCH_SAMPLING:
+                try:
+                    _sampling = await run_batch_sampling(
+                        final_system.get("prompt_matrix") or [],
+                        structured_brief or {},
+                        n=BATCH_SAMPLE_N,
+                    )
+                    final_system["_batch_sampling"] = _sampling
+                    _slog = self.db.create_stage_log(
+                        self.run_id,
+                        "batch_sampling",
+                        {"n_per_cell": BATCH_SAMPLE_N},
+                    )
+                    self.db.update_stage_log(
+                        _slog["id"],
+                        status=(
+                            "completed" if _sampling.get("status") == "ok"
+                            else "skipped"
+                        ),
+                        output_data=_sampling,
+                    )
+                    # 采样成本单独上报,和辅助层其它岗位一样不进 run token 熔断,
+                    # 但要让成本回显看得见 —— 悄悄花钱比花钱更糟。
+                    _su = _sampling.get("_usage") or {}
+                    if _su.get("cost_usd") or _su.get("output_tokens"):
+                        accumulate_auxiliary_cost(
+                            self.run_id,
+                            cost_usd=float(_su.get("cost_usd", 0.0)),
+                            input_tokens=int(_su.get("input_tokens", 0)),
+                            output_tokens=int(_su.get("output_tokens", 0)),
+                            source="batch_sampling",
+                        )
+                    if _sampling.get("status") == "ok":
+                        logger.info(
+                            "[batch_sample] %d 个 cell × %d 篇 = %d 样本 · "
+                            "红线 %.0f%% · 最差格子首句去重率 %s · "
+                            "最差格子两两相似度 %s · $%.4f",
+                            _sampling.get("cells_sampled", 0),
+                            _sampling.get("n_per_cell", 0),
+                            _sampling.get("total_samples", 0),
+                            _sampling.get("redline_pass_rate", 0.0) * 100,
+                            _sampling.get("worst_cell_unique_opening_ratio"),
+                            _sampling.get("worst_cell_max_similarity"),
+                            float(_su.get("cost_usd", 0.0)),
+                        )
+                except Exception:
+                    # 采样是 advisory —— 绝不能因为它把一条跑完的 run 判死。
+                    logger.exception("[batch_sample] 失败(non-fatal),继续出货")
 
             # 6.97 质量评分(双层评分体系)。跑在这里是有意的:此时 prompt_matrix
             # 已经过全部精炼阶段(红蓝 / 网感重写 / 结构补漏 / 策略升级),

@@ -947,6 +947,94 @@ if _scorecard.get("total_cells"):
             if _pc.get("craft_missing"):
                 st.caption(f"　　缺工艺要素：{'、'.join(_pc['craft_missing'])}")
 
+# ── 批量采样验收 ────────────────────────────────────────────────────────
+# 数据来自 stage_name='batch_sampling'。这是整条流水线唯一一处用 N>1 的样本
+# 验收产出的地方——前面 11 道质量闸看的都是每个 cell 唯一那篇 demo，而交付物
+# 是给批量生成用的 prompt。
+#
+# ⚠️ 当前是【观测，不拦】：这里的数字不影响出货，只用来攒分布。
+_bs_log = log_map.get("batch_sampling")
+_bs = (_bs_log or {}).get("output_data") or {}
+if _bs.get("status") == "ok":
+    st.divider()
+    st.subheader("批量采样验收")
+    st.caption(
+        f"拿最终 system_prompt 真跑了 {_bs.get('cells_sampled', 0)} 个格子 × "
+        f"{_bs.get('n_per_cell', 0)} 篇 = **{_bs.get('total_samples', 0)} 个样本**，"
+        f"只变 `{{{{seed}}}}` 其余变量固定。"
+        f"　成本 ${float((_bs.get('_usage') or {}).get('cost_usd', 0)):.4f}"
+        "　·　**观测模式：以下数字不影响出货判决**"
+    )
+
+    _s1, _s2, _s3 = st.columns(3)
+    _srate = _bs.get("redline_pass_rate", 0.0)
+    _s1.metric(
+        "样本红线通过",
+        f"{_bs.get('redline_clean_samples', 0)}/{_bs.get('total_samples', 0)}",
+        delta=None if _srate >= 1.0 else f"{_srate:.0%}",
+        delta_color="off" if _srate >= 1.0 else "inverse",
+        help="和上面「质量评分」用的是同一套红线规则，但样本空间不同："
+             "那边判的是唯一那篇 demo，这边判的是这个 prompt 真跑出来的一批。",
+    )
+    _uor = _bs.get("worst_cell_unique_opening_ratio")
+    _s2.metric(
+        "最差格子·首句去重率",
+        f"{_uor:.0%}" if _uor is not None else "—",
+        help="取各格子的**最差值**不取均值：一个格子严重趋同就是一个格子的批量废掉了，"
+             "被别的格子的好成绩平均掉就看不见了。",
+    )
+    _sim = _bs.get("worst_cell_max_similarity")
+    _s3.metric(
+        "最差格子·两两相似度",
+        f"{_sim:.2f}" if _sim is not None else "—",
+        help="字符 trigram 的 Jaccard 相似度。首句去重率会被「换词伪装」骗过去"
+             "（每篇开头都不同但其实是同一篇），这个指标抓得住。越低越好。",
+    )
+
+    _bt = _bs.get("redline_violation_tally") or {}
+    if _bt:
+        _RL = {"ai_cliche": "AI 空话黑名单", "banned_opening": "寒暄式开场",
+               "list_body": "列表体正文", "duplicate_opening": "首句重复",
+               "demo_missing": "样本为空"}
+        st.caption(
+            "样本红线违规分布：　"
+            + "　·　".join(f"{_RL.get(k, k)} {v}" for k, v in
+                           sorted(_bt.items(), key=lambda kv: -kv[1]))
+        )
+    if _bs.get("cells_not_sampled"):
+        st.warning(
+            f"有 {len(_bs['cells_not_sampled'])} 个格子未采样（超出单条 run 的采样上限）："
+            + "、".join(_bs["cells_not_sampled"][:8])
+        )
+
+    with st.expander(f"逐格子采样明细（{_bs.get('cells_sampled', 0)} 个）", expanded=False):
+        for _pc in (_bs.get("per_cell") or []):
+            _d = _pc.get("diversity") or {}
+            st.markdown(
+                f"**{_pc.get('cell_id', '?')}**　`{_pc.get('platform', '')}`　"
+                f"范式 {_pc.get('paradigm', '?')}　"
+                f"红线 {_pc.get('redline_clean_samples', 0)}/{_pc.get('n_ok', 0)}　"
+                f"工艺齐全 {_pc.get('craft_complete_samples', 0)}/{_pc.get('n_ok', 0)}　"
+                f"首句去重 {_d.get('unique_opening_ratio', 0):.0%}　"
+                f"相似度 max={_d.get('max_pairwise_similarity')}"
+            )
+            if _d.get("duplicate_openings"):
+                st.caption(f"　　重复首句：{_d['duplicate_openings'][0][:50]}")
+            for _ps in (_pc.get("per_sample") or []):
+                _flag = "✗" if _ps.get("redline_violations") else "·"
+                st.caption(
+                    f"　　{_flag} seed={_ps.get('seed')}　{_ps.get('chars')}字　"
+                    f"{_ps.get('opening', '')}"
+                    + (f"　[{'/'.join(_ps['redline_violations'])}]"
+                       if _ps.get("redline_violations") else "")
+                )
+elif _bs.get("status") in ("failed", "skipped"):
+    st.divider()
+    st.caption(
+        f"批量采样未产出（{_bs.get('status')}）：{_bs.get('reason', '未说明')}"
+        "　—— 采样是 advisory，不影响本次产出。"
+    )
+
 # ── Stage Details ──────────────────────────────────────────────────────────
 
 st.divider()

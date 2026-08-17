@@ -374,6 +374,75 @@ blocklist 挡不住"以后又有人往 `final_system` 上挂新字段"这个复�
 
 ---
 
+## 7. 批量采样验收:为什么 n=1 验收不成立 (v0.33.3)
+
+`pipeline/batch_sampler.py`,跑在终审之后、质量评分之前(`run()` 第 6.96 步)。
+
+### 缺口
+
+交付物是 system_prompt,它的工作是产出 N≥10 篇。但在此之前,**11 道质量闸看的
+都是每个 cell 唯一那篇 `demo_output`** —— 红蓝、画像模拟 ×2、结构审、网感
+critic、二审、消费者模拟、终审,全部对着同一个样本。
+
+三个后果:
+
+1. **5 池 + 人设轮换机制从来没被验证过。** 决定"第 7 篇会不会和第 3 篇一个味"
+   的就是这套机制,而流水线里唯一的检查是数一数"5 个池的文字在不在 prompt 里"。
+   **存在 ≠ 有效。**
+2. **n=1 测的是 demo 的质量,不是 prompt 的分布。** 那篇 demo 经过红蓝精修、
+   网感重写、结构补漏最多 3 轮打磨,反映的是"这 8 道工序能把一篇修到多好"。
+3. **优化方向是反的。** 目标是上限(100 篇里 5 篇爆款 > 100 篇都 85 分),
+   但最贵的两个环节(红蓝、网感重写)干的事恰恰是把唯一样本往均值推 ——
+   n=1 下无法区分"抹掉了尾部烂篇"和"抹掉了头部爆款"。
+
+### 做法:只变 seed
+
+拿最终 system_prompt 真跑 N 篇(默认 5),**只变 `{{seed}}`**,topic 固定、
+persona **留空**。
+
+- 只变 seed 是因为那正是 `works_builder.md` 批量规则承诺的差异化开关
+  (「相邻两篇的 seed 值建议间隔 ≥ 20」)。用它自己承诺的口径去测它。
+- persona 留空是有意的:手动指定人设等于替 prompt 做了它本该做的事,
+  那条轮换规则也就测不出来了。
+
+### 三个指标
+
+| 指标 | 口径 | 为什么 |
+|------|------|--------|
+| 样本红线通过率 | 追 100% | 和质量评分同一套规则,不同样本空间 |
+| 首句去重率 | 取**各 cell 最差值** | 一个格子趋同就是一个格子的批量废了,均值会盖掉它 |
+| 两两相似度 | 字符 trigram Jaccard,越低越好 | 首句去重率会被「换词伪装」骗过去 |
+
+第三个指标是必需的:实测「每篇开头都不同但正文只换了几个词」这种样本,
+首句去重率 100%,相似度均值 0.45 —— 光看去重率会放过它。
+
+### 观测,不拦
+
+采样结果**不参与出货判决**:不阻塞、不触发重写、不影响 verdict
+(`mode: "observe_only"`)。
+
+理由是仓库现在还没有历史分布。没有基线就设阈值等于凭猜调参 —— 那正是这轮
+改造要治的病。先攒几条 run,再决定阈值定在哪、要不要升级成闸门。
+
+### SQL
+
+```sql
+-- 采样质量随时间的变化(升级成闸门之前先看这个,别急着定阈值)
+SELECT
+    sl.created_at,
+    sl.output_data->>'total_samples'                   AS samples,
+    (sl.output_data->>'redline_pass_rate')::float      AS redline_rate,
+    (sl.output_data->>'worst_cell_unique_opening_ratio')::float AS worst_uniq,
+    (sl.output_data->>'worst_cell_max_similarity')::float       AS worst_sim,
+    sl.output_data->'_usage'->>'cost_usd'              AS cost
+FROM stage_logs sl
+WHERE sl.stage_name = 'batch_sampling'
+  AND sl.output_data->>'status' = 'ok'
+ORDER BY sl.created_at DESC LIMIT 30;
+```
+
+---
+
 ## 后续 sprint backlog (audit 2026-05-22 未实施项)
 
 | ID | 主题 | 工时 | 触发条件 |
