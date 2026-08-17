@@ -1,10 +1,13 @@
 """新建项目 — 2-tab form: New Product / Iterate & Extend."""
 
 import base64
-import io
 import json
 
 import streamlit as st
+from utils.file_extract import (
+    _IMAGE_EXTS,
+    extract_file_content,
+)
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="新建项目", page_icon="省", layout="wide")
@@ -13,90 +16,8 @@ st.title("新建 Prompt 工程项目")
 
 
 # ── File processing helpers ────────────────────────────────────────────────
-
-# Hard caps enforced server-side (the `type=[...]` arg on st.file_uploader is
-# just a UI hint, the client can still post anything). Images go into the
-# prompt as base64, which inflates by ~33%; 2 MB decoded → ~2.7 MB encoded,
-# which is already a lot of tokens. Text-like files are bounded to 1 MB so a
-# runaway upload can't blow the free-text column / LLM context.
-_MAX_IMAGE_BYTES = 2 * 1024 * 1024
-_MAX_TEXT_BYTES = 1 * 1024 * 1024
-_TEXT_EXTS = (".txt", ".md", ".json")
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
-
-
-def _read_with_cap(uploaded_file, max_bytes: int) -> bytes | None:
-    """Read uploaded_file and return bytes, or None if it exceeds max_bytes.
-    Uses .size when available (Streamlit UploadedFile exposes it) to avoid
-    materializing oversized content in memory."""
-    size = getattr(uploaded_file, "size", None)
-    if size is not None and size > max_bytes:
-        return None
-    data = uploaded_file.read()
-    if len(data) > max_bytes:
-        return None
-    return data
-
-
-def extract_file_content(uploaded_file) -> str:
-    """Extract text content from an uploaded file. Enforces size caps."""
-    name = uploaded_file.name.lower()
-
-    if name.endswith(_TEXT_EXTS):
-        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
-        if data is None:
-            return f"[文件过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
-        return data.decode("utf-8", errors="replace")
-
-    if name.endswith(".pdf"):
-        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
-        if data is None:
-            return f"[PDF 过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        except Exception as e:
-            return f"[PDF 解析失败: {e}]"
-
-    if name.endswith(".docx"):
-        data = _read_with_cap(uploaded_file, _MAX_TEXT_BYTES)
-        if data is None:
-            return f"[DOCX 过大跳过: {uploaded_file.name} > {_MAX_TEXT_BYTES // 1024}KB]"
-        try:
-            from docx import Document
-            doc = Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception as e:
-            return f"[DOCX 解析失败: {e}]"
-
-    if name.endswith(_IMAGE_EXTS):
-        data = _read_with_cap(uploaded_file, _MAX_IMAGE_BYTES)
-        if data is None:
-            return f"[图片过大跳过: {uploaded_file.name} > {_MAX_IMAGE_BYTES // 1024 // 1024}MB]"
-        # ── 图片预转写(v0.26.0)──
-        # 旧版做法:把图片转成 [BASE64_IMAGE:...] 占位符塞进 free_text。
-        # 但 Anthropic API 不会把字符串里的 base64 当图像理解,所以
-        # 下游 Crown Prince + 六部根本"看不见"图,只知道有张图存在。
-        # 新版:本地起一个 Gemini Vision 调用,把图转成 OCR + 视觉描述
-        # + 关键数据 的结构化文字块。Gemini 没配置 / 失败 → 降级到带
-        # 警告语的占位符(transcribe_image_for_brief 内部包了所有异常)。
-        from pipeline.agents.kimi_image_transcriber import (
-            transcribe_image_for_brief,
-        )
-        # mime 简单从扩展名推断,够 Gemini API 用
-        _ext_to_mime = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".webp": "image/webp",
-        }
-        _mime = next(
-            (m for ext, m in _ext_to_mime.items() if name.endswith(ext)),
-            "image/png",
-        )
-        return transcribe_image_for_brief(data, _mime, uploaded_file.name)
-
-    return f"[不支持的文件类型: {uploaded_file.name}]"
-
+# 实际的解析逻辑在 utils/file_extract.py —— page 3 的请旨补充资料走同一份,
+# 不要在任何一边写第二套(体积上限、docx 表格、扫描版 PDF 判定都在那里)。
 
 def _launch_pipeline(db, project, success_message: str = "流水线已启动！"):
     """Create a pipeline run, initialise API, start background pipeline, navigate."""

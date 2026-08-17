@@ -121,6 +121,16 @@ def _sanitize_freetext_for_display(text: str) -> str:
     return text
 
 
+# extract_file_content(page 2)失败时写进 body 的占位符形状。整条 body 就是
+# 这么一行 `[...]`,所以用 fullmatch 语义(match + $)避免误伤正文里出现的方括号。
+_FAILED_FILE_RE = re.compile(
+    r"^\[[^\]]*(过大跳过|解析失败|不支持的文件类型|无文字层|未提取到任何文字)[^\]]*\]$",
+    flags=re.DOTALL,
+)
+# 部分提取成功但被截断 / 有图没提 —— 不是失败,但必须让用户看见。
+_PARTIAL_FILE_RE = re.compile(r"\[⚠️ [^\]]*(已截断|未被提取)[^\]]*\]")
+
+
 def _extract_file_summary_from_freetext(text: str) -> list[dict]:
     """扫 free_text 找出所有已接收的文件及其状态。
 
@@ -149,7 +159,16 @@ def _extract_file_summary_from_freetext(text: str) -> list[dict]:
 
         # 按扩展名 + body 内容推断类型
         _ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        if "[图片AI识别:" in body:
+        # ⚠️ 失败占位符要**先于**扩展名分支判。extract_file_content 失败时
+        # 返回的是 `[DOCX 过大跳过: xxx]` 这类字符串,它照样是 body 的全部
+        # 内容 —— 按扩展名判就成了"Word · 已提取文本 · 33 字",把一次彻底
+        # 失败显示成了成功,而那 33 字就是报错本身。真实案例:4MB 的样稿
+        # Word 被整份拒收,清单上却是绿的,用户跑完一整条 run 才发现语料是空的。
+        # **清单的唯一职责就是回答"收到没",它撒谎比不显示更糟。**
+        if _FAILED_FILE_RE.match(body):
+            kind = {"docx": "Word", "pdf": "PDF"}.get(_ext, "文件")
+            status = "failed"
+        elif "[图片AI识别:" in body:
             kind = "图片(Kimi OCR)"
             status = "transcribed"
         elif "[图片占位符:" in body:
@@ -182,6 +201,9 @@ def _extract_file_summary_from_freetext(text: str) -> list[dict]:
         # 空 body 提示(上传成功但解析失败也算一种状态)
         if not body and status == "extracted":
             status = "empty"
+        # 提取成功但有损(文本被截断 / 内嵌图没提)——绿色会让人以为全收到了
+        elif status == "extracted" and _PARTIAL_FILE_RE.search(body):
+            status = "partial"
 
         files.append({
             "filename": filename,
@@ -596,48 +618,30 @@ for ni_log in needs_input_logs:
 
         if submitted and user_answer.strip():
             intervention = {"answer": user_answer.strip()}
-            # Size caps match pages/2_new_project.py::extract_file_content.
-            # st.file_uploader's `type=` arg is a UI hint only; clients can
-            # post anything, so the cap is enforced here.
-            _MAX_IMAGE_BYTES = 2 * 1024 * 1024
-            _MAX_TEXT_BYTES = 1 * 1024 * 1024
             if uploaded_files:
-                # 图片走 Kimi Vision 预转写,与 pages/2_new_project.py 一致。
-                # 旧版 base64 占位符让下游 LLM 看不见图,人工补充等于白补。
-                from pipeline.agents.kimi_image_transcriber import (
-                    transcribe_image_for_brief,
+                # ⚠️ 这里原本是**另一套**上传处理:体积上限自己写一份常量,
+                # 而且对一切非图片文件直接 `data.decode("utf-8")` —— 上传框
+                # 明明收 pdf/docx,补一份 Word 进来就是一大坨替换字符塞进
+                # 请旨回复,还看不出哪里错了。现在和新建项目页走**同一份**
+                # utils/file_extract,docx 表格、扫描版 PDF 判定、分开量的
+                # 体积上限一并继承,不会再出现"改了一边漏了另一边"。
+                from utils.file_extract import (
+                    _IMAGE_EXTS as _FE_IMAGE_EXTS,
+                    extract_file_content as _fe_extract,
                 )
-                _ext_to_mime = {
-                    ".png": "image/png", ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg", ".gif": "image/gif",
-                    ".webp": "image/webp",
-                }
                 _has_imgs = any(
-                    f.name.lower().endswith(tuple(_ext_to_mime))
+                    f.name.lower().endswith(_FE_IMAGE_EXTS)
                     for f in uploaded_files
                 )
 
                 def _process_one(f):
                     try:
-                        name = f.name.lower()
-                        is_image = name.endswith(tuple(_ext_to_mime))
-                        cap = _MAX_IMAGE_BYTES if is_image else _MAX_TEXT_BYTES
-                        size = getattr(f, "size", None)
-                        if size is not None and size > cap:
-                            return f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
-                        data = f.read()
-                        if len(data) > cap:
-                            return f"[补充文件: {f.name}] 过大跳过 > {cap // 1024 // 1024 or 1}MB"
-                        if is_image:
-                            mime = next(
-                                (m for ext, m in _ext_to_mime.items() if name.endswith(ext)),
-                                "image/png",
-                            )
-                            return f"[补充图片: {f.name}]\n{transcribe_image_for_brief(data, mime, f.name)}"
-                        return (
-                            f"[补充文件: {f.name}]\n"
-                            f"{data.decode('utf-8', errors='replace')}"
+                        _tag = (
+                            "补充图片"
+                            if f.name.lower().endswith(_FE_IMAGE_EXTS)
+                            else "补充文件"
                         )
+                        return f"[{_tag}: {f.name}]\n{_fe_extract(f)}"
                     except Exception:
                         return f"[补充文件: {f.name}]（无法读取）"
 
@@ -1154,6 +1158,8 @@ with tabs[0]:
             _status_icons = {
                 "extracted": "[已提取]",
                 "transcribed": "[已转写]",
+                "partial": "[部分]",
+                "failed": "[未收到]",
                 "placeholder_only": "[占位符]",
                 "legacy_base64": "[旧base64]",
                 "empty": "[空]",
@@ -1162,6 +1168,8 @@ with tabs[0]:
             _status_labels = {
                 "extracted": "已提取文本",
                 "transcribed": "Kimi 已转写",
+                "partial": "部分提取(有截断或图未提)",
+                "failed": "未进入 brief",
                 "placeholder_only": "仅占位符(未转写)",
                 "legacy_base64": "老版 base64 残留",
                 "empty": "body 为空(提取失败?)",
@@ -1176,13 +1184,26 @@ with tabs[0]:
                     "base64 残留来自 v0.26 之前的老数据,每次 re-run 会继承。"
                     "只想看『收到没』就看这个表,不用翻下面的正文。"
                 )
+                _n_failed = sum(
+                    1 for _f in _files_received if _f["status"] == "failed"
+                )
+                if _n_failed:
+                    st.error(
+                        f"**{_n_failed} 个文件没进 brief** —— 下面标 `[未收到]` 的"
+                        f"那几行，正文里存的是一句报错，不是内容。这条 run 是在"
+                        f"缺这些资料的情况下跑的。"
+                    )
                 for _fi in _files_received:
                     _icon = _status_icons.get(_fi["status"], "[未知]")
                     _label = _status_labels.get(_fi["status"], _fi["status"])
-                    st.markdown(
+                    _line = (
                         f"{_icon} **{_fi['filename']}** · _{_fi['kind']}_ · "
                         f"`{_label}` · {_fi['size_hint']:,} 字"
                     )
+                    if _fi["status"] == "failed":
+                        st.markdown(f":red[{_line}]")
+                    else:
+                        st.markdown(_line)
                     if _fi["preview"]:
                         st.caption(f"预览:{_fi['preview']}…")
     except Exception as _fs_err:
