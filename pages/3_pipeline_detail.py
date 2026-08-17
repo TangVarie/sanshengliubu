@@ -853,6 +853,100 @@ elif _run_failed and not _any_failed_log:
         "可以点下方「重跑流水线」重来；若反复发生请查看服务端运行日志。"
     )
 
+# ── 质量评分（双层评分体系）─────────────────────────────────────────────
+# 数据来自 stage_name='quality_score' 那一行，由 pipeline/quality_metrics.py
+# 在出货前算好落库。零 LLM 成本：红线层是纯 Python 判定，高分层读 vibe_critic
+# 已有的 cell_reviews。
+#
+# 两个数字的读法完全不同，UI 上必须分开呈现，否则很容易被当成一个综合分：
+#   · 红线通过率 → 追 100%，任何一条没到都意味着有废稿要复核
+#   · 高分篇数   → 看**绝对数**，跨 run 对比要的是 "4/12 → 8/12" 这种翻倍。
+#     有意不显示百分比：把它当通过率优化会压掉方差，而方差正是爆款的来源。
+_score_log = log_map.get("quality_score")
+_scorecard = (_score_log or {}).get("output_data") or {}
+if _scorecard.get("total_cells"):
+    st.divider()
+    _total = _scorecard["total_cells"]
+    _rl_cells = _scorecard.get("redline_pass_cells", 0)
+    _rl_rate = _scorecard.get("redline_pass_rate", 0.0)
+    _hs = _scorecard.get("high_score_cells", 0)
+    _cov = _scorecard.get("high_score_coverage_cells", 0)
+
+    st.subheader("质量评分")
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.metric(
+        "红线通过",
+        f"{_rl_cells}/{_total}",
+        delta=None if _rl_rate >= 1.0 else f"{_total - _rl_cells} 个格子有硬伤",
+        delta_color="off" if _rl_rate >= 1.0 else "inverse",
+        help="命中即废稿的硬伤：AI 空话黑名单 / 寒暄开场 / 列表体正文 / 跨格子首句撞车。"
+             "目标是 100%，没到就说明有格子不该出货。",
+    )
+    _c2.metric(
+        "高分篇",
+        f"{_hs}/{_total}",
+        help=f"高分层 6 项里拿到 {_scorecard.get('high_score_threshold', '5/6')} 且红线全过。"
+             "跨 run 对比看这个**绝对数**的变化（如 4/12 → 8/12），不看百分比——"
+             "把它当通过率优化会把爆款压成均值。",
+    )
+    _c3.metric(
+        "评分覆盖",
+        f"{_cov}/{_total}",
+        delta=None if _cov >= _total else "高分层数字不可比",
+        delta_color="off" if _cov >= _total else "inverse",
+        help="高分层 6 项全部测到的格子数。vibe_critic 故障或 resume 路径会让它掉下来——"
+             "这时高分篇数是被低估的，不要当成质量下降。",
+    )
+
+    _tally = _scorecard.get("redline_violation_tally") or {}
+    if _tally:
+        _RULE_LABEL = {
+            "ai_cliche": "AI 空话黑名单",
+            "banned_opening": "寒暄式开场",
+            "list_body": "列表体正文",
+            "duplicate_opening": "跨格子首句撞车",
+            "demo_missing": "demo 为空",
+        }
+        st.caption(
+            "红线违规分布：　"
+            + "　·　".join(
+                f"{_RULE_LABEL.get(k, k)} {v}" for k, v in sorted(
+                    _tally.items(), key=lambda kv: -kv[1]
+                )
+            )
+        )
+
+    # 「味道对但踩了硬伤」的格子单独提出来 —— 这类修复性价比最高，
+    # 改掉一条红线就能进高分篇。
+    _blocked = [
+        pc for pc in (_scorecard.get("per_cell") or [])
+        if pc.get("high_score_blocked_by_redline")
+    ]
+    if _blocked:
+        st.info(
+            f"有 {len(_blocked)} 个格子高分层已达标、只差红线："
+            + "、".join(pc.get("cell_id", "?") for pc in _blocked)
+            + "　—— 这几个改掉红线就能进高分篇，是修复性价比最高的。"
+        )
+
+    with st.expander(f"逐格子明细（{_total} 个）", expanded=False):
+        for _pc in (_scorecard.get("per_cell") or []):
+            _mark = "★" if _pc.get("is_high_score") else (
+                "⚠" if _pc.get("high_score_blocked_by_redline") else "·"
+            )
+            _rl = "✓" if _pc.get("redline_pass") else "✗"
+            st.markdown(
+                f"**{_mark} {_pc.get('cell_id', '?')}**　"
+                f"`{_pc.get('platform', '')}`　"
+                f"红线 {_rl}　高分层 {_pc.get('high_score_earned', 0)}"
+                f"/{_pc.get('high_score_scored', 0)}　"
+                f"范式 {_pc.get('paradigm', '?')}"
+            )
+            for _v in (_pc.get("redline_violations") or []):
+                st.caption(f"　　✗ {_v.get('detail', '')}")
+            if _pc.get("craft_missing"):
+                st.caption(f"　　缺工艺要素：{'、'.join(_pc['craft_missing'])}")
+
 # ── Stage Details ──────────────────────────────────────────────────────────
 
 st.divider()

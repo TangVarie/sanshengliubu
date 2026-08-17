@@ -193,6 +193,150 @@ TV 新增 vendor 时**记得同步过来**,否则该 vendor 的 token 在 ssll �
 
 ---
 
+## 5. 质量评分:双层评分体系去哪里查
+
+`pipeline/quality_metrics.py` 在出货前(`orchestrator.run()` 第 6.97 步,
+`save_output` 之前)给最终 `prompt_matrix` 打一次分,落 `stage_logs`
+(`stage_name='quality_score'`)。
+
+### 为什么加这一层
+
+在此之前本仓库**只有输入侧遥测**。R-022 飞轮 audit 追的是"数据库样本有没有
+被用上",没有任何东西回答得了"这一版产出比上一版好吗"。后果是改提示词全凭
+手感:改完 `works_builder.md` 跑一条 run,觉得 demo 看着顺眼就当改对了 ——
+样本量 1,还是被红蓝 + 网感重写打磨过 3 轮的那 1 篇。
+
+### 零 LLM 成本
+
+- **红线层** — 纯 Python 确定性判定,不调模型
+- **高分层** — 从 `vibe_critic` 已产出的 `cell_reviews` 里提取
+  (`multiplier_gate` 四项 + `template_test`),不重复判
+
+`vibe_loop` 跨轮次把 `cell_reviews` 按 cell_id 累积到
+`final_system._vibe_cell_reviews`。这一步是必需的:round 2+ 只复检被改写过的
+cell,单看最后一轮的 `critic_result` 会漏掉 round 1 就通过的那些格子。
+
+### 两个数字的读法不同(最容易被改错的地方)
+
+| 层 | 指标 | 目标 | 思维 |
+|----|------|------|------|
+| 红线层 | 通过率 % | **100%** | hill-climbing,零容忍尾部失败 |
+| 高分层 | 高分篇**绝对数** | 翻倍(如 4/12 → 8/12) | 上限思维,保方差 |
+
+高分层**有意不提供 `high_score_rate` 字段**。把它当 pass rate 优化会触发:
+mutation 倾向"消除尾部低分篇" → 分布向均值收窄 → 把 60 分拉到 75 分的同时
+把 95 分压到 85 分 → 方差消失 → 爆款消失。而小红书内容价值分布极度长尾,
+100 篇里 5 篇爆款的价值远大于 100 篇都 85 分。
+
+另外三条设计约束,改动时不要破坏:
+
+1. **红线是准入,高分是排名。** 有红线违规的 cell 一律不进高分篇计数,哪怕
+   高分层拿满 6 项。这类格子单独标 `high_score_blocked_by_redline` ——
+   它们是修复性价比最高的。
+2. **红线层只收"命中即死"型判定(黑名单)。** "应存在"型检查(必须有 X)一律
+   放高分层。理由见 v0.32.3 / v0.32.4 两次事故:那两次都是"应存在"型检查
+   误判导致批次重试 + 单 cell 重试的三轮空烧。黑名单的假阳性率天然低,
+   "应存在"的假阴性率天然高。
+3. **工艺四要素按 paradigm 分流。** 「具体性四要素」是 `works_builder.md`
+   写在**范式 A 专用**段下的;范式 B(元评论应答体)靠术语锚和结构建立信任。
+   拿 A 的尺子量 B 会系统性低估所有 B 格子 —— 实测 `foundation.md` 里那条
+   被当范例的真实洗洁精爆款,按 A 判会缺 3 项。
+
+### 词表同步义务
+
+`AI_CLICHE_BLACKLIST` / `BANNED_OPENING_PREFIXES` 是提示词里几处禁用清单的
+shadow copy,和第 4 节 `_SECRET_PATTERNS` 与 truth-vault 的对齐是同一个模式。
+同源出处:
+
+- `vibe_critic.md` 第 0.5 步「AI 空话硬否决」黑名单
+- `works_builder.md` 范式 A (a)(c) + 范式 B「反 AI 腔禁用清单」
+- `foundation.md`「反面教材——这些都是伪网感」
+
+**改一边要同步另一边**,否则评分标准和提示词要求会悄悄分叉:分数还在涨,
+产出已经不按新规矩走了。
+
+### SQL 自检模板
+
+```sql
+-- 最近 20 条 run 的分数曲线(这是判断"改动有没有用"的主视图)
+SELECT
+    pr.project_id,
+    sl.created_at,
+    sl.output_data->>'total_cells'               AS cells,
+    sl.output_data->>'redline_pass_cells'        AS redline_ok,
+    (sl.output_data->>'redline_pass_rate')::float AS redline_rate,
+    sl.output_data->>'high_score_cells'          AS high_score,
+    sl.output_data->>'high_score_coverage_cells' AS covered,
+    sl.output_data->'redline_violation_tally'    AS violations
+FROM stage_logs sl
+JOIN pipeline_runs pr ON sl.run_id = pr.id
+WHERE sl.stage_name = 'quality_score'
+ORDER BY sl.created_at DESC
+LIMIT 20;
+
+-- 红线违规按类型排行(过去 30 天)——告诉你该先修哪条规则
+SELECT
+    v.key   AS rule,
+    SUM(v.value::int) AS hits,
+    COUNT(DISTINCT sl.run_id) AS runs_affected
+FROM stage_logs sl,
+     LATERAL jsonb_each(sl.output_data->'redline_violation_tally') v
+WHERE sl.stage_name = 'quality_score'
+  AND sl.created_at > NOW() - INTERVAL '30 days'
+GROUP BY v.key
+ORDER BY hits DESC;
+
+-- 高分篇数的周趋势。⚠️ 只在 covered = cells 的 run 之间比较 ——
+-- 覆盖不满说明 critic 没测全,那条 run 的高分篇数是被低估的,混进来会污染曲线。
+SELECT
+    DATE_TRUNC('week', sl.created_at)::date AS week,
+    COUNT(*)                                 AS runs,
+    SUM((sl.output_data->>'high_score_cells')::int) AS high_score_cells,
+    SUM((sl.output_data->>'total_cells')::int)      AS total_cells
+FROM stage_logs sl
+WHERE sl.stage_name = 'quality_score'
+  AND (sl.output_data->>'high_score_coverage_cells')::int
+      = (sl.output_data->>'total_cells')::int
+GROUP BY week
+ORDER BY week DESC;
+```
+
+### 字段 schema (落库 output_data)
+
+```jsonc
+{
+  "total_cells": 12,
+  "redline_pass_cells": 10,
+  "redline_pass_rate": 0.8333,
+  "redline_violation_tally": {"ai_cliche": 3, "duplicate_opening": 2},
+  "high_score_cells": 5,              // 绝对数,不提供 rate(见上)
+  "high_score_threshold": "5/6",
+  "high_score_coverage_cells": 12,    // 高分层测全的格子数
+  "per_cell": [
+    {
+      "cell_id": "D1_xiaohongshu",
+      "platform": "小红书",
+      "direction_id": "D1",
+      "redline_violations": [{"rule": "ai_cliche", "hit": "性价比高", "detail": "..."}],
+      "redline_pass": false,
+      "high_score_items": {            // true / false / null(=没测)
+        "reward_signal": true, "interest_align": true,
+        "gap_tension": true, "identity_consistency": true,
+        "template_test": true, "craft": false
+      },
+      "high_score_earned": 5,
+      "high_score_scored": 6,
+      "is_high_score": false,
+      "high_score_blocked_by_redline": true,   // 味道对但踩了硬伤 = 优先修
+      "craft_missing": ["具体情绪反应"],
+      "paradigm": "A_emotional_hook"
+    }
+  ]
+}
+```
+
+---
+
 ## 后续 sprint backlog (audit 2026-05-22 未实施项)
 
 | ID | 主题 | 工时 | 触发条件 |

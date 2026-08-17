@@ -61,6 +61,7 @@ from pipeline.retrieve_samples import (
     summarize_packs_by_platform,
 )
 from pipeline.logger_utils import mask_secrets
+from pipeline.quality_metrics import persist_quality_score, score_matrix
 from pipeline.agents.socialdatax_trend_scout import (
     format_trend_intel_for_prompt,
     run_trend_scout,
@@ -134,6 +135,12 @@ class PipelineOrchestrator:
         # 这个 agent 调用会报 RuntimeError,_run_persona_simulation 会软降级
         # 只用 Claude 系结果。
         self.persona_simulator_alt = PersonaSimulatorAlt()
+
+        # vibe_loop 跨轮次累积的 cell_reviews(cell_id -> 最后一次评审)。
+        # 质量评分的高分层数据源。刻意不挂在 final_system 上 —— 那个 dict
+        # 会被整体透传给 chancellery_final(kimi-k3),挂上去就是白烧输入。
+        # 详见 _run_vibe_loop 里的累积点注释。
+        self._vibe_cell_reviews: dict[str, dict] = {}
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
@@ -713,6 +720,30 @@ class PipelineOrchestrator:
                     "output_content": _demo_txt,
                 })
             final_system["demo_outputs"] = _rebuilt_demos
+
+            # 6.97 质量评分(双层评分体系)。跑在这里是有意的:此时 prompt_matrix
+            # 已经过全部精炼阶段(红蓝 / 网感重写 / 结构补漏 / 策略升级),
+            # 打的分就是**真正出货的那一版**的分,而不是中间态。
+            #
+            # 零 LLM 成本:红线层是纯 Python 判定,高分层读 vibe_loop 累积的
+            # _vibe_cell_reviews。落库失败不阻塞(见 persist_quality_score)。
+            #
+            # 这是本仓库第一个**输出侧**的质量度量。在此之前只有输入侧遥测
+            # (R-022 飞轮 audit 追"样本有没有被用上"),没有任何东西回答得了
+            # "这一版比上一版好吗"。跨 run 对比的 SQL 见 docs/architecture.md 第 5 节。
+            try:
+                _scorecard = score_matrix(
+                    final_system.get("prompt_matrix") or [],
+                    getattr(self, "_vibe_cell_reviews", None) or {},
+                )
+                final_system["_quality_score"] = _scorecard
+                persist_quality_score(self.db, self.run_id, _scorecard)
+            except Exception:
+                # 评分器本身抛异常也不能把一条跑完的 run 判死 —— 它是可观测性,
+                # 不是硬不变量。和 _persist_audit_findings 同一个原则。
+                logger.exception(
+                    "[quality_score] 评分计算失败(non-fatal),继续出货"
+                )
 
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
@@ -3203,6 +3234,24 @@ class PipelineOrchestrator:
                     ),
                 })
                 break
+
+            # 跨轮次累积 cell_reviews。round 2+ 只复检被改写过的 cell(见上面
+            # cells_to_critique 的分支),所以最后一轮的 critic_result 里只有
+            # 那几个 cell —— round 1 就通过、之后再没被评过的 cell 完全不在
+            # 里面。质量评分要的是**每个 cell 最后一次评审**的全集,这里按
+            # cell_id 覆盖累积:后一轮的评审自然盖掉前一轮的。
+            # 纯读已有输出,零额外 LLM 成本。
+            #
+            # ⚠️ 存在 self 上而不是 final_system 上,这是有意的:
+            # chancellery_final 的输入是 `{"prompt_system": final_system}`
+            # 整体透传(见 agents/chancellery.py::run_final_review),挂到
+            # final_system 等于给全流水线最贵的那个 stage(kimi-k3 $3/$15)
+            # 白加十几 KB 输入换零收益。评分在终审之后才跑,存 self 完全够用。
+            # 策略升级会二次调用 _run_vibe_loop,共用同一个 self,累积正确。
+            for _rv in (critic_result.get("cell_reviews") or []):
+                _rv_cid = _rv.get("cell_id")
+                if _rv_cid:
+                    self._vibe_cell_reviews[_rv_cid] = _rv
 
             failed = critic_result.get("failed_cells", []) or []
             # Fail-CLOSED cross-check. vibe_critic.md 的契约:failed_cells 必须
