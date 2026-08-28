@@ -171,6 +171,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # 轮询队列每 5 秒一条 httpx INFO,把真正有用的日志淹没掉。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     # 日志脱敏必须先装(与 app.py 同一道防线):worker 的 stdout 会进
     # Railway 日志,traceback 里的 key/token 一样要剥。
     from pipeline.logger_utils import install_secret_masking_on_root_logger

@@ -121,6 +121,7 @@ def _estimate_cost_usd(input_tokens: int, output_tokens: int, model: str) -> flo
 _IMAGE_MAX_EDGE = 1568
 _IMAGE_JPEG_QUALITY = 85
 _IMAGE_SHRINK_THRESHOLD_BYTES = 400 * 1024  # 小于 400KB 的小图不折腾
+_PILLOW_MISSING_WARNED = False
 
 
 def _shrink_image(raw: bytes, mime: str) -> tuple[bytes, str]:
@@ -131,6 +132,15 @@ def _shrink_image(raw: bytes, mime: str) -> tuple[bytes, str]:
         import io
         from PIL import Image
     except Exception:
+        # 软依赖的代价是缺席不可见 —— 至少在日志里喊一次,不然
+        # "怎么图没被压"要靠猜(2026-08-28 排障实录)。
+        global _PILLOW_MISSING_WARNED
+        if not _PILLOW_MISSING_WARNED:
+            _PILLOW_MISSING_WARNED = True
+            logger.warning(
+                "[kimi_client] Pillow 不可用,图片将按原尺寸发送 —— "
+                "确认 requirements 里的 pillow 已安装"
+            )
         return raw, mime  # 无 Pillow:原样发送
     try:
         img = Image.open(io.BytesIO(raw))
@@ -303,7 +313,7 @@ def _call_kimi_raw(
 
     content = _build_content(user_message, images)
 
-    def _do_call():
+    def _do_request():
         # 辅助层多数在用户同步等待的路径上跑(上传转写/截图分析),不能沿用
         # client 构造时的 900s 主链路超时 —— 端点不可达时页面会冻死一刻钟。
         # per-request 覆盖成 KIMI_ASSIST_TIMEOUT_SECONDS,挂死快速失败降级。
@@ -314,6 +324,30 @@ def _call_kimi_raw(
             messages=[{"role": "user", "content": content}],
             timeout=KIMI_ASSIST_TIMEOUT_SECONDS,
         )
+
+    def _do_call():
+        # httpx 的 timeout 是【分阶段】的(connect/read/write 各自计时):
+        # 上行"缓慢滴灌"时每次 write 都成功,分阶段超时永远不触发,单次
+        # 尝试可以无限拖(实测海外→api.moonshot.cn 上行仅 ~150KB/s,大请求
+        # 正是这个形态)。这里再包一层【墙钟硬上限】:到点放弃本次尝试,
+        # 把被挂住的线程留给底层 socket 超时自然回收。
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as _FutTimeout
+
+        _deadline = KIMI_ASSIST_TIMEOUT_SECONDS + 60.0
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(_do_request)
+            try:
+                return fut.result(timeout=_deadline)
+            except _FutTimeout:
+                raise TimeoutError(
+                    f"assist 调用超过墙钟硬上限 {_deadline:.0f}s(request "
+                    f"timeout/timed out —— 多为上行过慢或端点无响应)"
+                )
+        finally:
+            # 不等在途线程(wait=True 会把硬上限变回软的)。
+            pool.shutdown(wait=False)
 
     try:
         from pipeline.llm_retry import call_with_retry
