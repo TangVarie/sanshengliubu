@@ -38,3 +38,8 @@ openai>=1.40.0,<2.0.0
 # Floor at 1.9.4: earlier 1.9.x required datetime.timedelta timeouts (we pass
 # timedelta anyway, belt-and-braces) and had streamable-HTTP fixes.
 mcp>=1.9.4,<2.0.0
+
+# 图片降采样(发送给视觉模型前把 1-2MB 手机截图压到 100-300KB,防止
+# 多图打包请求在慢线路上传不完 —— 见 pipeline/agents/kimi_client.py::_shrink_image)。
+# 软依赖:缺席时原图发送,功能不断。
+pillow>=10.0.0,<12.0.0
