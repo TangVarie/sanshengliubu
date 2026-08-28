@@ -24,7 +24,10 @@ except Exception as e:
 # If no project specified, show project selector
 if not project_id:
     projects = db.list_projects(limit=50)
-    completed = [p for p in projects if p["status"] == "completed"]
+    # needs_revision 的项目也已有(待修订的)产出,一并可选(COR-006)。
+    completed = [
+        p for p in projects if p["status"] in ("completed", "needs_revision")
+    ]
     if not completed:
         st.info("暂无已完成的项目。")
         st.stop()
@@ -48,6 +51,14 @@ prompt_system = output_data.get("prompt_system", {})
 final_review = output_data.get("final_review", {})
 
 st.subheader(f"{project['name']}")
+
+# 审计 COR-006:needs_revision 的 run 也保存了(待修订的)产出,现在能在
+# 这里看到 —— 但必须明确标注,避免把待修订稿当已批准的终稿直接交付。
+if output_data.get("_run_status") == "needs_revision":
+    st.warning(
+        "⚠️ 当前展示的是**待修订版本**:终审未通过,产出已保存供检查,"
+        "但尚未按终审意见修订。可回到「流水线详情」页应用修订意见后重跑。"
+    )
 
 # v0.30.0: 成品清单(顶层主视图)— 用户反馈"看不懂分类",这一块用最简
 # 形式回答"产出了什么":几个不重复的 prompt + 每个的内容 + 示例输出。

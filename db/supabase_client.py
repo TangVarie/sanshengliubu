@@ -398,6 +398,7 @@ class SupabaseClient:
         that a stage is slow or the user is slow to answer.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        cutoff_iso = cutoff.isoformat()
         reaped = 0
         for run in self.get_reapable_runs():
             ts = _parse_ts(
@@ -412,11 +413,59 @@ class SupabaseClient:
                 continue
             _was_paused = run.get("status") == "paused_for_review"
             try:
-                self.update_pipeline_run(
-                    rid, status="failed", completed_at=_now()
-                )
-                if run.get("project_id"):
-                    self.update_project(run["project_id"], status="failed")
+                # 审计 COR-002:收割改为数据库侧**条件 UPDATE**,只在
+                # 「status 仍是 reapable 且心跳仍然过期/仍然缺失」时才生效,
+                # 消除读后写 TOCTOU。在 get_reapable_runs 读取之后、这里写入
+                # 之前,若活线程刷新了心跳、或该行已被 resume/别处终结,条件
+                # 匹配不到任何行 —— 直接放过,不再误杀。
+                def _reap_run():
+                    q = (
+                        self.client.table("pipeline_runs")
+                        .update({"status": "failed", "completed_at": _now()})
+                        .eq("id", rid)
+                        .in_("status", list(self._REAPABLE_STATUSES))
+                    )
+                    if run.get("heartbeat_at"):
+                        q = q.lt("heartbeat_at", cutoff_iso)
+                    else:
+                        # 老行本无心跳:条件退化为"此刻仍无心跳"。若期间
+                        # 心跳出现了(进程其实活着),IS NULL 不成立,不收割。
+                        q = q.is_("heartbeat_at", "null")
+                    return q.execute()
+
+                resp = _with_write_retry(_reap_run)
+                if not (getattr(resp, "data", None) or []):
+                    # 条件没命中 = run 还活着或已被别处终结,跳过。
+                    continue
+
+                pid = run.get("project_id")
+                if pid:
+                    # 项目状态调和(审计 COR-002 后半):旧逻辑无条件把项目写
+                    # failed,会把"同项目新 run 正在使用/已完成"的项目状态
+                    # 盖掉。现在只在该项目已无其他活跃 run、且项目自身仍处
+                    # running/paused 时才落 failed。
+                    try:
+                        _others = (
+                            self.client.table("pipeline_runs")
+                            .select("id")
+                            .eq("project_id", pid)
+                            .in_("status", list(self._REAPABLE_STATUSES))
+                            .neq("id", rid)
+                            .limit(1)
+                            .execute()
+                        )
+                        if not (_others.data or []):
+                            (
+                                self.client.table("projects")
+                                .update({"status": "failed", "updated_at": _now()})
+                                .eq("id", pid)
+                                .in_("status", ["running", "paused_for_review"])
+                                .execute()
+                            )
+                    except Exception as _pe:
+                        logger.warning(
+                            "[reap] project reconcile failed for %s: %r", pid, _pe
+                        )
                 log = self.create_stage_log(
                     rid, "_pipeline_error", {"reaped_at": _now()}
                 )
@@ -634,29 +683,53 @@ class SupabaseClient:
     # ── Outputs ────────────────────────────────────────────────────────
 
     def save_output(self, run_id: str, prompt_system: dict, final_review: dict, version: int = 1) -> dict:
-        # Revision reruns REUSE the same run_id (revise_and_resume only deletes
-        # downstream stage_logs, never the outputs row) and reach save_output
-        # again. outputs(run_id) is NOT unique, so a plain insert left TWO rows
-        # for one run_id — and get_output returned data[0] with no ordering, so
-        # the STALE pre-revision output could win and the user would never see
-        # the revised result (silent data loss). Delete any prior row for this
-        # run_id first so exactly one (latest) row survives. Wrapped in
-        # write-retry: this is the heaviest write in the pipeline (full
-        # prompt_system jsonb) and a transient httpx blip must not fail the run.
+        # Revision reruns REUSE the same run_id and reach save_output again.
+        # 审计 COR-007:老实现用 delete→insert 两个独立请求模拟 upsert,
+        # delete 提交后 insert 失败的窗口会把该 run 唯一的产出永久清空;
+        # 并发写还会互删竞写。改为单条原子 upsert(on_conflict=run_id),
+        # 依赖 outputs(run_id) 的唯一索引(migration 003/006;fresh schema
+        # 也已改为 UNIQUE)。Wrapped in write-retry: this is the heaviest
+        # write in the pipeline (full prompt_system jsonb).
+        row = {
+            "run_id": run_id,
+            "prompt_system": prompt_system,
+            "final_review": final_review,
+            "version": version,
+        }
+
         def _do():
-            self.client.table("outputs").delete().eq("run_id", run_id).execute()
             resp = (
                 self.client.table("outputs")
-                .insert({
-                    "run_id": run_id,
-                    "prompt_system": prompt_system,
-                    "final_review": final_review,
-                    "version": version,
-                })
+                .upsert(row, on_conflict="run_id")
                 .execute()
             )
-            return _first_row(resp, op="insert", table="outputs")
-        return _with_write_retry(_do)
+            return _first_row(resp, op="upsert", table="outputs")
+
+        try:
+            return _with_write_retry(_do)
+        except Exception as e:
+            # 数据库还没有 outputs(run_id) 唯一约束时(只跑了老 schema、没跑
+            # migration 003/006),ON CONFLICT 会报 42P10。退回 legacy
+            # delete+insert 保证功能可用,并大声提示补迁移 —— 但这条路径
+            # 存在 COR-007 描述的丢失窗口,不该长期停留。
+            if "42P10" not in str(e) and "ON CONFLICT" not in str(e).upper():
+                raise
+            logger.error(
+                "[save_output] outputs(run_id) 缺唯一约束,已退回非原子的 "
+                "delete+insert。请执行 db/migrations/006_outputs_unique_and_"
+                "reference_note_id.sql 补齐唯一索引!"
+            )
+
+            def _legacy():
+                self.client.table("outputs").delete().eq(
+                    "run_id", run_id
+                ).execute()
+                resp = (
+                    self.client.table("outputs").insert(row).execute()
+                )
+                return _first_row(resp, op="insert", table="outputs")
+
+            return _with_write_retry(_legacy)
 
     def get_output(self, run_id: str) -> dict | None:
         # order+limit is defensive: even if legacy duplicate rows exist for a
@@ -824,16 +897,22 @@ class SupabaseClient:
     # ── Outputs ────────────────────────────────────────────────────
 
     def get_latest_output_for_project(self, project_id: str) -> dict | None:
+        # 审计 COR-006:needs_revision 的 run 在状态落库前就已保存了(待修订
+        # 的)output,老查询只认 status=completed —— 产出中心看不到当前待修订
+        # 稿,项目里若有旧 completed run 还会静默回显旧版本。改为扫最新几条
+        # 终态 run,取第一条真有 output 的,并把 run 状态带回给 UI 标注。
         resp = (
             self.client.table("pipeline_runs")
-            .select("id")
+            .select("id,status,created_at")
             .eq("project_id", project_id)
-            .eq("status", "completed")
+            .in_("status", ["completed", "needs_revision"])
             .order("created_at", desc=True)
-            .limit(1)
+            .limit(5)
             .execute()
         )
-        if not resp.data:
-            return None
-        run_id = resp.data[0]["id"]
-        return self.get_output(run_id)
+        for row in resp.data or []:
+            out = self.get_output(row["id"])
+            if out:
+                out["_run_status"] = row.get("status")
+                return out
+        return None

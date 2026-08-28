@@ -2062,37 +2062,11 @@ if status not in ("running",):
             key="supp_rerun_stage",
         )
 
-        # Downstream stage names for deletion. Order matters — we delete
-        # everything at and below the selected stage. 必须和 orchestrator
-        # 实际跑的阶段全集对齐,否则上一轮的 stage_log 会残留,UI 把它们
-        # 染色成"已完成/失败",误导用户以为部分阶段没重跑。
-        #
-        # v0.29.6: 补漏 — narrative_director / red_blue_refiner /
-        # persona_simulator / structural_rewriter 四个阶段之前没列进来,
-        # 用户反馈"补完重跑后叙事导演 + 红蓝 + 画像还带颜色"就是这个 bug。
-        _stage_order = [
-            "crown_prince",
-            "gemini_reference_analyzer",
-            "gemini_trend_scout_pre",
-            "secretariat",
-            "chancellery_1", "chancellery_2", "chancellery_3",
-            "dispatcher",
-            "ministry_personnel", "ministry_revenue", "ministry_rites",
-            "ministry_war", "ministry_justice",
-            "ministry_works",
-            "ministry_works_cell_planner",
-            "ministry_works_builder",
-            # v0.29.6 补:cross-cell + 精炼 + 画像 + 结构审
-            "narrative_director",
-            "red_blue_refiner",
-            "persona_simulator",
-            "ministry_works_structure_review",
-            "vibe_critic",
-            "vibe_rewriter",
-            # v0.29.6 补:结构手术(v0.29.0 新 agent,和 vibe_rewriter 并列)
-            "structural_rewriter",
-            "chancellery_final",
-        ]
+        # 删除清单不再在本页维护(审计 COR-005)。历史上这里有一份手工副本,
+        # 漏了精炼层断点快照(_matrix_ckpt_refined_a/b/c 等 9 个标记)和
+        # red_blue_red/blue 等新 stage 名 —— 结果「追加并重跑」后 run() 的
+        # 恢复分支拿旧矩阵快照盖掉新 builder 结果、跳过整条精炼链,补充信息
+        # 静默失效。现在统一调 orchestrator.compute_stages_to_invalidate。
 
         if st.button(
             "追加并重跑",
@@ -2144,56 +2118,19 @@ if status not in ("running",):
                         brief=_brief_update,
                     )
 
-                    # 2. Delete stage_logs from selected stage downward
-                    _idx = (
-                        _stage_order.index(_selected_stage)
-                        if _selected_stage in _stage_order
-                        else 0
+                    # 2. Delete stage_logs from selected stage downward —
+                    # 清单由 orchestrator 统一计算(含精炼层断点快照、
+                    # strategy_debate_N / gemini_trend_scout_post_* 动态名),
+                    # 本页不再自维护副本(审计 COR-005)。
+                    from pipeline.orchestrator import (
+                        compute_stages_to_invalidate,
                     )
-                    _to_delete = set(_stage_order[_idx:])
-
-                    # v0.29.7: 中书省 + 门下省实际以 strategy_debate_{turn}
-                    # 命名(多轮辩论,每轮一条 stage_log),不是 "secretariat"
-                    # 或 "chancellery_1..3"。之前 _stage_order 里的那些名字
-                    # 其实从不存在于 DB,所以上轮这些 debate log 永远删不掉,
-                    # UI 把 中书省+门下省 染成绿色。
-                    # MAX_DEBATE_TURNS 默认 8,这里给 20 的 buffer 防未来涨。
-                    if "secretariat" in _to_delete:
-                        _to_delete.update(
-                            f"strategy_debate_{i}" for i in range(20)
-                        )
-
-                    # Legacy chancellery_1..3 naming(debate 之前的老版本),
-                    # 保留以清理历史 run 的残留。
-                    _to_delete.update(f"chancellery_{i}" for i in range(1, 10))
-
-                    # v0.29.7: gemini_trend_scout_post_{direction_id} 是动态名
-                    # (每个 direction 一条),不在 _stage_order 里。delete 用
-                    # exact match,无法前缀匹配,所以要查一遍 run 的所有 log
-                    # 名字,把 post_* 都挑出来塞进 _to_delete。
-                    # 只有当 chancellery_final 及之前的阶段要重跑时,post 才
-                    # 需要跟着删(它在 final 之后才触发)。
-                    if "chancellery_final" in _to_delete:
-                        try:
-                            _all_logs = db.get_stage_logs(run_id) or []
-                            _to_delete.update(
-                                l.get("stage_name", "")
-                                for l in _all_logs
-                                if (l.get("stage_name") or "")
-                                   .startswith("gemini_trend_scout_post_")
-                            )
-                        except Exception:
-                            # 非致命:拿不到也只是 post 残留不影响主流程
-                            pass
-
-                    # 前置 advisory 阶段依附 crown_prince,crown_prince 重跑时
-                    # 它们也要删(之前就有逻辑,保留)。
-                    for _gs in ("gemini_trend_scout_pre", "gemini_reference_analyzer"):
-                        if _gs in _stage_order and _idx <= _stage_order.index(_gs):
-                            _to_delete.add(_gs)
+                    _to_delete = compute_stages_to_invalidate(
+                        _selected_stage, run_id, db
+                    )
 
                     _deleted = db.delete_stage_logs_by_names(
-                        run_id, sorted(_to_delete)
+                        run_id, _to_delete
                     )
 
                     # Reset project status so resume is allowed. "failed" is
