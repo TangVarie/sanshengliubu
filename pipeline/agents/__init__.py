@@ -43,6 +43,7 @@ from pipeline.config import (
     THINKING_STAGES,
 )
 from pipeline.logger_utils import mask_secrets
+from utils.secrets_compat import get_secret, has_secret
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
@@ -361,7 +362,7 @@ def _list_claude_relay_presets() -> dict[str, dict]:
     — keeps backward compat with secrets.toml files written before the
     multi-preset feature.
     """
-    raw = st.secrets.get("claude_relay_presets")
+    raw = get_secret("claude_relay_presets")
     presets: dict[str, dict] = {}
     if raw:
         for name, cfg in dict(raw).items():
@@ -373,12 +374,12 @@ def _list_claude_relay_presets() -> dict[str, dict]:
         # wrap their top-level ANTHROPIC_API_KEY into a synthetic preset
         # so the rest of the plumbing (init_api_config / settings page)
         # has a uniform structure to work with.
-        legacy_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        legacy_key = get_secret("ANTHROPIC_API_KEY", "")
         if legacy_key:
             presets["default"] = {
                 "label": "默认（来自顶层 ANTHROPIC_API_KEY）",
                 "api_key": legacy_key,
-                "base_url": st.secrets.get("ANTHROPIC_BASE_URL", ""),
+                "base_url": get_secret("ANTHROPIC_BASE_URL", ""),
                 "rpm_limit": None,  # use global defaults
                 "max_concurrent": None,
                 "supports_cache": None,  # use ENABLE_PROMPT_CACHING
@@ -415,7 +416,7 @@ def get_active_claude_relay_name() -> str:
     presets = _list_claude_relay_presets()
     if not presets:
         return ""
-    default = st.secrets.get("ACTIVE_CLAUDE_RELAY", "")
+    default = get_secret("ACTIVE_CLAUDE_RELAY", "")
     if default and default in presets:
         return str(default)
     return next(iter(presets.keys()))
@@ -443,12 +444,12 @@ def init_api_config():
     # 国内站 api.moonshot.cn 和国际站 api.moonshot.ai 是两套独立账号体系,
     # key 不通用。默认走国内站;要换国际站就在 secrets.toml 里设
     # MOONSHOT_BASE_URL = "https://api.moonshot.ai/anthropic"。
-    _kimi_key = (st.secrets.get("MOONSHOT_API_KEY") or "").strip()
+    _kimi_key = (get_secret("MOONSHOT_API_KEY") or "").strip()
     if _kimi_key:
         _api_config["kimi"] = {
             "api_key": _kimi_key,
             "base_url": (
-                st.secrets.get("MOONSHOT_BASE_URL")
+                get_secret("MOONSHOT_BASE_URL")
                 or "https://api.moonshot.cn/anthropic"
             ).rstrip("/"),
         }
@@ -460,12 +461,12 @@ def init_api_config():
     else:
         _api_config.pop("kimi", None)
 
-    _ds_key = (st.secrets.get("DEEPSEEK_API_KEY") or "").strip()
+    _ds_key = (get_secret("DEEPSEEK_API_KEY") or "").strip()
     if _ds_key:
         _api_config["deepseek"] = {
             "api_key": _ds_key,
             "base_url": (
-                st.secrets.get("DEEPSEEK_BASE_URL")
+                get_secret("DEEPSEEK_BASE_URL")
                 or "https://api.deepseek.com/anthropic"
             ).rstrip("/"),
         }
@@ -477,12 +478,12 @@ def init_api_config():
     else:
         _api_config.pop("deepseek", None)
 
-    _ve_key = (st.secrets.get("VECTORENGINE_API_KEY") or "").strip()
+    _ve_key = (get_secret("VECTORENGINE_API_KEY") or "").strip()
     if _ve_key:
         _api_config["vectorengine"] = {
             "api_key": _ve_key,
             "base_url": (
-                st.secrets.get("VECTORENGINE_BASE_URL")
+                get_secret("VECTORENGINE_BASE_URL")
                 or "https://api.vectorengine.ai/v1"
             ).rstrip("/"),
         }
@@ -495,15 +496,15 @@ def init_api_config():
         _api_config.pop("vectorengine", None)
 
     # Vertex AI mode
-    if st.secrets.get("GCP_PROJECT_ID"):
+    if get_secret("GCP_PROJECT_ID"):
         _api_config["mode"] = "vertex"
-        _api_config["project_id"] = st.secrets["GCP_PROJECT_ID"]
-        _api_config["region"] = st.secrets.get("GCP_REGION", "us-east5")
+        _api_config["project_id"] = get_secret("GCP_PROJECT_ID")
+        _api_config["region"] = get_secret("GCP_REGION", "us-east5")
 
         # Build credentials from service account JSON in secrets (for Streamlit Cloud)
-        if "gcp_service_account" in st.secrets:
+        if has_secret("gcp_service_account"):
             from google.oauth2 import service_account
-            sa_info = dict(st.secrets["gcp_service_account"])
+            sa_info = dict(get_secret("gcp_service_account") or {})
             credentials = service_account.Credentials.from_service_account_info(
                 sa_info,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],

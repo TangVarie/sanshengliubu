@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-import streamlit as st
 from supabase import create_client, Client
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from utils.secrets_compat import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +108,14 @@ class SupabaseClient:
         return cls._instance
 
     def __init__(self):
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+        # st.secrets 优先、环境变量兜底(worker 进程没有 secrets.toml)。
+        url = get_secret("SUPABASE_URL")
+        key = get_secret("SUPABASE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "缺少 SUPABASE_URL / SUPABASE_KEY —— 本地请配置 "
+                ".streamlit/secrets.toml,Railway/worker 请配置同名环境变量。"
+            )
         self.client: Client = create_client(url, key)
 
     # ── Projects ───────────────────────────────────────────────────────
@@ -184,13 +191,143 @@ class SupabaseClient:
 
     # ── Pipeline Runs ──────────────────────────────────────────────────
 
-    def create_pipeline_run(self, project_id: str) -> dict:
+    def create_pipeline_run(
+        self,
+        project_id: str,
+        *,
+        status: str = "running",
+        queued_action: str | None = None,
+    ) -> dict:
+        """创建 run。
+
+        thread 模式(默认):status='running',行为与历史一致。
+        worker 模式:status='pending' + queued_action('start'),由独立
+        worker 认领执行 —— 顺带修掉了「先建 running run 再 claim,claim
+        失败留孤儿 running」的老问题(审计 COR-009):pending 的 run 在被
+        worker 认领前对 reaper/UI 都不是"活任务"。
+        """
+        row: dict[str, Any] = {
+            "project_id": project_id,
+            "status": status,
+            "started_at": _now(),
+        }
+        if queued_action:
+            row["queued_action"] = queued_action
+        resp = self.client.table("pipeline_runs").insert(row).execute()
+        return _first_row(resp, op="insert", table="pipeline_runs")
+
+    # ── Worker 队列原语(pipeline_runs 即队列;见 worker/__main__.py)──
+
+    def get_pending_runs(self, limit: int = 10) -> list[dict]:
+        """按入队先后取待执行 run(status='pending')。"""
         resp = (
             self.client.table("pipeline_runs")
-            .insert({"project_id": project_id, "status": "running", "started_at": _now()})
+            .select("*")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(limit)
             .execute()
         )
-        return _first_row(resp, op="insert", table="pipeline_runs")
+        return resp.data or []
+
+    def try_claim_pending_run(self, run_id: str) -> bool:
+        """CAS 认领:pending→running + 刷新心跳。返回是否认领成功。
+
+        条件更新保证多 worker/取消并发下最多一个赢家;输家(或该 run 已被
+        force_cancel 置 failed)拿到空结果集,直接放弃。
+        """
+        def _do():
+            return (
+                self.client.table("pipeline_runs")
+                .update({
+                    "status": "running",
+                    "queued_action": None,
+                    "heartbeat_at": _now(),
+                    "completed_at": None,
+                })
+                .eq("id", run_id)
+                .eq("status", "pending")
+                .execute()
+            )
+        resp = _with_write_retry(_do)
+        return bool(getattr(resp, "data", None))
+
+    def try_enqueue_run(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        from_statuses: tuple[str, ...] = ("failed", "needs_revision"),
+    ) -> bool:
+        """CAS 入队:from_statuses→pending + queued_action。返回是否成功。
+
+        用于 worker 模式的「继续执行/追加重跑」:把可恢复终态的 run 重新
+        排队。已经 pending/running 的 run 条件不命中,天然防双击。
+        """
+        def _do():
+            return (
+                self.client.table("pipeline_runs")
+                .update({
+                    "status": "pending",
+                    "queued_action": action,
+                    "completed_at": None,
+                })
+                .eq("id", run_id)
+                .in_("status", list(from_statuses))
+                .execute()
+            )
+        resp = _with_write_retry(_do)
+        return bool(getattr(resp, "data", None))
+
+    def try_requeue_zombie_run(
+        self, run_id: str, cutoff_iso: str, *, from_status: str = "running"
+    ) -> bool:
+        """CAS 重排队一条疑似僵尸 run:仅当它仍处 from_status 且心跳仍早于
+        cutoff 时,置回 pending(queued_action='resume_preclaimed' ——
+        它生前已持有项目 claim,复活后不再重复抢占)。心跳在读写之间被
+        刷新(线程其实活着)则条件不命中,不误杀。"""
+        def _do():
+            return (
+                self.client.table("pipeline_runs")
+                .update({
+                    "status": "pending",
+                    "queued_action": "resume_preclaimed",
+                    "completed_at": None,
+                })
+                .eq("id", run_id)
+                .eq("status", from_status)
+                .lt("heartbeat_at", cutoff_iso)
+                .execute()
+            )
+        resp = _with_write_retry(_do)
+        return bool(getattr(resp, "data", None))
+
+    def try_unclaim_run(self, run_id: str, *, action: str) -> bool:
+        """CAS 放回队列:running→pending(+queued_action)。用于 worker
+        认领后项目锁竞争失败的回退;条件更新避免把已被 force_cancel 置
+        failed 的 run 复活成 pending。"""
+        def _do():
+            return (
+                self.client.table("pipeline_runs")
+                .update({"status": "pending", "queued_action": action})
+                .eq("id", run_id)
+                .eq("status", "running")
+                .execute()
+            )
+        resp = _with_write_retry(_do)
+        return bool(getattr(resp, "data", None))
+
+    def has_active_run(self, project_id: str) -> bool:
+        """项目当前是否已有排队/在跑的 run(worker 模式的入队前防重)。"""
+        resp = (
+            self.client.table("pipeline_runs")
+            .select("id")
+            .eq("project_id", project_id)
+            .in_("status", ["pending", "running"])
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
 
     def update_pipeline_run(self, run_id: str, **fields) -> dict:
         def _do():
