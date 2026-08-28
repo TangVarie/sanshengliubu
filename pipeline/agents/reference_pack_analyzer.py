@@ -35,6 +35,7 @@ from pipeline.agents import (
     BaseAgent,
     PROMPTS_DIR,
     _api_config,
+    get_client_for_model,
     init_api_config,
 )
 from pipeline.config import MODELS
@@ -128,17 +129,11 @@ def analyze_reference_pack(pack: dict) -> dict[str, Any]:
     # This is a one-shot cheap parsing task, not strategy — Sonnet is plenty.
     model = MODELS.get("ministry_works_builder") or "claude-sonnet-4-6"
 
-    # Build a minimal BaseAgent just to reuse its _get_client plumbing + the
-    # caching / retry infra. Give it a throwaway stage_name so stage_logs
-    # tagging is traceable if it ever does hit a real DB path.
-    _shim = BaseAgent.__new__(BaseAgent)
-    _shim.stage_name = "reference_pack_analyzer"
-    _shim.prompt_file = "reference_pack_analyzer.md"
-    _shim.model = model
-    _shim.max_tokens = 8000  # analysis rarely >3K tokens
-    _shim._use_thinking = False
-
-    client = _shim._get_client()
+    # 直接用模块级路由拿 client。此前这里用 BaseAgent.__new__ 造 shim 并给
+    # 只读 property `_use_thinking` 赋值,发 API 前必抛 AttributeError,
+    # 参考库 AI 分析整体不可用(审计 COR-001)。thinking 本来就按
+    # THINKING_STAGES 判定,本分析不在其中,无需任何覆盖。
+    client = get_client_for_model(model)
 
     # Wrap in the shared bounded-backoff retry so a transient 429/5xx/timeout
     # on the relay doesn't drop the pack into the failed bucket on the first

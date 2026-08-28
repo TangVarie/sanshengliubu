@@ -74,7 +74,17 @@ CREATE INDEX IF NOT EXISTS idx_stage_logs_stage ON stage_logs(stage_name);
 -- indexes above would still work but postgres prefers the composite for
 -- this exact query shape. Added in v0.10.0.
 CREATE INDEX IF NOT EXISTS idx_stage_logs_run_stage ON stage_logs(run_id, stage_name);
-CREATE INDEX IF NOT EXISTS idx_outputs_run ON outputs(run_id);
+-- outputs(run_id) 必须唯一(审计 COR-007/013):save_output 用原子
+-- upsert(on_conflict=run_id),一 run 一产出。老库若有历史重复行,先清掉
+-- (保留每个 run_id 最新一行)再建唯一索引;老的普通索引被唯一索引取代。
+DELETE FROM outputs o
+USING outputs o2
+WHERE o.run_id = o2.run_id
+  AND o.id <> o2.id
+  AND (o.created_at < o2.created_at
+       OR (o.created_at = o2.created_at AND o.id < o2.id));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outputs_run_id_unique ON outputs (run_id);
+DROP INDEX IF EXISTS idx_outputs_run;
 
 -- 参考爆文样本库
 CREATE TABLE IF NOT EXISTS reference_samples (
@@ -100,10 +110,22 @@ CREATE TABLE IF NOT EXISTS reference_samples (
 );
 
 -- ⚠ schema.sql 升级路径补丁:CREATE TABLE IF NOT EXISTS 对已存在的表是
--- no-op,新增列必须通过 ALTER TABLE 单独补,否则下面的 partial unique
--- index 会因列不存在报 42703。每次给 reference_samples 加新列时都要在
--- CREATE TABLE 块和 CREATE INDEX 块之间补一行 ALTER。
+-- no-op,新增列必须通过 ALTER TABLE 单独补,否则下面的 index 会因列不
+-- 存在报 42703。每次给 reference_samples 加新列时都要在 CREATE TABLE 块
+-- 和 CREATE INDEX 块之间补一行 ALTER。
+-- 审计 COR-013:此前这里只补了 source_truth_vault_note_id 一列——
+-- migration 002 时代的老表重跑 schema.sql 时,v2 八列全缺,
+-- idx_reference_samples_platform_category 直接 42703,README 的"重跑
+-- 不会报错、只会补齐"承诺被证伪。现在把 v2 全部列补进升级路径。
 ALTER TABLE reference_samples
+    ADD COLUMN IF NOT EXISTS post_title     TEXT,
+    ADD COLUMN IF NOT EXISTS post_body      TEXT,
+    ADD COLUMN IF NOT EXISTS cover_image_b64 TEXT,
+    ADD COLUMN IF NOT EXISTS top_comments   JSONB DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS platform       TEXT,
+    ADD COLUMN IF NOT EXISTS category       TEXT,
+    ADD COLUMN IF NOT EXISTS ai_analysis    JSONB,
+    ADD COLUMN IF NOT EXISTS quality_score  INTEGER DEFAULT 0,
     ADD COLUMN IF NOT EXISTS source_truth_vault_note_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_reference_samples_created

@@ -1087,6 +1087,11 @@ class PipelineOrchestrator:
                             "from review_dimensions + suggestions"
                         )
 
+            # 审计 COR-028:终审之后到落库之间原本没有任何取消检查点,
+            # trend post / prose / 批量采样(约 60 次调用)/评分/保存全程
+            # 不可取消。这里和下面两处补上 stage 边界检查。
+            self._check_cancelled("终审之后")
+
             # 6.9. Gemini 网感对标（advisory, A2）— 为每个 direction 拉一批
             # 当前小红书真实帖子，存到 final_system._per_direction_references
             # 让用户在产出页做"我的 demo vs 真实爆款"的肉眼对比。不改变
@@ -1189,6 +1194,9 @@ class PipelineOrchestrator:
                 final_system["_batch_sampling"] = done["batch_sampling"]
                 logger.info("[resume] 跳过批量采样(复用上次的 60 次调用结果)")
             elif ENABLE_BATCH_SAMPLING:
+                # 批量采样是全链调用量最大的尾段(12 格 × 5 = 60 次),
+                # 进入前再查一次取消(COR-028)。
+                self._check_cancelled("批量采样之前")
                 try:
                     _sampling = await run_batch_sampling(
                         final_system.get("prompt_matrix") or [],
@@ -1269,6 +1277,10 @@ class PipelineOrchestrator:
                 logger.exception(
                     "[quality_score] 评分计算失败(non-fatal),继续出货"
                 )
+
+            # 落库前最后一道取消检查(COR-028/COR-003):force_cancel 之后的
+            # 旧线程绝不能再写产出、也不能再覆盖 run/project 终态。
+            self._check_cancelled("保存产出之前")
 
             # 7. Save output (always — user wants to see partial output even on revision_required)
             self.db.save_output(self.run_id, final_system, final_review)
@@ -1360,12 +1372,30 @@ class PipelineOrchestrator:
                     "[run] failed to persist _pipeline_error marker: %r",
                     _persist_err,
                 )
-            self.db.update_pipeline_run(
-                self.run_id,
-                status="failed",
-                completed_at=datetime.now(timezone.utc).isoformat(),
-            )
-            self.db.update_project(self.project_id, status="failed")
+            # 审计 COR-003(轻量守卫):失败回写前确认这条 run 还归本线程管。
+            # force_cancel 已把 run 标 failed、同项目可能已有新 run 接管项目,
+            # 旧线程此刻再无条件把 project 写 failed 就是跨 run 串写。run 状态
+            # 已不是 running/paused_for_review 说明状态所有权已移交,只记日志。
+            _still_owned = True
+            try:
+                _cur = self.db.get_pipeline_run(self.run_id) or {}
+                _cur_status = (_cur.get("status") or "").strip().lower()
+                _still_owned = _cur_status in ("running", "paused_for_review")
+            except Exception:
+                pass  # 查询失败按仍归本线程处理,保持旧行为(宁可多写不悬空)
+            if _still_owned:
+                self.db.update_pipeline_run(
+                    self.run_id,
+                    status="failed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.db.update_project(self.project_id, status="failed")
+            else:
+                logger.info(
+                    "[run] run %s 已被外部终结(force_cancel/收割),"
+                    "跳过失败状态回写以免覆盖新 run 的项目状态",
+                    self.run_id,
+                )
             raise
         finally:
             # Release budget tracker memory for this run
@@ -4019,6 +4049,8 @@ class PipelineOrchestrator:
                 critic_result = await self.vibe_critic.run(
                     critic_input, self.run_id, self.db
                 )
+            except RunBudgetExceededError:
+                raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
             except Exception as _critic_err:
                 # Full traceback so a vibe-critic failure isn't a mystery
                 # ("why did this run skip the vibe loop?"). Still non-fatal:
@@ -4387,6 +4419,8 @@ class PipelineOrchestrator:
                             c["cell_id"]: c
                             for c in structural_result.get("prompt_cells", [])
                         }
+                    except RunBudgetExceededError:
+                        raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
                     except Exception:
                         logger.exception(
                             "Structural rewriter failed; falling back to "
@@ -4419,6 +4453,8 @@ class PipelineOrchestrator:
                             c["cell_id"]: c
                             for c in rewritten.get("prompt_cells", [])
                         }
+                    except RunBudgetExceededError:
+                        raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
                     except Exception as _rw_err:
                         logger.exception(
                             "Vibe rewriter failed, keeping original cells for this batch"
@@ -4669,6 +4705,8 @@ class PipelineOrchestrator:
                 revised_plan = await self.secretariat.run(
                     revision_input, self.run_id, self.db,
                 )
+            except RunBudgetExceededError:
+                raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
             except Exception:
                 logger.exception(
                     "[strategic_escalation] secretariat revision failed; "
@@ -4793,6 +4831,8 @@ class PipelineOrchestrator:
                 final_system = await self._run_vibe_loop(
                     final_system, structured_brief,
                 )
+            except RunBudgetExceededError:
+                raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
             except Exception:
                 logger.exception(
                     "[strategic_escalation] re-run vibe_loop failed; "
@@ -4936,6 +4976,8 @@ class PipelineOrchestrator:
                 self.run_id,
                 self.db,
             )
+        except RunBudgetExceededError:
+            raise  # 预算熔断必须冒泡到顶层硬停,不能被 advisory 降级吞掉
         except Exception as e:
             logger.exception(
                 "[consumer_sim] persona_simulator failed; skipping 2nd-level check"
@@ -5934,6 +5976,117 @@ def _synthesize_revisions_from_review(final_review: dict) -> tuple[list[str], st
     return synthetic_revs, synthetic_instr
 
 
+# ── 重跑/修订共用的 stage 失效图(审计 COR-005 的根治) ──────────────────
+#
+# resume 断点恢复(run() 里的 done.get(...) 分支)、UI 的「追加并重跑」
+# (pages/3)和「应用修订意见」(下面的 revise 路径)是同一份 stage_log 的
+# 多个读者。历史上删除清单存在两份手工副本,pages/3 那份漏了精炼层快照
+# (_matrix_ckpt_refined_a/b/c 等 9 个标记)和 red_blue_red/blue 等新名字,
+# 结果「补充并重跑」后旧矩阵快照把新 builder 结果整体盖掉、精炼链被跳过,
+# 用户拿回原封不动的旧稿且无任何报错。v0.34.1 的注释已经警告过"每新增一个
+# resume 标记都要回来登记"——所以清单从现在起只允许存在这一份,两条路径
+# 都必须调用 compute_stages_to_invalidate()。
+#
+# 主链路顺序(重跑起点的粒度)。动态名(strategy_debate_N / 旧版
+# chancellery_N / gemini_trend_scout_post_*)不在这里,由函数统一展开。
+PIPELINE_STAGE_ORDER: list[str] = [
+    "crown_prince",
+    "gemini_reference_analyzer",
+    "gemini_trend_scout_pre",
+    "secretariat",
+    "dispatcher",
+    "ministry_personnel", "ministry_revenue", "ministry_rites",
+    "ministry_war", "ministry_justice",
+    "ministry_works",
+    "ministry_works_cell_planner",
+    "ministry_works_builder",
+    "narrative_director",
+    "red_blue_refiner",        # legacy,v0.30.9 起不再写新 log,留着清旧
+    "red_blue_red",            # v0.30.9 拆分,会写新 log
+    "red_blue_blue",           # v0.30.9 拆分,会写新 log
+    "persona_simulator",
+    "persona_simulator_alt",   # v0.30.8 双 backend 并跑,会写新 log
+    "ministry_works_structure_review",
+    "vibe_critic",
+    "vibe_rewriter",
+    "structural_rewriter",
+    "chancellery_final",
+]
+
+# 精炼层断点快照/收尾标记 → 它们所属的主链路锚点 stage。
+# 失效必须**按位置**:锚点在重跑范围内,标记才作废;上游标记必须保留。
+# 否则「网感复检(只重新检查味道)」这类浅起点会把 refined_a/画像包/结构
+# hints 一并删掉,resume 被迫重跑叙事导演+红蓝(12 格约 13-25 次调用)、
+# 画像模拟、结构审 —— 既烧钱又改动了用户没让改的内容(PR#47 Codex 评审)。
+# 产出锚点以 run() 精炼链的实际写入点为准:refined_a 在红蓝之后,
+# _persona_merged / _structure_hints 在画像/结构审之后,refined_b 在网感
+# 循环之后,refined_c 是策略升级重跑 vibe 的产物,_consumer_sim_done 评的
+# 是 vibe 之后的矩阵;batch/prose/quality 是终审后的收尾,评最终矩阵。
+REFINEMENT_MARKER_ANCHORS: dict[str, str] = {
+    "_matrix_ckpt_refined_a": "narrative_director",
+    "_persona_merged": "persona_simulator",
+    "_structure_hints": "ministry_works_structure_review",
+    "_matrix_ckpt_refined_b": "vibe_critic",
+    "_matrix_ckpt_refined_c": "vibe_critic",
+    "_consumer_sim_done": "vibe_critic",
+    "batch_sampling": "chancellery_final",
+    "prose_gate": "chancellery_final",
+    "quality_score": "chancellery_final",
+}
+
+
+def compute_stages_to_invalidate(
+    from_stage: str, run_id: str, db: SupabaseClient
+) -> list[str]:
+    """给定重跑起点,返回必须删除的 stage_log 名字全集。
+
+    覆盖:主链路 from_stage 及其下游、锚点落在重跑范围内的精炼层快照/收尾
+    标记、strategy_debate_N 动态名、legacy chancellery_N 名、以及本 run 已
+    存在的 gemini_trend_scout_post_* 动态名。所有 rerun/revise 入口共用此
+    函数,不允许各自维护删除清单。
+    """
+    if from_stage in PIPELINE_STAGE_ORDER:
+        idx = PIPELINE_STAGE_ORDER.index(from_stage)
+    else:
+        idx = 0  # 未知起点按最保守处理:全删
+    to_delete: set[str] = set(PIPELINE_STAGE_ORDER[idx:])
+
+    # 精炼层快照/收尾标记:按锚点位置失效 —— 锚点 stage 要重跑,其产物才
+    # 作废;上游标记保留,让 resume 能从最近的有效快照续跑(见常量注释)。
+    to_delete.update(
+        marker
+        for marker, anchor in REFINEMENT_MARKER_ANCHORS.items()
+        if anchor in to_delete
+    )
+
+    # 中书省+门下省实际以 strategy_debate_{turn} 写 log(v0.29.7 起)。
+    # MAX_DEBATE_TURNS 当前为 4,20 是防未来上调的 buffer。
+    if "secretariat" in to_delete:
+        to_delete.update(f"strategy_debate_{i}" for i in range(20))
+
+    # Legacy chancellery_1..9 命名(debate 之前的老版本)。当前代码不再写
+    # 这些名字,删除仅为清理历史 run 的 UI 残留,无副作用。
+    to_delete.update(f"chancellery_{i}" for i in range(1, 10))
+
+    # 动态 per-direction post scan:final 批准后才跑,final 要重跑它就要清。
+    # delete 是 exact-match,所以先扫一遍本 run 的 log 名字。
+    if "chancellery_final" in to_delete:
+        try:
+            _all_logs = db.get_stage_logs(run_id) or []
+            to_delete.update(
+                l.get("stage_name", "")
+                for l in _all_logs
+                if (l.get("stage_name") or "").startswith(
+                    "gemini_trend_scout_post_"
+                )
+            )
+        except Exception:
+            # 非致命:拿不到也只是 post 残留,不影响主流程正确性。
+            pass
+
+    return sorted(to_delete)
+
+
 def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClient):
     """Resume a failed pipeline run — reuses existing run_id and skips completed stages.
 
@@ -6052,6 +6205,17 @@ def revise_and_resume_pipeline_in_background(
         kw in all_revision_text.lower() or kw in all_revision_text
         for kw in global_keywords
     )
+    if not is_global_revision and not affected_direction_ids:
+        # 审计 COR-012:终审若用自然语言/中文方向名/小写 d1 描述修订,既没有
+        # D+数字标记也没命中全局关键词,旧逻辑会当成"cell 级修订 + 空 affected
+        # 集"——builder 日志全保留、一个 cell 都不重建,修订意见被静默丢弃,
+        # 终审下一轮多半原样再驳。空 affected 集必须保守视为全局修订:
+        # 多重建只是成本,少重建是丢用户的修订意见。
+        is_global_revision = True
+        logger.warning(
+            "[revise] revisions carry no D\\d+ ids and no global keyword — "
+            "treating as GLOBAL revision (conservative: rebuild all cells)"
+        )
     logger.info(
         f"[revise] affected_direction_ids={affected_direction_ids}, "
         f"is_global_revision={is_global_revision}"
@@ -6102,86 +6266,30 @@ def revise_and_resume_pipeline_in_background(
     brief["_revision_context"] = revision_context
     db.update_project(project_id, brief=brief)
 
-    # 3. Selective deletion: only re-run what's actually needed.
-    # Always re-run: 中间精炼层 + vibe loop + chancellery_final
-    # (这些都 evaluate full matrix,任何一个 cell 变了它们就得重跑)。
-    # v0.29.6: 补上 narrative_director / red_blue_refiner /
-    # persona_simulator / structural_rewriter / structure_review,之前
-    # 只删 vibe+final 会让这 5 个阶段的上轮 stage_log 残留 → UI 误染色
-    # + orchestrator cell 级 resume 时用到陈旧数据。
-    stages_to_redo = [
-        "narrative_director",
-        "red_blue_refiner",        # legacy,v0.30.9 起不再写新 log,留着清旧
-        "red_blue_red",            # v0.30.9 拆分,会写新 log,必须随重跑清掉
-        "red_blue_blue",           # v0.30.9 拆分,会写新 log,必须随重跑清掉
-        "persona_simulator",
-        "persona_simulator_alt",   # v0.30.8 双 backend 并跑,会写新 log
-        "ministry_works_structure_review",
-        "vibe_critic",
-        "vibe_rewriter",
-        "structural_rewriter",
-        "chancellery_final",
-        # ⚠️ v0.34.1:v0.33.8 加的断点重续标记**必须**一起清掉,漏了会静默
-        # 丢弃用户的修订意见 —— 这是这批改动里最严重的一处。
-        #
-        # 机制:修订重跑会重建 prompt_matrix,但 `done` 里还留着上一轮(已被
-        # 终审驳回的)矩阵快照,于是 run() 里的恢复分支会拿旧快照**盖掉**刚
-        # 重建的矩阵、并跳过整条精炼链。用户点了「应用修订意见」,拿回来的却是
-        # 原封不动的旧稿,而且没有任何报错。
-        #
-        # 教训:每新增一个 resume 标记,都要回来这里登记。resume 和 revision
-        # 是同一份 stage_log 的两个读者,只加读的那一半必然出这种事。
-        "_matrix_ckpt_refined_a",
-        "_matrix_ckpt_refined_b",
-        "_matrix_ckpt_refined_c",
-        "_consumer_sim_done",
-        "_persona_merged",
-        "_structure_hints",
-        "batch_sampling",
-        "prose_gate",
-        "quality_score",
-    ]
-
+    # 3. Selective deletion — 审计 COR-005:删除清单统一收敛到
+    # compute_stages_to_invalidate,本路径不再手工维护副本(v0.34.1 的教训:
+    # resume 和 revision 是同一份 stage_log 的两个读者,清单漏一项就会拿旧
+    # 快照盖掉新结果)。
+    # 全局修订:从工部·架构起全部失效(architect + cell_planner + builder
+    # + 精炼链 + final + 全部断点快照)。
+    # cell 级修订:保留 works/cell_planner/builder 日志,从 narrative_director
+    # 起失效——cell 级 resume 会按 affected_direction_ids 把受影响 cell 排除
+    # 出恢复集、强制重建。
     if is_global_revision:
-        # Global concern (persona_library / title_rules etc.)
-        # → must re-run architect + all cell_planner + all builder
-        stages_to_redo += [
-            "ministry_works",
-            "ministry_works_cell_planner",
-            "ministry_works_builder",
-        ]
+        stages_to_redo = compute_stages_to_invalidate(
+            "ministry_works", run_id, db
+        )
         logger.info(
             "[revise] global revision → deleting ALL works stages + 中间精炼 + vibe + final"
         )
     else:
-        # Cell-specific revision → keep builder stage_logs intact.
-        # Cell-level resume will skip recovered cells; affected cells
-        # (matching affected_direction_ids) will be excluded from recovery
-        # and forced to re-build.
+        stages_to_redo = compute_stages_to_invalidate(
+            "narrative_director", run_id, db
+        )
         logger.info(
             f"[revise] cell-specific revision → keeping builder stage_logs, "
             f"only D{'/D'.join(affected_direction_ids)} will be re-built"
         )
-
-    # v0.29.7: gemini_trend_scout_post_{d_id} 跟 chancellery_final 挂钩
-    # (final 批准后才跑 per-direction post scan),chancellery_final 要
-    # 重跑意味着 post 也要清。用 exact-match delete,所以先扫一遍 log
-    # 名字把所有 post_* 找出来。
-    try:
-        _all_logs = db.get_stage_logs(run_id) or []
-        _post_names = [
-            l.get("stage_name", "")
-            for l in _all_logs
-            if (l.get("stage_name") or "").startswith(
-                "gemini_trend_scout_post_"
-            )
-        ]
-        if _post_names:
-            stages_to_redo += _post_names
-    except Exception:
-        # Non-fatal: can't read logs = post stays, UI shows stale but main
-        # pipeline proceeds correctly.
-        pass
 
     deleted = db.delete_stage_logs_by_names(run_id, stages_to_redo)
     logger.info(
