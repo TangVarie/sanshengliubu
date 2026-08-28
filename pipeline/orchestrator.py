@@ -18,6 +18,7 @@ from pipeline.config import (
     CELL_PLANNER_BATCH_SIZE,
     CELL_PLANNER_CONCURRENCY,
     ENABLE_BATCH_SAMPLING,
+    ENABLE_DEBATE_HISTORY_CACHE,
     CLARIFICATION_POLL_SECONDS,
     CLARIFICATION_TIMEOUT_SECONDS,
     DEFAULT_PLATFORM,
@@ -1422,6 +1423,39 @@ class PipelineOrchestrator:
         """
         max_turns = int(MAX_DEBATE_TURNS)
         debate_history: list[dict] = []
+        # 增量缓存前缀(ENABLE_DEBATE_HISTORY_CACHE):每轮结束把该轮发言
+        # 序列化【一次】存成字符串,之后各轮原样复用 —— 字节级稳定是命中
+        # 前缀缓存的前提(BaseAgent 端见 `_cache_prefix_blocks` 保留键,
+        # 断点打在最后一段上,下一轮命中 system + 全部历史轮)。
+        debate_prefix_segments: list[str] = []
+        _DEBATE_PREFIX_HEADER = (
+            "【debate_history · 辩论历史】以下文本段为此前各轮的完整发言,"
+            "按 turn 升序排列;本消息末尾的 JSON 里不再重复这份历史。"
+        )
+
+        def _append_debate_entry(role: str, turn: int, content: dict) -> None:
+            debate_history.append({"role": role, "turn": turn, "content": content})
+            debate_prefix_segments.append(
+                f"debate_history[{turn}](role={role}, turn={turn}):\n"
+                + json.dumps(content, ensure_ascii=False, indent=2)
+            )
+
+        def _inject_debate_history(input_data: dict) -> None:
+            """把辩论历史装进 input:开关开 → 稳定前缀段 + 指路占位;
+            开关关 → 老形态,整个数组进尾部 JSON。"""
+            if ENABLE_DEBATE_HISTORY_CACHE:
+                input_data["_cache_prefix_blocks"] = [
+                    _DEBATE_PREFIX_HEADER,
+                    *debate_prefix_segments,
+                ]
+                # 占位字符串让 prompt 里"input 中带有 debate_history 字段"
+                # 的辩论模式触发条件继续成立。
+                input_data["debate_history"] = (
+                    "（完整辩论历史见本消息前部的 debate_history[i] 文本段）"
+                )
+            else:
+                input_data["debate_history"] = debate_history
+
         plan = None
 
         for turn in range(max_turns):
@@ -1440,7 +1474,7 @@ class PipelineOrchestrator:
                 if _trend_block:
                     input_data["trend_intel_block"] = _trend_block
                 if debate_history:
-                    input_data["debate_history"] = debate_history
+                    _inject_debate_history(input_data)
                     input_data["debate_mode"] = True
 
                 agent = self.secretariat
@@ -1455,11 +1489,7 @@ class PipelineOrchestrator:
                 # mode it's in current_plan; in initial mode it's the
                 # top-level output.
                 plan = response.get("current_plan") or response
-                debate_history.append({
-                    "role": "secretariat",
-                    "turn": turn,
-                    "content": response,
-                })
+                _append_debate_entry("secretariat", turn, response)
                 logger.info(
                     f"[strategy_debate] turn {turn} (secretariat): "
                     f"directions={[d.get('direction_id') for d in plan.get('tactical_directions', [])]}"
@@ -1470,10 +1500,10 @@ class PipelineOrchestrator:
                     "review_type": "plan_review",
                     "plan": plan,
                     "brief": brief,
-                    "debate_history": debate_history,
                     "debate_mode": True,
                     "round_number": (turn // 2) + 1,
                 }
+                _inject_debate_history(input_data)
 
                 # v0.33.6: 最后一轮**照常调用门下省**,只把 verdict 覆写成
                 # approved,而不是凭空合成一个批准。
@@ -1538,11 +1568,7 @@ class PipelineOrchestrator:
                         ),
                     }
 
-                debate_history.append({
-                    "role": "chancellery",
-                    "turn": turn,
-                    "content": response,
-                })
+                _append_debate_entry("chancellery", turn, response)
 
                 verdict = (response.get("verdict") or "").strip().lower()
                 logger.info(

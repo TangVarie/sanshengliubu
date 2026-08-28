@@ -291,7 +291,9 @@ brief 里带了 `advertising_stance` 字段(`stealth` / `disclosed_kol` / `brand
 
 ### 辩论机制
 
-- `debate_history` 是一个 `[{role, turn, content}]` 数组，记录了之前每一轮你和门下省的交锋
+- `debate_history` 记录了之前每一轮你和门下省的交锋。它有两种呈现形态，内容等价：
+  - JSON 里直接是一个 `[{role, turn, content}]` 数组；或
+  - JSON 里只是一个指路占位符——此时完整历史在本消息**前部**，以 `debate_history[i](role=..., turn=i):` 开头的文本段逐轮排列（i 为轮次，升序）
 - 你的上一轮发言里有完整的 `current_plan`，门下省的回应里有 `challenges`（具体质疑）
 - 你现在要做的是：**逐条回应门下省的 challenges**，修改你的方案，或者给出有理由的坚持
 
