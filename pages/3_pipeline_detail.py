@@ -500,14 +500,12 @@ if status == "needs_revision":
                     st.session_state[_busy_key] = True
                     from pipeline.orchestrator import (
                         PipelineAlreadyRunningError,
-                        revise_and_resume_pipeline_in_background,
                     )
+                    from pipeline.launcher import launch_revise
                     from pipeline.agents import init_api_config
                     init_api_config()
                     try:
-                        revise_and_resume_pipeline_in_background(
-                            project_id, latest_run_id, db
-                        )
+                        launch_revise(project_id, latest_run_id, db)
                         st.success(
                             "已触发修订流程。修订指令已存入 project.brief，"
                             "工部相关 stage_logs 已清除，流水线将从工部重跑并把"
@@ -2163,11 +2161,11 @@ if status not in ("running",):
                     try:
                         from pipeline.orchestrator import (
                             PipelineAlreadyRunningError,
-                            resume_pipeline_in_background,
                         )
+                        from pipeline.launcher import launch_resume
                         from pipeline.agents import init_api_config
                         init_api_config()
-                        resume_pipeline_in_background(project_id, run_id, db)
+                        launch_resume(project_id, run_id, db)
                         st.success(
                             f"补充信息已追加,{_deleted} 个 stage_log 已清除。"
                             f"已自动从 {_rerun_stages[_selected_stage]} 开始重跑——"
@@ -2226,15 +2224,15 @@ with c2:
             st.session_state[_actions_busy_key] = True
             from pipeline.orchestrator import (
                 PipelineAlreadyRunningError,
-                resume_pipeline_in_background,
             )
+            from pipeline.launcher import launch_resume
             from pipeline.agents import init_api_config
             init_api_config()
             try:
                 # Don't pre-set project.status here; orchestrator.run() does
                 # it, and our guard checks project.status so pre-setting
                 # would make the guard reject our own call.
-                resume_pipeline_in_background(project_id, run_id, db)
+                launch_resume(project_id, run_id, db)
                 st.rerun()
             except PipelineAlreadyRunningError as _err:
                 st.session_state[_actions_busy_key] = False
@@ -2256,8 +2254,8 @@ with c3:
         st.session_state[_actions_busy_key] = True
         from pipeline.orchestrator import (
             PipelineAlreadyRunningError,
-            start_pipeline_in_background,
         )
+        from pipeline.launcher import launch_new_run
         from pipeline.agents import init_api_config
         init_api_config()
         try:
@@ -2270,11 +2268,9 @@ with c3:
             if "_revision_context" in _pb:
                 _pb.pop("_revision_context", None)
                 db.update_project(project_id, brief=_pb)
-            # create_pipeline_run + start — orchestrator sets project.status
-            # internally, so we skip the pre-emptive update that would
-            # trip our own guard.
-            new_run = db.create_pipeline_run(project_id)
-            start_pipeline_in_background(project_id, new_run["id"], db)
+            # launch_new_run(thread 模式 = create+start;worker 模式 = 入队)。
+            # orchestrator/worker 会自行设置 project.status,这里不预写。
+            launch_new_run(project_id, db)
             st.rerun()
         except PipelineAlreadyRunningError as _err:
             st.session_state[_actions_busy_key] = False
@@ -2300,7 +2296,7 @@ with c3:
 # stays responsive. When the set of stage statuses (or the run status) actually
 # changes, it escalates to a single full-page rerun so the progress row + tab
 # details refresh with the new output. No change → no full rerun → no jank.
-if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review"):
+if status in ("running", "paused_for_review") or run.get("status") in ("running", "paused_for_review", "pending"):
     _auto = st.toggle(
         f"自动刷新（每 {POLL_INTERVAL_SECONDS} 秒，只轮询状态、不阻塞页面）",
         value=st.session_state.get("detail_auto_refresh", True),

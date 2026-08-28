@@ -422,6 +422,7 @@ def eyebrow(title: str, sub: str = "") -> None:
 
 
 _STATUS_META = {
+    "pending": ("is-review", "排队中"),
     "running": ("is-running", "运行中"),
     "completed": ("is-completed", "已完成"),
     "failed": ("is-failed", "失败"),

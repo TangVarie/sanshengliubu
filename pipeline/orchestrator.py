@@ -181,8 +181,9 @@ class PipelineOrchestrator:
         # paused_for_review 是请旨等待,是正常态,不算取消。
         if status and status not in ("running", "paused_for_review"):
             raise PipelineCancelled(
-                f"run 状态已变为 {status!r}(多半是用户点了强制取消),"
-                f"在 {where} 处停止。已完成的阶段都留着,点「继续执行」可以接着跑。"
+                f"run 状态已变为 {status!r}(用户点了强制取消,或 worker "
+                f"停机时把它重新排队了),在 {where} 处停止。已完成的阶段都"
+                f"留着:排队中的 run 会被 worker 自动接续,取消的可点「继续执行」。"
             )
 
     # ── 精炼链的断点重续 (v0.33.8) ────────────────────────────────────
@@ -5143,8 +5144,10 @@ def force_cancel_pipeline(project_id: str, db: SupabaseClient) -> dict:
         logger.warning("[force_cancel] get_runs_for_project failed: %r", e)
         runs = []
 
+    # worker 模式下 run 可能停在队列态(pending),同样要拦下 —— 否则用户
+    # 取消后 worker 仍会把排队的 run 认领执行。
     for run in runs:
-        if run.get("status") == "running":
+        if run.get("status") in ("running", "pending"):
             rid = run.get("id")
             if not rid:
                 continue
@@ -6109,7 +6112,8 @@ def resume_pipeline_in_background(project_id: str, run_id: str, db: SupabaseClie
 
 
 def revise_and_resume_pipeline_in_background(
-    project_id: str, run_id: str, db: SupabaseClient
+    project_id: str, run_id: str, db: SupabaseClient,
+    *, enqueue_only: bool = False,
 ):
     """Apply chancellery_final's revision_instructions and re-run the downstream.
 
@@ -6300,4 +6304,13 @@ def revise_and_resume_pipeline_in_background(
     # step 0 and the run set running in step 0.5, so tell
     # start_pipeline_in_background NOT to claim again (that would raise
     # AlreadyRunning against the status we ourselves just set).
+    # worker 模式(enqueue_only):不起线程,把 run 置回 pending 交给独立
+    # worker 认领。项目锁已在 step 0 被本 run 抢到,所以入队动作是
+    # resume_preclaimed —— worker 认领时跳过项目 CAS,直接 claim=False 执行。
+    if enqueue_only:
+        db.update_pipeline_run(
+            run_id, status="pending", queued_action="resume_preclaimed"
+        )
+        logger.info("[revise] run %s 已入队(resume_preclaimed)", run_id[:8])
+        return None
     return start_pipeline_in_background(project_id, run_id, db, claim=False)

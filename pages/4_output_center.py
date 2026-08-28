@@ -603,13 +603,12 @@ if uncertainty_summary:
 
                 from pipeline.orchestrator import (
                     PipelineAlreadyRunningError,
-                    start_pipeline_in_background,
                 )
+                from pipeline.launcher import launch_new_run
                 from pipeline.agents import init_api_config
                 init_api_config()
                 try:
-                    new_run = db.create_pipeline_run(project_id)
-                    start_pipeline_in_background(project_id, new_run["id"], db)
+                    launch_new_run(project_id, db)
                 except PipelineAlreadyRunningError as _e:
                     st.warning(
                         f"{_e}\n\n如果任务其实已卡死，先到「流水线详情」页点"

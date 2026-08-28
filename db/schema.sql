@@ -25,18 +25,20 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    status TEXT DEFAULT 'running',         -- running | completed | failed | paused_for_review
+    status TEXT DEFAULT 'running',         -- pending | running | completed | failed | paused_for_review | needs_revision
     started_at TIMESTAMPTZ DEFAULT now(),
     completed_at TIMESTAMPTZ,
     total_tokens INTEGER DEFAULT 0,
     total_cost_usd NUMERIC(10,4) DEFAULT 0,
     heartbeat_at TIMESTAMPTZ,              -- 后台线程周期续期;停跳=进程已死,供 reaper 收割僵尸 running
+    queued_action TEXT,                    -- worker 队列:start | resume | resume_preclaimed(migration 007)
     created_at TIMESTAMPTZ DEFAULT now()
 );
 -- 升级路径:老库补列(见 reference_samples 同款惯例)。每次给 pipeline_runs
 -- 加新列都要在这里补一行 ALTER,否则老部署 select/update 会 42703。
 ALTER TABLE pipeline_runs
-    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS queued_action TEXT;
 
 -- 各环节执行日志
 CREATE TABLE IF NOT EXISTS stage_logs (
@@ -67,6 +69,7 @@ CREATE TABLE IF NOT EXISTS outputs (
 
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_project ON pipeline_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
 CREATE INDEX IF NOT EXISTS idx_stage_logs_run ON stage_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_logs_stage ON stage_logs(stage_name);
 -- Composite covers the hot path in resume/revise/cell-recovery: filter

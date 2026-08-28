@@ -21,12 +21,13 @@ st.title("新建 Prompt 工程项目")
 
 def _launch_pipeline(db, project, success_message: str = "流水线已启动！"):
     """Create a pipeline run, initialise API, start background pipeline, navigate."""
-    from pipeline.orchestrator import start_pipeline_in_background
+    from pipeline.launcher import execution_mode, launch_new_run
     from pipeline.agents import init_api_config
 
-    run = db.create_pipeline_run(project["id"])
     init_api_config()
-    start_pipeline_in_background(project["id"], run["id"], db)
+    launch_new_run(project["id"], db)
+    if execution_mode() == "worker":
+        success_message = "已加入执行队列,worker 认领后开始跑——详情页可看进度。"
     st.success(success_message)
     st.session_state["current_project_id"] = project["id"]
     st.query_params["project_id"] = project["id"]
