@@ -6013,20 +6013,26 @@ PIPELINE_STAGE_ORDER: list[str] = [
     "chancellery_final",
 ]
 
-# 精炼层断点快照 + 终审后的收尾阶段。它们都 evaluate full matrix:只要
-# builder 或任何精炼阶段重跑,这些必须全部失效——宁可多删(多花一点重算)
-# 也不能少删(旧快照盖掉新结果)。
-REFINEMENT_MARKER_STAGES: list[str] = [
-    "_matrix_ckpt_refined_a",
-    "_matrix_ckpt_refined_b",
-    "_matrix_ckpt_refined_c",
-    "_consumer_sim_done",
-    "_persona_merged",
-    "_structure_hints",
-    "batch_sampling",
-    "prose_gate",
-    "quality_score",
-]
+# 精炼层断点快照/收尾标记 → 它们所属的主链路锚点 stage。
+# 失效必须**按位置**:锚点在重跑范围内,标记才作废;上游标记必须保留。
+# 否则「网感复检(只重新检查味道)」这类浅起点会把 refined_a/画像包/结构
+# hints 一并删掉,resume 被迫重跑叙事导演+红蓝(12 格约 13-25 次调用)、
+# 画像模拟、结构审 —— 既烧钱又改动了用户没让改的内容(PR#47 Codex 评审)。
+# 产出锚点以 run() 精炼链的实际写入点为准:refined_a 在红蓝之后,
+# _persona_merged / _structure_hints 在画像/结构审之后,refined_b 在网感
+# 循环之后,refined_c 是策略升级重跑 vibe 的产物,_consumer_sim_done 评的
+# 是 vibe 之后的矩阵;batch/prose/quality 是终审后的收尾,评最终矩阵。
+REFINEMENT_MARKER_ANCHORS: dict[str, str] = {
+    "_matrix_ckpt_refined_a": "narrative_director",
+    "_persona_merged": "persona_simulator",
+    "_structure_hints": "ministry_works_structure_review",
+    "_matrix_ckpt_refined_b": "vibe_critic",
+    "_matrix_ckpt_refined_c": "vibe_critic",
+    "_consumer_sim_done": "vibe_critic",
+    "batch_sampling": "chancellery_final",
+    "prose_gate": "chancellery_final",
+    "quality_score": "chancellery_final",
+}
 
 
 def compute_stages_to_invalidate(
@@ -6034,10 +6040,10 @@ def compute_stages_to_invalidate(
 ) -> list[str]:
     """给定重跑起点,返回必须删除的 stage_log 名字全集。
 
-    覆盖:主链路 from_stage 及其下游、全部精炼层快照/收尾标记、
-    strategy_debate_N 动态名、legacy chancellery_N 名、以及本 run 已存在的
-    gemini_trend_scout_post_* 动态名。所有 rerun/revise 入口共用此函数,
-    不允许各自维护删除清单。
+    覆盖:主链路 from_stage 及其下游、锚点落在重跑范围内的精炼层快照/收尾
+    标记、strategy_debate_N 动态名、legacy chancellery_N 名、以及本 run 已
+    存在的 gemini_trend_scout_post_* 动态名。所有 rerun/revise 入口共用此
+    函数,不允许各自维护删除清单。
     """
     if from_stage in PIPELINE_STAGE_ORDER:
         idx = PIPELINE_STAGE_ORDER.index(from_stage)
@@ -6045,9 +6051,13 @@ def compute_stages_to_invalidate(
         idx = 0  # 未知起点按最保守处理:全删
     to_delete: set[str] = set(PIPELINE_STAGE_ORDER[idx:])
 
-    # 精炼层快照/收尾标记:任何可选起点(最深为 vibe_critic)都会重算精炼链,
-    # 一律清掉。
-    to_delete.update(REFINEMENT_MARKER_STAGES)
+    # 精炼层快照/收尾标记:按锚点位置失效 —— 锚点 stage 要重跑,其产物才
+    # 作废;上游标记保留,让 resume 能从最近的有效快照续跑(见常量注释)。
+    to_delete.update(
+        marker
+        for marker, anchor in REFINEMENT_MARKER_ANCHORS.items()
+        if anchor in to_delete
+    )
 
     # 中书省+门下省实际以 strategy_debate_{turn} 写 log(v0.29.7 起)。
     # MAX_DEBATE_TURNS 当前为 4,20 是防未来上调的 buffer。
