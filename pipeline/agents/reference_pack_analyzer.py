@@ -141,12 +141,17 @@ def analyze_reference_pack(pack: dict) -> dict[str, Any]:
     from pipeline.llm_retry import call_with_retry
 
     try:
+        from pipeline.config import KIMI_ASSIST_TIMEOUT_SECONDS
+
         response = call_with_retry(
+            # 用户在参考库页面同步等结果,per-request 超时覆盖掉 client 的
+            # 900s 主链路默认 —— 端点挂死时快速失败出错误横幅,不冻页面。
             lambda: client.messages.create(
                 model=model,
                 max_tokens=8000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_content}],
+                timeout=KIMI_ASSIST_TIMEOUT_SECONDS,
             ),
             operation="reference_pack_analyzer",
         )

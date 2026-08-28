@@ -1354,6 +1354,13 @@ ENABLE_KIMI_ASSIST = True
 # 全局默认 — 任何没在 KIMI_ASSIST_MODEL_OVERRIDES 里钉死的岗位用这个。
 KIMI_ASSIST_MODEL = PRIMARY_MODEL
 
+# 辅助层专用请求超时(秒)。主链路 client 的 900s 超时是给"后台线程跑
+# 几分钟的大生成"用的;辅助层的图片转写/截图分析/参考包分析多数发生在
+# **用户正在页面上等**的同步路径(上传时刻、参考库提交时刻),一次调用
+# 挂 15 分钟等于页面冻死。120s 足够覆盖 vision 大图的正常延迟;挂死的
+# 连接 2 分钟内报错降级(转写有占位符兜底,参考库有错误横幅)。
+KIMI_ASSIST_TIMEOUT_SECONDS = 120.0
+
 # 按岗位钉模型。kimi_client.resolve_assist_model(role) 先查这里,查不到用
 # KIMI_ASSIST_MODEL。
 #
