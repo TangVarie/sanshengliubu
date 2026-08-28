@@ -44,6 +44,7 @@ from pipeline.config import (
     KIMI_ASSIST_MAX_OUTPUT_TOKENS,
     KIMI_ASSIST_MODEL,
     KIMI_ASSIST_MODEL_OVERRIDES,
+    KIMI_ASSIST_TIMEOUT_SECONDS,
 )
 from pipeline.logger_utils import mask_secrets
 
@@ -255,11 +256,15 @@ def _call_kimi_raw(
     content = _build_content(user_message, images)
 
     def _do_call():
+        # 辅助层多数在用户同步等待的路径上跑(上传转写/截图分析),不能沿用
+        # client 构造时的 900s 主链路超时 —— 端点不可达时页面会冻死一刻钟。
+        # per-request 覆盖成 KIMI_ASSIST_TIMEOUT_SECONDS,挂死快速失败降级。
         return client.messages.create(
             model=model_id,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": content}],
+            timeout=KIMI_ASSIST_TIMEOUT_SECONDS,
         )
 
     try:

@@ -189,7 +189,7 @@ def main() -> None:
     init_api_config()
 
     logger.info(
-        "[worker] 启动 v%s · poll=%ss · concurrent=%s · zombie_scan=%ss · auto_resume=%s",
+        "[worker] 启动 %s · poll=%ss · concurrent=%s · zombie_scan=%ss · auto_resume=%s",
         VERSION, POLL_SECONDS, MAX_CONCURRENT, ZOMBIE_SCAN_SECONDS, AUTO_RESUME,
     )
 
