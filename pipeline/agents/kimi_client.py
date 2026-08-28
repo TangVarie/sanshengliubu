@@ -112,6 +112,53 @@ def _estimate_cost_usd(input_tokens: int, output_tokens: int, model: str) -> flo
     return (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
 
 
+# ── 发送前图片降采样 ────────────────────────────────────────────────
+# 手机截图动辄 1-2MB(3x 分辨率),对 OCR/视觉理解纯属浪费;截图分析还把
+# 最多 10 张打包进【一次】请求,base64 后 body 可达 8MB+ —— 上行慢的线路
+# 上表现为"传不完、无限等"(Railway 排障实录,2026-08-28)。压到长边
+# 1568px(视觉模型的常见有效上限)的 JPEG 后,单张通常只剩 100-300KB。
+# Pillow 不可用时原样发送:降采样是优化,不是功能前提。
+_IMAGE_MAX_EDGE = 1568
+_IMAGE_JPEG_QUALITY = 85
+_IMAGE_SHRINK_THRESHOLD_BYTES = 400 * 1024  # 小于 400KB 的小图不折腾
+
+
+def _shrink_image(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """把过大的图压成长边 ≤1568px 的 JPEG;失败/无 Pillow/压不小则原样返回。"""
+    if not raw or len(raw) <= _IMAGE_SHRINK_THRESHOLD_BYTES:
+        return raw, mime
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        return raw, mime  # 无 Pillow:原样发送
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        w, h = img.size
+        scale = _IMAGE_MAX_EDGE / float(max(w, h))
+        if scale < 1.0:
+            img = img.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                Image.LANCZOS,
+            )
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")  # 丢 alpha:OCR 不需要透明度
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_IMAGE_JPEG_QUALITY, optimize=True)
+        out = buf.getvalue()
+        if len(out) < len(raw):
+            logger.info(
+                "[kimi_client] 图片降采样 %dKB → %dKB(%dx%d → 长边≤%d)",
+                len(raw) // 1024, len(out) // 1024, w, h, _IMAGE_MAX_EDGE,
+            )
+            return out, "image/jpeg"
+        return raw, mime  # 极端情况(纯色 PNG 等)压缩反而变大:用原图
+    except Exception:
+        logger.warning("[kimi_client] 图片降采样失败,原图发送", exc_info=True)
+        return raw, mime
+
+
 def _build_content(
     user_message: str, images: list[tuple[bytes, str]] | None
 ) -> list[dict[str, Any]] | str:
@@ -126,6 +173,7 @@ def _build_content(
     for raw, mime in images:
         if not raw:
             continue
+        raw, mime = _shrink_image(raw, mime)
         blocks.append(
             {
                 "type": "image",
