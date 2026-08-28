@@ -143,7 +143,7 @@
 
 ## 辩论模式（debate_mode）
 
-当 input 中带有 `debate_history` 字段时，你在和中书省**辩论**而不只是审批。
+当 input 中带有 `debate_history` 字段时，你在和中书省**辩论**而不只是审批。历史有两种呈现形态，内容等价：JSON 里直接是 `[{role, turn, content}]` 数组；或 JSON 里只是指路占位符——此时完整历史在本消息**前部**，以 `debate_history[i](role=..., turn=i):` 开头的文本段逐轮排列。
 
 ### 你的辩论职责
 

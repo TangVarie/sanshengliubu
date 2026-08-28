@@ -1339,7 +1339,10 @@ class BaseAgent:
         return (text, input_tokens, output_tokens, cache_read, 0, False, effective_model)
 
     def _call_model(
-        self, system_prompt: str, user_message: str
+        self,
+        system_prompt: str,
+        user_message: str,
+        cache_prefix_blocks: list[str] | None = None,
     ) -> tuple[str, int, int, int, int, bool, str]:
         """Synchronous model call (Anthropic Messages API 形状)。
 
@@ -1376,20 +1379,46 @@ class BaseAgent:
         """
         is_vertex = _api_config.get("mode") == "vertex"
 
-        # Build content (may include image blocks)
-        user_content = self._build_content_blocks(user_message)
-        messages = [{"role": "user", "content": user_content}]
-
-        # Structured system prompt with ephemeral cache control. Cache
-        # support is a per-preset flag: new_relay might support it,
+        # Cache support is a per-preset flag: new_relay might support it,
         # old_relay might silently drop the cache_control field and
         # just pay full price. The active preset's supports_cache flag
         # (set in init_api_config) overrides the global
         # ENABLE_PROMPT_CACHING constant, so switching relays via the
-        # settings page immediately adjusts this behavior.
+        # settings page immediately adjusts this behavior. 在内容组装
+        # **之前**算好 —— 消息级前缀断点(下面)也要用它。
         _preset_supports_cache = _api_config.get(
             "supports_cache", ENABLE_PROMPT_CACHING
         )
+
+        # Build content (may include image blocks)
+        user_content = self._build_content_blocks(user_message)
+
+        # 消息级增量缓存前缀(ENABLE_DEBATE_HISTORY_CACHE):调用方传入
+        # 逐轮追加、字节稳定的文本段(目前只有策略辩论历史),每段一个
+        # text block 前置在用户消息里,cache_control 断点只打在**最后一个
+        # 前缀块**上 —— 下一轮的前缀与本轮完全一致,可命中「system + 全部
+        # 历史段」的缓存;动态尾部(JSON)不缓存。逐段成块而不是拼一大段,
+        # 是为了让后端的向前回看按块边界找最长已缓存前缀。
+        # 断点预算:system 1 + 消息级 1 = 2,远低于 4 上限。
+        _prefix_blocks = [
+            s for s in (cache_prefix_blocks or []) if isinstance(s, str) and s
+        ]
+        if _prefix_blocks:
+            if isinstance(user_content, str):
+                _tail_blocks: list[dict[str, Any]] = [
+                    {"type": "text", "text": user_content}
+                ]
+            else:
+                _tail_blocks = user_content
+            _prefix_content: list[dict[str, Any]] = [
+                {"type": "text", "text": s} for s in _prefix_blocks
+            ]
+            if _preset_supports_cache:
+                _prefix_content[-1]["cache_control"] = {"type": "ephemeral"}
+            user_content = _prefix_content + _tail_blocks
+        messages = [{"role": "user", "content": user_content}]
+
+        # Structured system prompt with ephemeral cache control.
         if _preset_supports_cache:
             system_block: Any = [
                 {
@@ -1419,10 +1448,17 @@ class BaseAgent:
         _model_low = (effective_model or "").lower()
         _is_gpt_family = _model_low.startswith("gpt-")
         if _is_gpt_family:
+            # OpenAI-compat 路径没有消息级 cache_control 概念,把前缀段
+            # 直接拼进纯文本消息,保证模型仍能看到完整辩论历史。
+            _gpt_user_message = (
+                "\n\n".join([*_prefix_blocks, user_message])
+                if _prefix_blocks
+                else user_message
+            )
             try:
                 return self._call_openai_chat(
                     system_prompt=system_prompt,
-                    user_message=user_message,
+                    user_message=_gpt_user_message,
                     effective_model=effective_model,
                     max_tokens=self.max_tokens,
                 )
@@ -1623,6 +1659,16 @@ class BaseAgent:
                         err_text[:300],
                     )
                 kwargs["system"] = system_prompt  # plain string, no cache
+                # 消息级断点(辩论历史前缀,见 _call_model 内容组装)也要
+                # 一并剥掉 —— 只降级 system 的话,重试请求仍带 cache_control,
+                # 同一个 400 会原样再来一遍。块 dict 都是本次调用新建的,
+                # 就地 pop 安全。
+                for _msg in kwargs.get("messages") or []:
+                    _mc = _msg.get("content")
+                    if isinstance(_mc, list):
+                        for _blk in _mc:
+                            if isinstance(_blk, dict):
+                                _blk.pop("cache_control", None)
                 return _do_stream(kwargs)
 
         # ── Model fallback 保底 ────────────────────────────────────────
@@ -1923,7 +1969,19 @@ class BaseAgent:
         for attempt in range(MAX_RETRIES + 1):
             try:
                 system_prompt = self.load_system_prompt()
-                user_message = json.dumps(input_data, ensure_ascii=False, indent=2)
+                # `_cache_prefix_blocks` 是保留键:预序列化、逐轮追加的稳定
+                # 前缀段(目前只有策略辩论历史用)。它不进 JSON 尾部 ——
+                # 作为消息级缓存前缀单独传给 _call_model,断点打在末段上。
+                cache_prefix_blocks = input_data.get("_cache_prefix_blocks") or []
+                user_message = json.dumps(
+                    {
+                        k: v
+                        for k, v in input_data.items()
+                        if k != "_cache_prefix_blocks"
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
                 (
                     text,
@@ -1934,7 +1992,10 @@ class BaseAgent:
                     thinking_fired,
                     actual_model,
                 ) = await asyncio.to_thread(
-                    self._call_model, system_prompt, user_message
+                    self._call_model,
+                    system_prompt,
+                    user_message,
+                    cache_prefix_blocks,
                 )
                 total_input_tokens += input_tokens
                 total_output_tokens += output_tokens

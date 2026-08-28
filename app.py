@@ -1,9 +1,25 @@
+import logging
+
 import streamlit as st
 
 from pipeline.config import VERSION, VERSION_DATE
 from pipeline.logger_utils import install_secret_masking_on_root_logger
 from utils.theme import eyebrow
 from utils.version_badge import show_version_badge
+
+# Web 进程的日志此前没有 handler,Python 只输出 WARNING+ —— 图片降采样、
+# 辅助层调用等 INFO 级诊断在 Railway 日志里完全不可见,排障等于盲飞
+#(2026-08-28 上传卡死排障实录)。幂等:重复执行只调级别。
+# 必须在 install_secret_masking 之前建 handler,masker 只包装调用时已
+# 存在的 root handlers(审计 SUP-005)。
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+else:
+    logging.getLogger().setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # 每次 DB 请求一行,太吵
 
 # R-023: 任何 logger.exception / traceback 输出到 stderr 之前,
 # 都要先剥掉 API key/JWT/Supabase token,防止运维看日志、截图、

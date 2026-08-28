@@ -2,11 +2,28 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.36.0"
+VERSION = "v0.36.1"
 VERSION_DATE = "2026-08-28"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.36.1 fix+perf: 上传转写链路加固 + 辩论历史增量缓存。"
+    "\n\n"
+    "【上传转写卡死】首条真实 run 暴露的三层问题,逐层修:"
+    "(1) 辅助/视觉层沿用主链路 900s 超时,端点慢时页面冻 15 分钟 —— 单独"
+    "给 KIMI_ASSIST_TIMEOUT_SECONDS=120s;(2) 多图打包请求体 8MB+,海外→"
+    "moonshot 上行 ~150KB/s 直接撑爆 —— 发送前 Pillow 降采样(>400KB 转"
+    "JPEG 长边 ≤1568);(3) httpx 的分相超时对「慢滴」上行不生效 —— 再包"
+    "一层墙钟硬上限(ThreadPoolExecutor future.result(timeout))。另:web"
+    "进程此前没有 log handler,INFO 级诊断全部不可见,排障盲飞 —— app.py"
+    "起 basicConfig(必须在 secret-masking 之前装,见审计 SUP-005)。"
+    "\n\n"
+    "【辩论历史增量缓存】ENABLE_DEBATE_HISTORY_CACHE:策略辩论每轮把全部"
+    "历史原样重发,而 system 级缓存根本盖不到它。现在历史逐轮序列化成字节"
+    "稳定的前缀文本段,消息级 cache_control 断点打在最后一段 —— 下一轮命中"
+    "「system + 全部历史轮」。K2.6 缓存命中省 83%、v4-flash 省 98%,辩论"
+    "越深省得越多,延迟同步下降。后端不认消息级断点时走 400 自愈剥掉重试。"
+    "\n\n"
     "v0.36.0 release: 全量审计 P0 修复 + 执行层剥离(Railway worker 模式)。"
     "\n\n"
     "【审计核实】2026-08-28 全量审计报告 77 项,逐条对抗核查:72 项完全属实、"
@@ -1530,6 +1547,21 @@ GEMINI_MAX_OUTPUT_TOKENS = KIMI_ASSIST_MAX_OUTPUT_TOKENS
 # drop it (cache just misses, no error). If your relay 400s on it, set this
 # to False.
 ENABLE_PROMPT_CACHING = True
+
+# 策略辩论历史的消息级增量缓存。ENABLE_PROMPT_CACHING 只缓存 system prompt,
+# 而辩论循环里真正逐轮膨胀的是 debate_history —— 中书省每轮的完整大 plan +
+# 门下省的审议,到后几轮占输入的大头,且每轮都原样重发一遍。
+#
+# 开启后 _strategy_loop 把已完成轮次的发言序列化【一次】,作为字节稳定的
+# 前缀文本段前置在用户消息里(BaseAgent 的 _cache_prefix_blocks 保留键),
+# cache_control 断点打在最后一段上:下一轮的前缀与本轮完全一致,可命中
+# 「system + 全部历史轮」的缓存。断点预算 system 1 + 消息级 1 = 2,
+# 远低于 4 上限。辩论轮间隔通常远小于 5 分钟 TTL。
+#
+# 后端不认消息级 cache_control 时走既有的 400 自愈路径(剥断点重试一次,
+# 之后本进程整体停发)。关掉本开关则回退老形态:debate_history 整个塞进
+# 尾部 JSON,每轮全量重算。
+ENABLE_DEBATE_HISTORY_CACHE = True
 
 # ── Cost tracking (per 1M tokens, approximate) ────────────────────────────
 
