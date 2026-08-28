@@ -2,11 +2,35 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.35.1"
-VERSION_DATE = "2026-08-17"
+VERSION = "v0.36.0"
+VERSION_DATE = "2026-08-28"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.36.0 release: 全量审计 P0 修复 + 执行层剥离(Railway worker 模式)。"
+    "\n\n"
+    "【审计核实】2026-08-28 全量审计报告 77 项,逐条对抗核查:72 项完全属实、"
+    "5 项部分属实、0 项被推翻。生产库里还挖出了 6 个 run 共 11 行重复产出行,"
+    "把 COR-007 从理论变成了实锤。"
+    "\n\n"
+    "【P0 修复】(PR #47)参考库必现崩溃(COR-001 只读 property 赋值)、"
+    "预算熔断被 6 处 advisory catch 吞掉(COR-004)、失效清单双份漂移导致"
+    "「追加并重跑」被旧快照静默覆盖(COR-005,收敛为 compute_stages_to_"
+    "invalidate 唯一失效图,快照按产出锚点位置失效)、空 affected 集保守"
+    "全局重建(COR-012)、收割器 TOCTOU 改条件写(COR-002)、save_output "
+    "原子 upsert(COR-007)、needs_revision 产出可见(COR-006)、尾段取消"
+    "检查点 + 失败回写所有权守卫(COR-028/003 轻量版)、schema 与迁移对齐"
+    "(COR-013,migration 006)。"
+    "\n\n"
+    "【执行层剥离】(PR #48)PIPELINE_EXECUTION_MODE=worker 时 UI 只入队"
+    "(pipeline_runs.status=pending + queued_action),独立 worker 进程"
+    "(python -m worker)条件 CAS 认领执行:心跳过期的僵尸 run 自动重排队"
+    "接续(进程起来即恢复,治 ROB-001),SIGTERM 停止认领、原地等待到平台"
+    "宽限期(治 ROB-005;刻意不在停机时重排队,避免滚动发布双执行)。"
+    "密钥走 st.secrets→环境变量兼容层,Railway 无 secrets.toml 可跑。"
+    "默认 thread 模式行为不变,可随时回滚。部署见 docs/railway-deploy.md,"
+    "需 migration 007。"
+    "\n\n"
     "v0.35.1 fix: 上传的 Word 被整份拒收 —— 第一条真跑就撞出来的,而且四轮"
     "静态评审一条都没提。"
     "\n\n"

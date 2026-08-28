@@ -54,4 +54,17 @@ def show_version_badge() -> None:
         # R-019: single-tenant operating reminder (RLS disabled). Kept visible
         # on every page so a future multi-brand deploy can't forget to flip it.
         st.caption("单租户模式 · RLS 关闭")
+        # 执行模式徽章:worker(入队给独立执行进程)/ thread(进程内线程)。
+        # 放在侧栏是为了让「PIPELINE_EXECUTION_MODE 到底生效没」肉眼可查——
+        # Railway 上少配了这个环境变量,web 会静默退回 thread 模式,整个
+        # 剥离架构等于没启用,除了这里没有任何地方能看出来。
+        try:
+            from pipeline.launcher import execution_mode
+            _mode = execution_mode()
+            st.caption(
+                "执行模式 · worker(独立进程)" if _mode == "worker"
+                else "执行模式 · thread(进程内)"
+            )
+        except Exception:
+            pass  # 徽章绝不能把页面带崩
         st.caption(f"**{VERSION}** · {VERSION_DATE}")
