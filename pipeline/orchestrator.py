@@ -4264,6 +4264,11 @@ class PipelineOrchestrator:
                 if c.get("cell_id") not in failed_ids
             ]
             _v4_for_jev = None  # v0.37.0: 给判定服务影子做三方对照用,只读
+            # v0.37.1: 二审这一轮的结果另落 stage_log `vibe_arbitration`(见本轮末尾),
+            # 这两个变量只为那条记录服务,不参与分流。
+            _v4_record: dict = {"verdict": "not_run",
+                                "_skip_reason": "主 critic 本轮没有判过的 cell,二审无事可做"}
+            _v4_added_ids: list[str] = []
             if claude_passed:
                 try:
                     gemini_result = await run_kimi_critic(claude_passed)
@@ -4311,6 +4316,7 @@ class PipelineOrchestrator:
                                 ),
                             }
                             failed.append(gf)
+                            _v4_added_ids.append(gf["cell_id"])
                             added += 1
                     if added:
                         logger.info(
@@ -4322,6 +4328,7 @@ class PipelineOrchestrator:
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
                 _v4_for_jev = gemini_result
+                _v4_record = gemini_result
 
             # ── 判定服务二审影子(v0.37.0,judge 仓 docs/00 #5「记不分流」)──
             # Jev 按 multiplier_gate 四项 + template_test.still_holds 给本轮评的每个
@@ -4400,6 +4407,25 @@ class PipelineOrchestrator:
                     "强制进重写(零 LLM 成本): %s",
                     len(_pg_forced), sorted(_pg_forced),
                 )
+
+            # ── 二审仲裁落库(v0.37.1,只记录)──────────────────────────────
+            # critic_result["_gemini_arbitration"] 是在 vibe_critic.run() 返回**之后**
+            # 才挂上去的,而 BaseAgent.run 在返回前就把 output_data 写进了那条
+            # vibe_critic stage_log —— 这个改动永远到不了库,详情页「二审」面板因此
+            # 从来没有数据。这里每轮单独写一条 `vibe_arbitration`,详情页按时间顺序
+            # 把它配到对应那轮 vibe_critic 下面。只读本轮已经算好的结果,不改 failed、
+            # 不改 severity、不影响哪些 cell 进重写;落库失败只丢这一行记录。
+            self._write_vibe_arbitration_log(
+                round_tag=f"v{self._jev_vibe_pass}r{iteration + 1}",
+                iteration=iteration + 1,
+                cells_reviewed=[c.get("cell_id") for c in cells_to_critique if c.get("cell_id")],
+                main_passed=[c.get("cell_id") for c in claude_passed if c.get("cell_id")],
+                second_review=_v4_record,
+                second_review_added=_v4_added_ids,
+                prose_forced=sorted(_pg_forced),
+                prose_soft=_pg_soft,
+                jev_report=critic_result.get("_jev_arbitration"),
+            )
 
             # v0.30.6 fix M1: Gemini 结构审标了 _structure_hint(missing_items
             # 非空)但 critic 让该 cell 过了 → 之前 hint 永远到不了 rewriter,
@@ -5262,6 +5288,63 @@ class PipelineOrchestrator:
             )
         res.update({"status": "ok", "bank": bank, "scope": scope})
         return res
+
+    def _write_vibe_arbitration_log(
+        self,
+        *,
+        round_tag: str,
+        iteration: int,
+        cells_reviewed: list,
+        main_passed: list,
+        second_review: dict | None,
+        second_review_added: list,
+        prose_forced: list,
+        prose_soft: dict,
+        jev_report: dict | None,
+    ) -> None:
+        """每轮网感复检之后的二审仲裁记录(stage_log `vibe_arbitration`,v0.37.1)。
+
+        output_data:
+          · second_review —— v4-flash 二审的原始结果(verdict / failed_cells /
+            cell_reviews / _gemini_usage / _skip_reason);主 critic 本轮没有判过的
+            cell 时是 verdict = not_run。
+          · second_review_added —— 二审额外判 fail、因此进了本轮重写的 cell。
+          · prose_gate —— 机审硬命中强制进重写的 cell 与 SOFT 标记。
+          · jev_shadow —— 判定服务影子的摘要(完整报告在 `jev_critic_shadow`)。
+        tokens_used 不填:二审的用量已经经 accumulate_auxiliary_cost 进了 run 总账,
+        详情页页脚按 stage_log 加总 tokens_used,再填一次会重复计数。"""
+        sr = dict(second_review or {})
+        verdict = sr.get("verdict") or "unknown"
+        usage = sr.get("_gemini_usage") or {}
+        jev = None
+        if isinstance(jev_report, dict):
+            jev = {"status": jev_report.get("status"),
+                   "gate_severity_agreement_with_main": jev_report.get("gate_severity_agreement_with_main"),
+                   "agreement_with_main": jev_report.get("agreement_with_main")}
+        output = {
+            "round": round_tag,
+            "iteration": iteration,
+            "cells_reviewed": cells_reviewed,
+            "main_critic_passed": main_passed,
+            "second_review": sr,
+            "second_review_added": list(second_review_added),
+            "prose_gate": {"forced": list(prose_forced), "soft": dict(prose_soft or {})},
+            "jev_shadow": jev,
+            "_note": "只记录:这条 log 不参与分流;哪些 cell 进重写以 vibe_critic 与本轮合并后的 failed 为准。",
+        }
+        try:
+            _log = self.db.create_stage_log(
+                self.run_id, "vibe_arbitration",
+                {"round": round_tag, "iteration": iteration, "cells": len(cells_reviewed)},
+            )
+            self.db.update_stage_log(
+                _log["id"],
+                status="skipped" if verdict in ("skipped", "not_run") else "completed",
+                output_data=output,
+                model_used=usage.get("model") or "v4-flash (second review)",
+            )
+        except Exception:
+            logger.warning("[vibe_arbitration] %s 落库失败(不影响本轮)", round_tag)
 
     def _write_jev_log(
         self, stage: str, input_meta: dict, output: dict, *, ok: bool,
@@ -6719,6 +6802,9 @@ REFINEMENT_MARKER_ANCHORS: dict[str, str] = {
     "jev_comment_regen": "vibe_critic",
     "jev_sample_shadow": "chancellery_final",
     "jev_comment_shadow": "chancellery_final",
+    # v0.37.1 每轮网感复检之后的二审仲裁记录(只记录,详情页 Tab 6 读它)。
+    # 跟 vibe_critic 一起失效:vibe_critic 重跑了,旧轮次的二审记录就对不上号了。
+    "vibe_arbitration": "vibe_critic",
 }
 
 

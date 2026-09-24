@@ -613,6 +613,8 @@ judge 仓 docs/00 #5 拍板:**二审先影子跑(记不分流),采样正文落�
 | 阶段 | 开关(默认) | 题库 | 写账本 | 结果去哪 | 改不改产出 |
 |------|-------------|------|--------|----------|-----------|
 | 网感二审影子 | `ENABLE_JEV_CRITIC_SHADOW`(开) | `ssll_critic_v0.1` | 否 | `critic_result["_jev_arbitration"]` + stage_log `jev_critic_shadow` | 否 |
+
+> v0.37.1:v4-flash 二审本身每轮另写一条 stage_log `vibe_arbitration`(原始结果、额外判 fail 的 cell、机审命中、Jev 一致率摘要),详情页 Tab 6 按时间顺序把它和 `jev_critic_shadow` 配回所属那一轮。`critic_result` 上挂的 `_gemini_arbitration` / `_jev_arbitration` / `_prose_soft_flags` 只在内存里和 `final_system.vibe_critic_result` 里,到不了那一轮 vibe_critic 的 stage_log(那条在 critic 返回前就写完了)。
 | 采样正文 | `ENABLE_JEV_SAMPLE_SHADOW`(开) | `feature_questions_v0_1` + 按段 `human_feel_para_v0.1` | fq 是(`ssll_sample`),段级否 | stage_log `jev_sample_shadow` | 否 |
 | 预埋评论 | `ENABLE_JEV_COMMENT_SHADOW`(开) | `comment_reader_v0.4` / `comment_thread_v0.3` | 否 | stage_log `jev_comment_shadow` | 否 |
 | 预埋评论重生成 | `ENABLE_JEV_COMMENT_REGEN`(**关**) | 同上 + Moonshot 生成端 | 否 | 写回 `cell.comment_seeds`,stage_log `jev_comment_regen`(兼续跑标记) | **是** |

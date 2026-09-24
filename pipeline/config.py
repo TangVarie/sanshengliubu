@@ -2,11 +2,26 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.37.0"
+VERSION = "v0.37.1"
 VERSION_DATE = "2026-09-24"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.37.1 fix: 详情页 Tab 6「二审(仲裁)」面板一直是空的,现在每轮都有真实数据。"
+    "\n\n"
+    "【为什么】critic_result[\"_gemini_arbitration\"] 是在 vibe_critic.run() 返回之后才挂上的,"
+    "而 BaseAgent.run 在返回前就把 output_data 写进了 vibe_critic 那条 stage_log,这个改动"
+    "永远到不了库;页面读的是库里那条,所以面板是死代码。v0.37.0 的 _jev_arbitration / "
+    "_prose_soft_flags 也挂在同一处,同样到不了 vibe_critic 的 log。"
+    "\n\n"
+    "【做了什么】每轮网感复检之后写一条 stage_log `vibe_arbitration`:v4-flash 二审原始结果"
+    "(verdict / failed_cells / cell_reviews / 用量 / 跳过原因)、二审额外判 fail 进了本轮重写"
+    "的 cell、机审硬命中与 SOFT 标记、判定服务影子的一致率摘要。只记录,不改 failed、不改"
+    "severity、不影响哪些 cell 进重写;落库失败只丢这一行。登记进 REFINEMENT_MARKER_ANCHORS"
+    "(锚 vibe_critic)。详情页用 utils/stage_log_pairing.py 按时间顺序把 vibe_arbitration 和"
+    "jev_critic_shadow 配回所属那一轮 vibe_critic,Tab 6 同时显示 Jev 影子的一致率。"
+    "tests/test_vibe_arbitration.py 覆盖落库路径(FakeDB)、未跑二审、写库失败、失效锚点、配对。"
+    "\n\n---\n\n"
     "v0.37.0 feature: 接入共用判定服务 judge(Jev 闭集判定),全部影子跑。"
     "\n\n"
     "【为什么】三省六部里批评家、画像、二审全是生成式模型在做闭集判断(pass / weak / "
