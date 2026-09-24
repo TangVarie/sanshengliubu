@@ -964,9 +964,16 @@ def accumulate_auxiliary_cost(
     the guard into irrelevance. Tokens are still tracked per-source for the
     UI breakdown.
 
-    ⚠️ v0.32.0: 辅助层(kimi_client)【不】走这里 —— 它是 advisory,刻意不进
-    run 总账,免得二审/结构审的开销把主链路的预算熔断提前触发。它的成本经
-    call_kimi_json 返回值里的 cost_usd 单独上报给调用方。
+    辅助层的成本**走这里**(v0.37.0 更正:此前这段写着「辅助层【不】走这里」,
+    和代码对不上)。kimi_client 自己不记账,只把 cost_usd 放在返回值里,由
+    orchestrator 在调用点经本函数记进 run 总账的 cost_usd:
+      - 网感二审(v4-flash)       source="gemini_critic"
+      - 结构审                    source="gemini_structure"
+      - 批量采样                  source="batch_sampling"
+      - 判定服务(judge / Jev)    source="jev_judge"
+      - 预埋评论重生成的生成端    source="jev_comment_regen"(默认关)
+    它们都**不**进 input/output token 计数,所以不会把 MAX_TOKENS_PER_RUN 的
+    熔断提前触发(辅助层是 advisory,不该因为它把整条 run 判死)。
     """
     with _run_totals_lock:
         totals = _run_totals.setdefault(

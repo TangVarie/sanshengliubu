@@ -33,6 +33,10 @@ critic 看它、二审看它、消费者模拟看它、终审看它。11 道闸,
 这一整轮改造要治的病。先攒几条 run 的真实分布,再决定阈值定在哪、要不要升级成
 闸门。
 
+v0.37.0 起每篇的**正文全文**随报告落库(`per_sample[i].body`),orchestrator
+再给每篇编判定服务账本 id(`<run_id>:<cell>:<代际>:<seed>`),采样正文过 fq +
+人感题库的影子判定(judge 仓 docs/31 §6.2),同样只记不拦。
+
 ## 成本
 
 采样调用很便宜:system_prompt 走 prompt cache(K2.6 命中价省 83%),每次只出
@@ -372,6 +376,12 @@ async def sample_one_cell(
             "seed": _seed,          # 真实发出去的 seed,不是列表下标推算的
             "opening": first_sentence(_strip_trailing_hashtags(s))[:60],
             "chars": len(s),
+            # v0.37.0:正文全文落库。此前只留 opening[:60] + 字数,采样是全流水线
+            # 唯一多样本的地方,正文却随进程一起丢了 —— 事后既没法回看「那一篇」,
+            # 判定服务(judge)也没东西可判。12 格 × 5 篇约 50KB,和矩阵快照同量级。
+            # 账本 id(subject_id)不在这里编:run_id 不在本函数签名里,由
+            # orchestrator 拼(jev_shadow.assign_sample_subject_ids)。
+            "body": s,
             "redline_violations": [x["rule"] for x in v],
             "craft_missing": missing,
         })

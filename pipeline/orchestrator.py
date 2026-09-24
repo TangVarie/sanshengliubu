@@ -27,6 +27,23 @@ from pipeline.config import (
     ENABLE_STRUCTURAL_REWRITER,
     ENABLE_STRATEGIC_ESCALATION,
     ENABLE_CONSUMER_SIMULATION,
+    ENABLE_JEV_COMMENT_REGEN,
+    ENABLE_JEV_COMMENT_SHADOW,
+    ENABLE_JEV_CRITIC_SHADOW,
+    ENABLE_JEV_PERSONA_ROUTE,
+    ENABLE_JEV_SAMPLE_SHADOW,
+    JEV_COMMENT_READER_BANK,
+    JEV_COMMENT_REGEN_CONCURRENCY,
+    JEV_COMMENT_REGEN_K,
+    JEV_COMMENT_REGEN_MAX_CELLS,
+    JEV_COMMENT_REGEN_MAX_OUTPUT_TOKENS,
+    JEV_COMMENT_THREAD_BANK,
+    JEV_CRITIC_BANK,
+    JEV_SAMPLE_FQ_BANK,
+    JEV_SAMPLE_HUMAN_BANK,
+    JEV_SAMPLE_WRITE,
+    JUDGE_MAX_SUBJECTS_PER_REQUEST,
+    PRIMARY_MODEL,
     CONSUMER_SIM_ONLY_WEAK_ALIGN,
     NARRATIVE_DIRECTOR_MAX_REBUILDS,
     PERSONA_WEAK_REQUIRES_BOTH_BACKENDS,
@@ -58,7 +75,9 @@ from pipeline.agents import (
     release_run_budget,
     reset_run_budget,
 )
+from pipeline.agents import judge_client
 from pipeline.agents.kimi_critic import run_kimi_critic
+from pipeline import jev_shadow
 from pipeline.agents.kimi_structure_reviewer import (
     format_revision_hints as _format_structure_hints,
     run_kimi_structure_review,
@@ -71,6 +90,7 @@ from pipeline.retrieve_samples import (
 from pipeline.logger_utils import mask_secrets
 from pipeline.batch_sampler import run_batch_sampling
 from pipeline.prose_gate import (
+    AI_CLICHE_BLACKLIST,
     format_hard_hits_for_rewriter,
     run_prose_gate,
     scan_text as prose_scan_text,
@@ -1047,6 +1067,16 @@ class PipelineOrchestrator:
 
             self._check_cancelled("网感循环之后")
 
+            # 5f. 预埋评论重生成(v0.37.0,**默认关** —— 会改产出)。按评论位用
+            # Moonshot 出候选、Jev 挑最好的一条写回 cell.comment_seeds,跑在终审
+            # 之前让终审看到的就是新评论。它改矩阵,所以 stage_log
+            # `jev_comment_regen` 兼作续跑标记:有就把上次写回的评论重新贴回矩阵
+            # (矩阵是从 refined_b/c 快照恢复的,快照里是重生成之前的评论)。
+            if ENABLE_JEV_COMMENT_REGEN:
+                await self._maybe_run_jev_comment_regen(
+                    final_system, structured_brief, done
+                )
+
             # 6. 门下省终审
             # Track review round for the final-review force-pass mechanism.
             # Round 1 = fresh run. Round ≥ 2 = user applied revisions at least
@@ -1205,6 +1235,13 @@ class PipelineOrchestrator:
                         structured_brief or {},
                         n=BATCH_SAMPLE_N,
                     )
+                    # v0.37.0: 每篇采样编判定服务账本 id `<run_id>:<cell>:<代际>:<seed>`。
+                    # run_id 不在采样函数的签名里,在这里拼;代际一次采样一个值 ——
+                    # 修订重跑会删掉 batch_sampling 日志、按同一组 seed 重采,不带代际的话
+                    # 新旧两批正文对应同一个账本主键,后写覆盖先写(见 jev_shadow.new_generation)。
+                    jev_shadow.assign_sample_subject_ids(
+                        _sampling, self.run_id, jev_shadow.new_generation()
+                    )
                     final_system["_batch_sampling"] = _sampling
                     _slog = self.db.create_stage_log(
                         self.run_id,
@@ -1246,6 +1283,12 @@ class PipelineOrchestrator:
                 except Exception:
                     # 采样是 advisory —— 绝不能因为它把一条跑完的 run 判死。
                     logger.exception("[batch_sample] 失败(non-fatal),继续出货")
+
+            # 6.965 判定服务影子(v0.37.0,judge 仓 docs/00 #5「采样正文落库后再判」)。
+            # 采样正文过 fq(写账本,subject_type = ssll_sample)+ 人感(按段,不写),
+            # 预埋评论过评论题库(不写)。只进各自的 stage_log,不改出货的任何东西。
+            # 没配 JUDGE_URL 时整段不执行(连取消检查的那次 DB 查询都不发)。
+            await self._run_jev_post_final_shadows(final_system, structured_brief, done)
 
             # 6.97 质量评分(双层评分体系)。跑在这里是有意的:此时 prompt_matrix
             # 已经过全部精炼阶段(红蓝 / 网感重写 / 结构补漏 / 策略升级),
@@ -3106,6 +3149,21 @@ class PipelineOrchestrator:
                     _p_tagged["id"] = f"{_orig_pid}_ds" if _orig_pid else "P_unknown_ds"
                 merged_personas.append(_p_tagged)
 
+        # v0.37.0 persona 第三路(Jev,默认关;judge 仓 docs/00 #5「后做」)。
+        # 开着时 Jev 对每个 cell 按核心 / 边缘 / 反面三位读者各答一次,拼成 3 个
+        # `_source="jev"` 的画像(每个 cell 3 条 reactions)并进 merged_personas,
+        # 下面的弱 cell 判据相应改成「至少两路否决」。关着时这一段整段不执行,
+        # 画像模拟与 v0.36.1 逐字节一致。
+        _jev_route_meta = None
+        if ENABLE_JEV_PERSONA_ROUTE:
+            try:
+                _jev_personas, _jev_route_meta = await self._run_jev_persona_route(
+                    prompt_cells, brief
+                )
+                merged_personas.extend(_jev_personas)
+            except Exception:
+                logger.exception("[persona_sim] Jev 第三路失败(non-fatal),只用两个生成式后端")
+
         # 用 Claude 的 summary 当主(它通常更结构化),DeepSeek 的留作 _ds_summary
         # 给 UI 展示。如果 Claude 失败就 fallback DeepSeek。
         _primary = _claude_result or _ds_result or {}
@@ -3125,6 +3183,8 @@ class PipelineOrchestrator:
                 "deepseek_error": _ds_err,
             },
         }
+        if ENABLE_JEV_PERSONA_ROUTE:
+            result["_jev_route"] = _jev_route_meta or {"status": "skipped"}
         tagged = result
         final_system["_persona_reactions"] = tagged
 
@@ -3192,14 +3252,24 @@ class PipelineOrchestrator:
             # 只有一个 backend 跑通时(另一个没配 key / 挂了)交集自动退化成
             # 它自己,不会因为少一票就永远判不出弱 cell。
             if PERSONA_WEAK_REQUIRES_BOTH_BACKENDS and len(_backends_seen) > 1:
-                _weak_cell_ids = sorted(
-                    cid for cid, srcs in _vetoed_by.items()
-                    if srcs >= _backends_seen
-                )
-                _single_sided = sorted(
-                    cid for cid, srcs in _vetoed_by.items()
-                    if not (srcs >= _backends_seen)
-                )
+                if ENABLE_JEV_PERSONA_ROUTE:
+                    # v0.37.0 第三路开着:两个生成式后端 + Jev,「至少两路一致否决」
+                    # 才判弱(docs/31 §6.1)。只跑通两路时这就是原来的交集。
+                    _weak_cell_ids = sorted(
+                        cid for cid, srcs in _vetoed_by.items() if len(srcs) >= 2
+                    )
+                    _single_sided = sorted(
+                        cid for cid, srcs in _vetoed_by.items() if len(srcs) < 2
+                    )
+                else:
+                    _weak_cell_ids = sorted(
+                        cid for cid, srcs in _vetoed_by.items()
+                        if srcs >= _backends_seen
+                    )
+                    _single_sided = sorted(
+                        cid for cid, srcs in _vetoed_by.items()
+                        if not (srcs >= _backends_seen)
+                    )
                 if _single_sided:
                     logger.info(
                         "[persona_sim] %d 个 cell 只被单边 backend 否决,按交集"
@@ -3216,7 +3286,7 @@ class PipelineOrchestrator:
                 for _cid in _weak_cell_ids:
                     _cell = _cell_idx.get(_cid, {})
                     _sample = " | ".join(_reactions_per_cell.get(_cid, [])[:3])
-                    final_system.setdefault("strategic_warnings", []).append({
+                    _weak_warning = {
                         "cell_id": _cid,
                         "direction_id": _cell.get("direction_id", ""),
                         "platform": _cell.get("platform", ""),
@@ -3228,7 +3298,13 @@ class PipelineOrchestrator:
                         "multiplier_gate": {"interest_align": "fail"},
                         "iteration": "persona_sim",
                         "source": "persona_simulator",
-                    })
+                    }
+                    if ENABLE_JEV_PERSONA_ROUTE:
+                        # 第三路开着时记下是哪几路否决的,复盘 Jev 的票有没有起作用
+                        _weak_warning["vetoed_by"] = sorted(_vetoed_by.get(_cid, ()))
+                    final_system.setdefault("strategic_warnings", []).append(
+                        _weak_warning
+                    )
 
                 logger.warning(
                     "[persona_sim] %d weak cells flagged into "
@@ -3905,6 +3981,9 @@ class PipelineOrchestrator:
         hard_cap = VIBE_LOOP_HARD_CAP
         initial_cap = VIBE_LOOP_INITIAL_CAP
         escalate_threshold = VIBE_LOOP_ESCALATE_THRESHOLD
+        # v0.37.0: 第几次进网感循环(策略升级会再跑一整轮),只用来给判定服务
+        # 影子的 subject_id / stage_log 编号,不参与任何判断。
+        self._jev_vibe_pass = getattr(self, "_jev_vibe_pass", 0) + 1
         prompt_cells = final_system.get("prompt_matrix", [])
         if not prompt_cells:
             logger.warning("Vibe loop skipped: no prompt_cells")
@@ -4059,6 +4138,11 @@ class PipelineOrchestrator:
             if iteration == 0 and _persona_pkg.get("status") == "ok":
                 _per_cell_reactions: dict = {}
                 for _p in (_persona_pkg.get("personas") or []):
+                    if ENABLE_JEV_PERSONA_ROUTE and _p.get("_source") == "jev":
+                        # v0.37.0: Jev 第三路只参与弱 cell 否决(docs/31 §6.1),不注入
+                        # critic —— vibe_critic.md 第 0.4 步按「3 个画像」的口径写规则,
+                        # 多出来的 3 票会改 critic 的判决尺度。
+                        continue
                     _pid = _p.get("id", "?")
                     for _r in (_p.get("reactions") or []):
                         _cid_r = _r.get("cell_id")
@@ -4179,6 +4263,7 @@ class PipelineOrchestrator:
                 c for c in cells_to_critique
                 if c.get("cell_id") not in failed_ids
             ]
+            _v4_for_jev = None  # v0.37.0: 给判定服务影子做三方对照用,只读
             if claude_passed:
                 try:
                     gemini_result = await run_kimi_critic(claude_passed)
@@ -4236,6 +4321,29 @@ class PipelineOrchestrator:
                 # Even if Gemini didn't add new fails, stash its raw
                 # result on the critic_result for UI / stage_log record.
                 critic_result["_gemini_arbitration"] = gemini_result
+                _v4_for_jev = gemini_result
+
+            # ── 判定服务二审影子(v0.37.0,judge 仓 docs/00 #5「记不分流」)──
+            # Jev 按 multiplier_gate 四项 + template_test.still_holds 给本轮评的每个
+            # cell 出概率,和主 critic、v4-flash 二审三方对照。结果**只**进
+            # critic_result["_jev_arbitration"] 和 stage_log `jev_critic_shadow`:
+            # 不进 failed、不改 severity、不映射 strategic(Jev 判 interest_align /
+            # reward_signal = fail 若归 strategic,就会触发策略升级回中书省重跑整轮,
+            # 一次几分钱的调用能触发全流水线最贵的重入,误报代价极不对称)。
+            # 没配 JUDGE_URL 时整段零副作用。
+            if ENABLE_JEV_CRITIC_SHADOW and judge_client.is_configured():
+                try:
+                    await self._run_jev_critic_shadow(
+                        round_tag=f"v{self._jev_vibe_pass}r{iteration + 1}",
+                        critic_input=critic_input,
+                        critic_result=critic_result,
+                        v4_result=_v4_for_jev,
+                        brief=structured_brief,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[jev_critic_shadow] 失败(non-fatal,影子阶段不影响本轮判决)"
+                    )
 
             # ── 机审闸(v0.33.5)───────────────────────────────────────
             # 纯 Python 扫本轮 cell 的机械指纹(翻案句 / 商业黑话 / 伪精确行为量 /
@@ -4250,6 +4358,14 @@ class PipelineOrchestrator:
             # 免费复扫一遍,能抓到 rewriter「把 A 指纹改成 B 指纹」的情况 ——
             # 那是机扫过了、读者没过的最隐蔽劣化路径。
             _pg_forced: set[str] = set()
+            # SOFT 档按 prose_gate 的定位是「记标不 fail,给 critic 当参考」。
+            # v0.37.0 之前这里把它写到矩阵 cell 的 `_prose_soft_flags` 上,全仓没有
+            # 任何地方读 —— 却跟着 cell 进了 vibe_rewriter 的输入、终审的输入和交付的
+            # prompt_matrix,改写之后还是旧 demo 的标记。现在记在本轮 critic 结果上
+            # (和 _gemini_arbitration / _jev_arbitration 同一处),不再污染矩阵。
+            # 刻意**不**注入下一轮 critic 的输入:那会改 severity,不是记录。
+            # 出货那一版的 SOFT 标记另有 stage_log `prose_gate` 的 per_cell.soft_flags。
+            _pg_soft: dict[str, list] = {}
             for _c in cells_to_critique:
                 _cid_pg = _c.get("cell_id")
                 if not _cid_pg or _cid_pg in {
@@ -4257,7 +4373,8 @@ class PipelineOrchestrator:
                 }:
                     continue
                 _pg = prose_scan_text(_c.get("demo_output") or "")
-                _c["_prose_soft_flags"] = _pg["soft"]
+                if _pg["soft"]:
+                    _pg_soft[_cid_pg] = _pg["soft"]
                 if not _pg["hard"]:
                     continue
                 failed.append({
@@ -4275,6 +4392,8 @@ class PipelineOrchestrator:
                     "_flagged_by": "prose_gate",
                 })
                 _pg_forced.add(_cid_pg)
+            if _pg_soft:
+                critic_result["_prose_soft_flags"] = _pg_soft
             if _pg_forced:
                 logger.info(
                     "[prose_gate] 机审硬命中 %d 个 critic 判过的 cell,"
@@ -5062,6 +5181,534 @@ class PipelineOrchestrator:
                 "(矩阵共 %d 个)",
                 len(_target_cells), len(prompt_cells),
             )
+
+    # ── 判定服务(judge / Jev)影子阶段 (v0.37.0) ──────────────────────────
+    #
+    # judge 仓 docs/00 #5 拍板:二审先影子跑(记不分流),采样正文落库后再判,
+    # persona 第三路后做。几条纪律:
+    #   · 没配 JUDGE_URL:调用点在进来之前就用 judge_client.is_configured() 短路,
+    #     零副作用 —— 不发请求、不写 stage_log、不往任何结果上挂字段。
+    #   · 配了:结果只进各自的 stage_log(二审另挂 critic_result["_jev_arbitration"]),
+    #     不改 failed / severity / 分流 / strategic_warnings / 产出。
+    #   · 会改产出或判据的两件(评论重生成、画像第三路)在默认关的开关后面。
+    #   · 每个请求都带 project / category / published=false(数据出境,docs/00 #7);
+    #     只有采样稿的 fq 判定写账本。
+    #   · 成本按 Jev 价算好,经 accumulate_auxiliary_cost(source="jev_judge") 记账,
+    #     和二审 / 结构审 / 批量采样三处同一个做法。
+    #   · 新增的 stage_log 名全部在 JEV_STAGE_LOG_NAMES 里,登记在
+    #     REFINEMENT_MARKER_ANCHORS,重跑 / 修订时跟着锚点一起失效。
+
+    async def _jev_judge(
+        self,
+        bank: str,
+        subjects: list[dict],
+        *,
+        brief: dict | None,
+        write: bool = False,
+        chunk_size: int | None = None,
+    ) -> dict:
+        """调判定服务的唯一入口。永不抛异常:成功 {"status": "ok", ...},
+        否则 {"status": "skipped", "reason": ...}(调用方一律当跳过)。
+
+        熔断:同一个 run 里只要有一次是「服务整体不可用」(超时 / 连不上 / 401 /
+        503 / URL 不对),后面的影子调用直接跳过 —— 单次最坏要等两次 8 秒超时,
+        一条 run 里有十来次调用,不熔断的话服务挂掉时会把流水线尾段拖长几分钟。
+        题库级的失败(策略拒绝、题库没部署、请求形状不对)不熔断,别的题库照常。"""
+        scope = jev_shadow.judge_scope(self.project_id, brief)
+        if not subjects:
+            return {"status": "skipped", "reason": "no_subjects", "bank": bank, "scope": scope}
+        _tripped = getattr(self, "_jev_circuit", None)
+        if _tripped:
+            return {"status": "skipped", "reason": "circuit_open",
+                    "detail": f"本 run 先前一次调用发现判定服务不可用({_tripped}),不再发请求",
+                    "bank": bank, "scope": scope}
+        try:
+            res = await asyncio.to_thread(
+                judge_client.judge_many,
+                bank,
+                subjects,
+                write=write,
+                project=scope["project"],
+                category=scope["category"],
+                published=False,
+                chunk_size=chunk_size,
+            )
+        except judge_client.JudgePolicyRefused as e:
+            # 处方药项目的未发布稿:按拍板本来就不出境,不是故障
+            logger.info("[jev] %s 被数据出境策略拒绝,跳过: %s", bank, e)
+            return {**judge_client.skip_record(e), "bank": bank, "scope": scope}
+        except (judge_client.JudgeNotConfigured, judge_client.JudgeCallFailed) as e:
+            logger.warning(
+                "[jev] %s 跳过(%s): %s", bank, getattr(e, "kind", "?"), e
+            )
+            if getattr(e, "kind", None) in _JEV_CIRCUIT_KINDS:
+                self._jev_circuit = getattr(e, "kind", "unavailable")
+            return {**judge_client.skip_record(e), "bank": bank, "scope": scope}
+        except Exception as e:  # noqa: BLE001 — 影子阶段绝不外抛
+            logger.exception("[jev] %s 客户端意外异常,跳过", bank)
+            return {
+                "status": "skipped", "reason": "client_error",
+                "detail": mask_secrets(f"{type(e).__name__}: {e}")[:300],
+                "bank": bank, "scope": scope,
+            }
+        usage = res.get("usage") or {}
+        if res.get("cost_usd") or usage.get("input_tokens") or usage.get("output_tokens"):
+            accumulate_auxiliary_cost(
+                self.run_id,
+                cost_usd=float(res.get("cost_usd") or 0.0),
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                source="jev_judge",
+            )
+        res.update({"status": "ok", "bank": bank, "scope": scope})
+        return res
+
+    def _write_jev_log(
+        self, stage: str, input_meta: dict, output: dict, *, ok: bool,
+    ) -> None:
+        """影子阶段的 stage_log。落库失败只丢这一行记录,不影响本轮。
+
+        tokens_used 刻意不填:详情页页脚把全部 stage_log 的 tokens_used 加总当
+        「本 run 用了多少 token」,Jev 的输入 token 单价是主链路的几十分之一,
+        混进去会让那个数失真。用量和成本在 output_data 的 judge.usage / cost_usd 里,
+        成本已经经 accumulate_auxiliary_cost 进了 run 总账。"""
+        try:
+            _log = self.db.create_stage_log(self.run_id, stage, input_meta)
+            self.db.update_stage_log(
+                _log["id"],
+                status="completed" if ok else "skipped",
+                output_data=output,
+                model_used="jev (judge)",
+            )
+        except Exception:
+            logger.warning("[jev] %s 落库失败(不影响本轮)", stage)
+
+    async def _run_jev_post_final_shadows(
+        self, final_system: dict, brief: dict | None, done: dict
+    ) -> None:
+        """终审之后的两个影子阶段(采样正文、预埋评论)。没配 JUDGE_URL 或两个开关
+        都关时直接返回 —— 连取消检查那次 DB 查询都不发。取消照常往上抛。"""
+        if not (ENABLE_JEV_SAMPLE_SHADOW or ENABLE_JEV_COMMENT_SHADOW):
+            return
+        if not judge_client.is_configured():
+            return
+        self._check_cancelled("判定服务影子之前")
+        if ENABLE_JEV_SAMPLE_SHADOW:
+            if done.get("jev_sample_shadow"):
+                logger.info("[resume] 跳过采样影子判定(复用上次结果)")
+            else:
+                try:
+                    await self._run_jev_sample_shadow(final_system.get("_batch_sampling"), brief)
+                except Exception:
+                    logger.exception("[jev_sample_shadow] 失败(non-fatal),继续出货")
+        if ENABLE_JEV_COMMENT_SHADOW:
+            if done.get("jev_comment_shadow"):
+                logger.info("[resume] 跳过预埋评论影子判定(复用上次结果)")
+            else:
+                try:
+                    await self._run_jev_comment_shadow(final_system, brief)
+                except Exception:
+                    logger.exception("[jev_comment_shadow] 失败(non-fatal),继续出货")
+
+    async def _maybe_run_jev_comment_regen(
+        self, final_system: dict, brief: dict | None, done: dict
+    ) -> None:
+        """预埋评论重生成的入口(调用方已判过 ENABLE_JEV_COMMENT_REGEN)。有续跑标记
+        就把上次写回的评论贴回矩阵,否则在判定服务可用时现跑。失败保留原评论。"""
+        _cr_prev = done.get("jev_comment_regen")
+        if _cr_prev and (_cr_prev.get("applied") or {}):
+            _n = _apply_comment_seeds(
+                final_system.get("prompt_matrix") or [], _cr_prev.get("applied") or {}
+            )
+            logger.info("[resume] 跳过预埋评论重生成,把上次写回的 %d 个 cell 的评论贴回矩阵", _n)
+            return
+        if not judge_client.is_configured():
+            return
+        try:
+            await self._run_jev_comment_regen(final_system, brief)
+        except Exception:
+            logger.exception("[jev_comment_regen] 失败(non-fatal),保留工部·构建产出的原评论")
+
+    async def _run_jev_critic_shadow(
+        self,
+        *,
+        round_tag: str,
+        critic_input: dict,
+        critic_result: dict,
+        v4_result: dict | None,
+        brief: dict | None,
+    ) -> None:
+        """网感二审影子:本轮 critic 评的每个 cell 交给 Jev(题库 ssll_critic_v0.1)。
+
+        state 装主 critic 判决时对照的全部锚点 —— stop_trigger / reward_type /
+        gap_direction(来自 _direction_index)、product_role(来自 cell_plan)、
+        advertising_stance(brief)。critic_input.prompt_cells 就是 _enriched_cell
+        的产物,已经带着这些字段。
+        ⚠️ 现行 v4-flash 二审(kimi_critic.py)的 payload 同样缺这些锚点,但**没有**
+        顺手补:它的结论直接进 failed、决定哪些 cell 被重写,补锚点会改变分流,
+        不是纯粹的 payload 增补。
+        """
+        cells = [c for c in (critic_input.get("prompt_cells") or []) if c.get("cell_id")]
+        if not cells:
+            return
+        bc = critic_input.get("brief_context") or {
+            "advertising_stance": (brief or {}).get("advertising_stance", ""),
+        }
+        dir_idx = getattr(self, "_direction_index", {}) or {}
+        subjects = [
+            jev_shadow.critic_subject(
+                self.run_id, round_tag, c, bc, dir_idx.get(c.get("direction_id"))
+            )
+            for c in cells
+        ]
+        res = await self._jev_judge(JEV_CRITIC_BANK, subjects, brief=brief)
+        _v4_ok = isinstance(v4_result, dict) and v4_result.get("verdict") != "skipped"
+        if res.get("status") == "ok":
+            report = jev_shadow.summarize_critic_shadow(
+                res,
+                run_id=self.run_id,
+                round_tag=round_tag,
+                cell_ids=[c["cell_id"] for c in cells],
+                main_reviews=critic_result.get("cell_reviews") or [],
+                v4_reviews=(v4_result or {}).get("cell_reviews") if _v4_ok else None,
+            )
+        else:
+            report = {"mode": "shadow", "round": round_tag,
+                      "cells": [c["cell_id"] for c in cells]}
+        report["status"] = res.get("status")
+        report["judge"] = jev_shadow.resp_meta(res)
+        critic_result["_jev_arbitration"] = report
+        self._write_jev_log(
+            "jev_critic_shadow",
+            {"round": round_tag, "cells": len(cells), "bank": JEV_CRITIC_BANK},
+            report,
+            ok=res.get("status") == "ok",
+        )
+        if res.get("status") == "ok":
+            _agr = report.get("gate_severity_agreement_with_main") or {}
+            logger.info(
+                "[jev_critic_shadow] %s: %d 个 cell,门槛层判决与主 critic 一致 %s/%s",
+                round_tag, len(cells), _agr.get("agree"), _agr.get("n"),
+            )
+
+    async def _run_jev_persona_route(
+        self, prompt_cells: list[dict], brief: dict
+    ) -> tuple[list[dict], dict]:
+        """画像第三路(ENABLE_JEV_PERSONA_ROUTE,默认关)。返回 (Jev 画像列表, 元信息)。
+
+        Jev 不会角色扮演,这里把核心 / 边缘 / 反面三位读者写进 state,对每个 cell
+        问三道闭集题(点开 / 划走 / 想留着 / 说不清)。歧义与出口选项都记
+        `unclear`,不算划走 —— 误报一票会触发策略升级,从严。
+        """
+        if not judge_client.is_configured():
+            return [], {"status": "skipped", "reason": "not_configured"}
+        ta = brief.get("target_audience", "") or ""
+        if isinstance(ta, list):
+            ta = ", ".join(str(t) for t in ta)
+        pairs = [
+            (c["cell_id"], jev_shadow.persona_subject(self.run_id, c, ta))
+            for c in prompt_cells if c.get("cell_id")
+        ]
+        res = await self._jev_judge(
+            JEV_CRITIC_BANK, [s for _cid, s in pairs], brief=brief
+        )
+        personas = (
+            jev_shadow.personas_from_results(res, pairs)
+            if res.get("status") == "ok" else []
+        )
+        meta = jev_shadow.resp_meta(res)
+        meta["cells"] = len(pairs)
+        meta["personas"] = len(personas)
+        self._write_jev_log(
+            "jev_persona_route",
+            {"cells": len(pairs), "bank": JEV_CRITIC_BANK},
+            {**meta, "personas": personas},
+            ok=res.get("status") == "ok" and bool(personas),
+        )
+        return personas, meta
+
+    async def _run_jev_sample_shadow(
+        self, sampling: dict | None, brief: dict | None
+    ) -> None:
+        """采样正文过 fq 题库(写账本)+ 人感题库(按段,不写)。"""
+        samples = list(jev_shadow.iter_samples(sampling))
+        if not samples:
+            logger.info(
+                "[jev_sample_shadow] 没有带正文的采样(采样没跑成,或是 v0.37.0 之前的"
+                "采样日志),跳过"
+            )
+            return
+        fq_subjects = [jev_shadow.sample_fq_subject(ps) for _rep, ps in samples]
+        # 两个题库先后跑,不并发:并发会把同时在飞的 Jev 调用翻倍,顶到 Jev 的限流
+        # (key 三仓共用),见 config.JUDGE_CLIENT_CONCURRENCY 的注释。
+        fq_res = await self._jev_judge(
+            JEV_SAMPLE_FQ_BANK, fq_subjects, brief=brief, write=JEV_SAMPLE_WRITE,
+        )
+        para_subjects: list[dict] = []
+        hf_res = None
+        if JEV_SAMPLE_HUMAN_BANK:
+            for _rep, _ps in samples:
+                para_subjects.extend(
+                    jev_shadow.sample_para_subjects(_ps, _rep.get("platform", ""))
+                )
+            hf_res = await self._jev_judge(
+                JEV_SAMPLE_HUMAN_BANK, para_subjects, brief=brief, write=False,
+                # 段级每个 subject 只一次 Jev 调用(没有证据选句),一个请求可以多带几段
+                chunk_size=JUDGE_MAX_SUBJECTS_PER_REQUEST * 2,
+            )
+        report = jev_shadow.summarize_sample_shadow(sampling, fq_res, hf_res)
+        report["judge"] = {
+            "fq": jev_shadow.resp_meta(fq_res),
+            "human_feel": jev_shadow.resp_meta(hf_res) if hf_res else None,
+        }
+        report["ledger"] = {
+            "subject_type": jev_shadow.SUBJECT_TYPE,
+            "write": bool(JEV_SAMPLE_WRITE),
+            "written": fq_res.get("written"),
+        }
+        _ok = fq_res.get("status") == "ok" or (hf_res or {}).get("status") == "ok"
+        self._write_jev_log(
+            "jev_sample_shadow",
+            {"samples": len(samples), "paragraphs": len(para_subjects),
+             "generation": (sampling or {}).get("generation")},
+            report,
+            ok=_ok,
+        )
+        logger.info(
+            "[jev_sample_shadow] %d 篇采样 · fq %s(写入 %s 行)· 人感 %s",
+            len(samples), fq_res.get("status"), fq_res.get("written"),
+            (hf_res or {}).get("status", "off"),
+        )
+
+    async def _run_jev_comment_shadow(
+        self, final_system: dict, brief: dict | None
+    ) -> None:
+        """cell.comment_seeds 逐条过读者侧评论题库、整组过评论区题库。不写账本。"""
+        cells = [
+            c for c in (final_system.get("prompt_matrix") or [])
+            if c.get("cell_id") and jev_shadow.seed_texts(c)
+        ]
+        if not cells:
+            return
+        reader_subjects: list[dict] = []
+        thread_subjects: list[dict] = []
+        for c in cells:
+            _r, _t = jev_shadow.comment_subjects(self.run_id, c)
+            reader_subjects.extend(_r)
+            if _t:
+                thread_subjects.append(_t)
+        rr = await self._jev_judge(JEV_COMMENT_READER_BANK, reader_subjects, brief=brief)
+        tr = await self._jev_judge(JEV_COMMENT_THREAD_BANK, thread_subjects, brief=brief)
+        report = jev_shadow.summarize_comment_shadow(cells, self.run_id, rr, tr)
+        report["judge"] = {
+            "reader": jev_shadow.resp_meta(rr),
+            "thread": jev_shadow.resp_meta(tr),
+        }
+        self._write_jev_log(
+            "jev_comment_shadow",
+            {"cells": len(cells), "seeds": len(reader_subjects)},
+            report,
+            ok=rr.get("status") == "ok" or tr.get("status") == "ok",
+        )
+
+    async def _run_jev_comment_regen(
+        self, final_system: dict, brief: dict | None
+    ) -> None:
+        """预埋评论重生成(ENABLE_JEV_COMMENT_REGEN,默认关 —— 会改产出)。
+
+        judge 仓的 comments.produce_comments 在本仓用不了(那是 judge 进程里的库,
+        生成端要在这边跑),所以这里是它的精简版:逐评论位 best-of-k(生成端
+        Moonshot,人设 / 口吻取自该 cell 的 system_prompt)→ Jev 读者侧题库打分取
+        最好的一条 → 整组过评论区题库(只记录,不换位重出)→ 全部位都有结果的
+        cell 才写回 comment_seeds。任何一个 cell 失败都保留工部·构建的原评论。
+        写回在全部 cell 跑完之后一次做,中途异常不会留下改了一半的矩阵。
+
+        生成调用和批量采样一样走**主链路的限流器**(每次真实请求单独取槽、内层
+        不重试):这一步跑在终审之前、主链路还在跑,旁路打出的 429 会让主链路的
+        自适应限流器误以为自己太快而减速(v0.33.8 采样踩过的坑)。
+        """
+        from pipeline.agents import _get_active_limiter
+        from pipeline.agents.kimi_client import (
+            KimiCallFailed,
+            KimiNotConfigured,
+            call_kimi_text,
+        )
+
+        cells = [
+            c for c in (final_system.get("prompt_matrix") or [])
+            if c.get("cell_id") and (c.get("demo_output") or "").strip()
+        ][:JEV_COMMENT_REGEN_MAX_CELLS]
+        if not cells:
+            return
+        slots = list(jev_shadow.DEFAULT_COMMENT_SLOTS)
+        order = sorted(slots, key=lambda s: 1 if s.reply_to else 0)
+        gen_usage = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+        # 这些原因换一个 cell 也一样,直接收手
+        _fatal = {"not_configured", "unauthorized", "unavailable", "bad_url",
+                  "policy_blocked", "bank_missing", "bad_request", "circuit_open"}
+        state: dict[str, Any] = {"abort_reason": None}
+        sem = asyncio.Semaphore(JEV_COMMENT_REGEN_CONCURRENCY)
+
+        def _gen_sync(system: str, user: str) -> dict:
+            lim = _get_active_limiter()
+            kw = dict(model=PRIMARY_MODEL,
+                      max_output_tokens=JEV_COMMENT_REGEN_MAX_OUTPUT_TOKENS,
+                      max_attempts=1)
+            if lim is None:
+                return call_kimi_text(system, user, **kw)
+            with lim.slot(stage_name="jev_comment_regen"):
+                return call_kimi_text(system, user, **kw)
+
+        async def _gen(system: str, user: str) -> str | None:
+            try:
+                r = await asyncio.to_thread(_gen_sync, system, user)
+            except (KimiNotConfigured, KimiCallFailed) as e:
+                logger.warning("[jev_comment_regen] 生成端失败: %s", e)
+                return None
+            gen_usage["cost_usd"] += float(r.get("cost_usd") or 0.0)
+            gen_usage["input_tokens"] += int(r.get("input_tokens") or 0)
+            gen_usage["output_tokens"] += int(r.get("output_tokens") or 0)
+            return jev_shadow.clean_generated_comment(r.get("text", ""))
+
+        async def _one_cell(cell: dict) -> tuple[dict, list[str] | None]:
+            cid = cell["cell_id"]
+            post = jev_shadow.post_from_demo(cell.get("demo_output") or "")
+            fill = jev_shadow.comment_fill(post)
+            chosen: dict[str, dict] = {}
+            entry: dict[str, Any] = {"cell_id": cid, "slots": []}
+            for slot in order:
+                if state["abort_reason"]:
+                    entry["slots"].append({"slot": slot.id, "error": f"中止:{state['abort_reason']}"})
+                    break
+                reply_text = chosen.get(slot.reply_to, {}).get("text", "") if slot.reply_to else ""
+                system, user = jev_shadow.comment_generation_prompt(cell, post, slot, reply_text)
+                texts = await asyncio.gather(
+                    *[_gen(system, user) for _ in range(JEV_COMMENT_REGEN_K)]
+                )
+                cands = list(dict.fromkeys(t for t in texts if t))
+                if not cands:
+                    entry["slots"].append({"slot": slot.id, "error": "生成端没有给出候选"})
+                    break
+                subjects = [
+                    {
+                        "subject_type": jev_shadow.COMMENT_SUBJECT_TYPE,
+                        "subject_id": f"{self.run_id}:{cid}:regen:{slot.id}:{i + 1}",
+                        "state": jev_shadow.comment_state(
+                            post, t, role=slot.role, reply_to_text=reply_text
+                        ),
+                        "fill": fill,
+                    }
+                    for i, t in enumerate(cands)
+                ]
+                res = await self._jev_judge(JEV_COMMENT_READER_BANK, subjects, brief=brief)
+                if res.get("status") != "ok":
+                    entry["slots"].append({"slot": slot.id, "judge": jev_shadow.resp_meta(res)})
+                    if res.get("reason") in _fatal:
+                        state["abort_reason"] = state["abort_reason"] or res.get("reason")
+                    break
+                by = jev_shadow.results_by_id(res)
+                ranked = []
+                for s_, t in zip(subjects, cands):
+                    r_ = by.get(s_["subject_id"]) or {}
+                    if not r_ or r_.get("error"):
+                        continue
+                    score, hard, flags = jev_shadow.score_comment(r_.get("items") or {}, slot)
+                    ranked.append({"text": t, "score": score, "hard_fails": hard, "flags": flags})
+                if not ranked:
+                    entry["slots"].append({"slot": slot.id, "error": "候选一条都没判出来"})
+                    break
+                ranked.sort(key=lambda x: x["score"])
+                chosen[slot.id] = ranked[0]
+                entry["slots"].append({"slot": slot.id, "chosen": ranked[0],
+                                       "ranking": [x["score"] for x in ranked]})
+            if len(chosen) != len(slots):
+                return entry, None
+            comments = [
+                {"text": chosen[s.id]["text"], "role": s.role,
+                 "reply_to_text": chosen[s.reply_to]["text"] if s.reply_to else ""}
+                for s in slots
+            ]
+            tres = await self._jev_judge(
+                JEV_COMMENT_THREAD_BANK,
+                [{"subject_type": jev_shadow.COMMENT_SUBJECT_TYPE,
+                  "subject_id": f"{self.run_id}:{cid}:regen:thread",
+                  "state": jev_shadow.thread_state(post, comments), "fill": fill}],
+                brief=brief,
+            )
+            _t_items = (jev_shadow.results_by_id(tres).get(
+                f"{self.run_id}:{cid}:regen:thread") or {}).get("items") or {}
+            entry["thread"] = {
+                "items": {q: jev_shadow.compact_item(it) for q, it in _t_items.items()},
+                "would_swap": jev_shadow.thread_flags(_t_items),
+                "judge": jev_shadow.resp_meta(tres),
+            }
+            return entry, [c["text"] for c in comments]
+
+        async def _guarded(cell: dict):
+            async with sem:
+                return await _one_cell(cell)
+
+        outs = await asyncio.gather(*[_guarded(c) for c in cells])
+        applied: dict[str, list[str]] = {}
+        original: dict[str, Any] = {}
+        per_cell: list[dict] = []
+        for cell, (entry, seeds) in zip(cells, outs):
+            per_cell.append(entry)
+            if seeds:
+                applied[cell["cell_id"]] = seeds
+                original[cell["cell_id"]] = cell.get("comment_seeds")
+
+        if gen_usage["cost_usd"] or gen_usage["output_tokens"]:
+            accumulate_auxiliary_cost(
+                self.run_id,
+                cost_usd=gen_usage["cost_usd"],
+                input_tokens=gen_usage["input_tokens"],
+                output_tokens=gen_usage["output_tokens"],
+                source="jev_comment_regen",
+            )
+        n = _apply_comment_seeds(final_system.get("prompt_matrix") or [], applied)
+        self._write_jev_log(
+            "jev_comment_regen",
+            {"cells": len(cells), "slots": [s.id for s in slots], "k": JEV_COMMENT_REGEN_K},
+            {"applied": applied, "original": original, "per_cell": per_cell,
+             "abort_reason": state["abort_reason"], "generator_usage": gen_usage},
+            ok=bool(applied),
+        )
+        logger.info(
+            "[jev_comment_regen] %d/%d 个 cell 的预埋评论已重生成并写回%s",
+            n, len(cells),
+            f"(中止:{state['abort_reason']})" if state["abort_reason"] else "",
+        )
+
+
+# ── 判定服务影子阶段写的 stage_log 名(v0.37.0)────────────────────────────
+# 全部登记在 REFINEMENT_MARKER_ANCHORS(tests 钉着):不登记的话「追加并重跑」/
+# 「应用修订意见」删不到它们,旧矩阵的判定结果会留在新 run 的详情里,续跑还会
+# 拿旧的重生成评论贴回新矩阵。
+# 这些失败说明判定服务整体不可用,同一个 run 里后面的影子调用直接跳过(_jev_judge 的熔断)。
+_JEV_CIRCUIT_KINDS = frozenset({
+    "not_configured", "unauthorized", "unavailable", "bad_url", "timeout", "unreachable",
+})
+
+JEV_STAGE_LOG_NAMES: tuple[str, ...] = (
+    "jev_critic_shadow",
+    "jev_persona_route",
+    "jev_comment_regen",
+    "jev_sample_shadow",
+    "jev_comment_shadow",
+)
+
+
+def _apply_comment_seeds(prompt_cells: list[dict], applied: dict) -> int:
+    """把重生成的评论按 cell_id 写回矩阵(原地修改),返回写了几个 cell。"""
+    by_id = {c.get("cell_id"): c for c in prompt_cells if c.get("cell_id")}
+    n = 0
+    for cid, seeds in (applied or {}).items():
+        cell = by_id.get(cid)
+        if cell is not None and isinstance(seeds, list) and seeds:
+            cell["comment_seeds"] = list(seeds)
+            n += 1
+    return n
 
 
 class TrendScoutRequiredError(RuntimeError):
@@ -5873,15 +6520,14 @@ def _validate_prompt_cell(cell: dict) -> tuple[bool, list[str]]:
             tail = demo[-40:].replace("\n", " ")
             issues.append(f"{cid}: demo_output 结尾不完整（末尾: ...{tail!r}）")
 
-        # AI-cliché blacklist — works_builder.md:60 explicitly lists these
-        # as forbidden phrases. If the demo contains them, chancellery will
-        # reliably reject for "AI 味". Catch locally to avoid the round trip.
-        ai_cliches = [
-            "效果显著", "性价比高", "值得推荐", "适合所有人", "温和不刺激",
-            "希望对你有帮助", "综上所述", "在如今", "让我们一起", "姐妹们冲",
-            "快快收藏",
-        ]
-        hit_cliches = [c for c in ai_cliches if c in demo]
+        # AI-cliché blacklist — works_builder.md 范式 A (c)「禁止 AI 空话」和
+        # vibe_critic.md 第 0.5 步「AI 空话硬否决」列的就是这类短语(旧注释写的
+        # 是 works_builder.md 第 60 行,那一行现在是人设轮换规则,早就对不上了;
+        # 改成按段落名引用,行号会漂)。If the demo contains them, chancellery
+        # will reliably reject for "AI 味". Catch locally to avoid the round trip.
+        # v0.37.0: 词表不再在这里自带一份,直接用机审闸那份(全仓唯一来源,
+        # prose_gate.AI_CLICHE_BLACKLIST,16 条,是两份旧清单的并集)。
+        hit_cliches = [c for c in AI_CLICHE_BLACKLIST if c in demo]
         if hit_cliches:
             issues.append(
                 f"{cid}: demo_output 命中 AI 空话黑名单 {hit_cliches}（works_builder 禁用项）"
@@ -6061,6 +6707,18 @@ REFINEMENT_MARKER_ANCHORS: dict[str, str] = {
     "batch_sampling": "chancellery_final",
     "prose_gate": "chancellery_final",
     "quality_score": "chancellery_final",
+    # v0.37.0 判定服务(judge / Jev)各阶段(JEV_STAGE_LOG_NAMES)。不进
+    # PIPELINE_STAGE_ORDER:它们都不是重跑起点,只需要跟着产出它们的锚点一起失效。
+    #   二审影子每轮 vibe_critic 之后写 → 锚 vibe_critic;
+    #   画像第三路跟画像模拟一起跑 → 锚 persona_simulator;
+    #   评论重生成跑在网感循环之后、终审之前,改的是网感循环产出的矩阵 → 锚 vibe_critic
+    #   (它兼作续跑标记:锚点重跑了还留着它,续跑会把旧评论贴回新矩阵);
+    #   采样 / 预埋评论影子判的是终审之后的出货矩阵 → 锚 chancellery_final。
+    "jev_critic_shadow": "vibe_critic",
+    "jev_persona_route": "persona_simulator",
+    "jev_comment_regen": "vibe_critic",
+    "jev_sample_shadow": "chancellery_final",
+    "jev_comment_shadow": "chancellery_final",
 }
 
 

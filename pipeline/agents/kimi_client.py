@@ -15,8 +15,9 @@ BaseAgent._call_model 那条路上挂着 stage_log 落库、run 级 token 熔断
   - 辅助层的调用不隶属任何 stage,写 stage_log 会污染流水线详情页。
 
 所以这里只留一层薄重试(pipeline/llm_retry.call_with_retry),别的都不要。
-代价是辅助层的 token 不进 run 总账 —— 和 v0.31 的 Gemini 层行为一致,
-成本单独通过返回值里的 cost_usd 上报给调用方。
+辅助层的 token 不进 run 的 input/output 计数(不碰 MAX_TOKENS_PER_RUN 熔断);
+成本通过返回值里的 cost_usd 交给调用方,由 orchestrator 在调用点经
+accumulate_auxiliary_cost 记进 run 总账的 cost_usd(见该函数 docstring)。
 
 路由复用 pipeline.agents.get_client_for_model,不自己拼 base_url —— 辅助层
 和主链路用的是同一套 vendor 路由规则,复制一份迟早漂移。

@@ -2,11 +2,43 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.36.1"
-VERSION_DATE = "2026-08-28"
+VERSION = "v0.37.0"
+VERSION_DATE = "2026-09-24"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.37.0 feature: 接入共用判定服务 judge(Jev 闭集判定),全部影子跑。"
+    "\n\n"
+    "【为什么】三省六部里批评家、画像、二审全是生成式模型在做闭集判断(pass / weak / "
+    "fail、click / skip),拿不到概率,只能靠 fail-closed 和双模型交集对冲方差;而全流水线"
+    "唯一多样本的批量采样,正文却不落库。judge 仓 docs/00 #5 拍板:二审先影子跑(记不"
+    "分流),采样正文落库后再判,persona 第三路后做。"
+    "\n\n"
+    "【做了什么】(1) 薄客户端 pipeline/agents/judge_client.py:POST {JUDGE_URL}/judge,"
+    "超时 8 秒,复用 llm_retry.call_with_retry,只抛 JudgeNotConfigured / JudgeCallFailed;"
+    "成本按 Jev 价(输入 0.042 美元 / 百万 token)经 accumulate_auxiliary_cost"
+    "(source=jev_judge)记账。(2) 网感二审影子:每轮 critic 之后 Jev 按 multiplier_gate "
+    "四项 + template_test 给概率,state 装齐 stop_trigger / reward_type / gap_direction / "
+    "advertising_stance / product_role 锚点,结果只进 critic_result[\"_jev_arbitration\"] "
+    "和 stage_log jev_critic_shadow。(3) 批量采样保留正文全文,每篇编账本 id "
+    "<run_id>:<cell>:<代际>:<seed>(代际防修订重采时同 seed 覆盖账本),fq 写账本、"
+    "人感按段判,进 stage_log jev_sample_shadow。(4) 预埋评论过评论题库(jev_comment_shadow)。"
+    "(5) 两件会改产出的在默认关的开关后面:预埋评论重生成(ENABLE_JEV_COMMENT_REGEN)、"
+    "画像第三路(ENABLE_JEV_PERSONA_ROUTE,开着时弱 cell 判据改成至少两路否决)。"
+    "新 stage_log 名全部登记进 REFINEMENT_MARKER_ANCHORS。"
+    "\n\n"
+    "【数据出境】每个请求都带 project(ssll:<projects.id>)、能认出来的 category 和 "
+    "published=false;处方药项目的未发布稿服务端 403,本仓按跳过处理。没配 JUDGE_URL 时"
+    "以上全部零副作用。"
+    "\n\n"
+    "【顺手修】(a) AI 空话黑名单收成一份:_validate_prompt_cell 不再自带 11 条,直接读 "
+    "prose_gate.AI_CLICHE_BLACKLIST(两份并集 16 条)—— 构建期校验多查「总而言之」「分享几个"
+    "小技巧」「记住这3点」「记住这三点」「以下几个要点」,机审闸多按全文查「在如今」;"
+    "tests/test_ai_cliches.py 钉住「提示词清单 ⊆ 机审」。(b) _prose_soft_flags 不再写到"
+    "矩阵 cell 上(没人读,却进了 rewriter / 终审输入和交付矩阵),改记在当轮 critic 结果上。"
+    "(c) accumulate_auxiliary_cost 的 docstring 写着「辅助层不走这里」,和三个调用点对不上,"
+    "改正。(d) 本仓第一次有 tests/(pytest)。"
+    "\n\n"
     "v0.36.1 fix+perf: 上传转写链路加固 + 辩论历史增量缓存。"
     "\n\n"
     "【上传转写卡死】首条真实 run 暴露的三层问题,逐层修:"
@@ -1738,6 +1770,106 @@ BATCH_SAMPLE_MAX_CELLS = 20
 # 单次采样的输出上限。一篇小红书 300-800 字、知乎最长 1500 字,2048 token
 # 足够;给太大只会让模型倾向写更长,反而偏离平台真实长度。
 BATCH_SAMPLE_MAX_OUTPUT_TOKENS = 2048
+
+# ── 判定服务 judge(Jev 闭集判定,v0.37.0)──────────────────────────────
+# 三仓共用的判定服务(独立仓库 judge,Railway 单独一个服务):同一个 Jev 模型、
+# 同一套题库纪律、同一张账本(truth_vault.note_feature_answers)。本仓只有
+# 薄客户端 pipeline/agents/judge_client.py,连接信息走 secrets / 环境变量:
+#   JUDGE_URL      服务根地址(不带 /judge)。**不配 = 下面所有阶段零副作用跳过**:
+#                  不发请求、不写 stage_log、不往任何结果上挂字段。
+#   JUDGE_API_KEY  请求头 X-Judge-Key。
+#
+# 拍板(judge 仓 docs/00 #5):二审先影子跑(记不分流),采样正文落库后再判,
+# persona 第三路后做。所以开关分两类:
+#   · 影子(只记录,不改任何判决 / 分流 / severity / 策略升级 / 产出):默认开,
+#     没配 JUDGE_URL 时是空操作。
+#   · 会改产出或判据的(评论重生成、画像第三路):默认关。
+
+# 单次请求超时。判定服务单次亚秒级,8 秒没回来就当这次没判(docs/00 #4 口径)。
+# 刻意不用辅助层那套 120 秒 + 60 秒墙钟:影子阶段不能拖住流水线尾段。
+JUDGE_TIMEOUT_SECONDS = 8.0
+# 总尝试次数(含首次)。只对 429 / 502 / 504 / 超时 / 连不上重试,由
+# llm_retry._is_transient 按异常文本判;其余状态一次定论。
+JUDGE_MAX_ATTEMPTS = 2
+JUDGE_RETRY_INITIAL_WAIT = 1.0
+JUDGE_RETRY_MAX_WAIT = 2.0
+# 每个请求最多带几个 subject。服务端每篇 1–2 次 Jev 调用、默认 4 路并行,
+# 5 篇一请求落在 8 秒以内;服务端硬上限是 200。
+JUDGE_MAX_SUBJECTS_PER_REQUEST = 5
+# 客户端同时在飞的请求数。服务端每个请求再开 4 路(JUDGE_WORKERS),2 × 4 = 8 路
+# 并发 Jev 调用、每次 0.5–0.8 秒,约 600–960 次/分钟,留在 Jev 1,200 次/分钟的限流
+# 以内(同一个 Jev key 三仓共用,别一家吃满)。
+JUDGE_CLIENT_CONCURRENCY = 2
+# Jev 官方价:输入 0.042 美元 / 百万 token,输出免费(judge 仓 docs/31 §7.1)。
+# 不进 COST_PER_1M_* 表:那张表按模型名查,jev 不是本仓的生成模型。
+JUDGE_COST_PER_1M_INPUT = 0.042
+JUDGE_COST_PER_1M_OUTPUT = 0.0
+JUDGE_RUN_TAG = "primary"
+
+# 数据出境(judge 仓 docs/00 #7):采样稿、demo、预埋评论都是**未发布**内容,
+# 请求必须带 project;处方药项目的未发布稿服务端直接 403(本仓按跳过处理)。
+# 三省六部的项目在 TV 里没有项目代号,这里发 "ssll:<projects.id>";要给某个
+# 项目放行 / 标处方药,在 judge 仓 config/data_policy.yaml 里写这个代号。
+JUDGE_PROJECT_PREFIX = "ssll:"
+# brief.product_category 是自由文本(页面上填「护肤」「保健品」这类),要翻成
+# TV 统一词表才有意义。按顺序匹配,第一条命中即用;都不中就不发 category。
+# 最后一条「药」是**从严**的兜底:分不清处方 / 非处方的药品一律按处方药发,
+# 宁可让服务端 403 掉这次影子,也不把可能是处方药的未发布稿放出去。
+JUDGE_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("非处方", "otc"), "OTC药"),
+    (("处方",), "处方药"),
+    (("保健",), "保健品"),
+    (("医疗器械",), "医疗器械"),
+    (("药",), "处方药"),
+)
+# 匹配前先从品类文本里剔掉的词(含「药」字但不是药品)。
+JUDGE_CATEGORY_EXCLUDE: tuple[str, ...] = ("药妆", "药食同源")
+
+# ① 网感二审影子:每轮 vibe_critic 之后,把本轮评的 cell 交给 Jev 按
+# multiplier_gate 四项 + template_test.still_holds 出概率。结果只进
+# critic_result["_jev_arbitration"] 和 stage_log `jev_critic_shadow`,
+# 不进 failed、不改 severity、不触发策略升级。
+ENABLE_JEV_CRITIC_SHADOW = True
+# 题库在 judge 仓 banks/ssll_critic_v0.1.yaml(画像第三路也用它,按 qids 分开问)。
+JEV_CRITIC_BANK = "ssll_critic_v0.1"
+
+# ② 批量采样影子:采样正文(batch_sampling 现在保留全文)过 fq 题库,写账本
+# (subject_type = ssll_sample,id = <run_id>:<cell>:<代际>:<seed>),每 cell 得到
+# 一个答案分布;再按段过人感题库(段级不落账本)。结果进 stage_log `jev_sample_shadow`。
+ENABLE_JEV_SAMPLE_SHADOW = True
+JEV_SAMPLE_FQ_BANK = "feature_questions_v0_1"
+JEV_SAMPLE_WRITE = True
+# 生成稿里的标题按 fq 的 markers 规则切(「标题：…」/「【标题】…」),切不出就没有
+# 标题、标题类题目记 NULL,不猜。
+JEV_SAMPLE_TITLE_EXTRACTION = "markers"
+# 段级人感题库;设成 "" 关掉这一路。
+JEV_SAMPLE_HUMAN_BANK = "human_feel_para_v0.1"
+# 每篇最多判几段(清单体长文段落多,影子期不值得全判)。12 格 × 5 篇 × 8 段
+# 上限约 480 次调用、约 2 美分,按上面的并发约半分钟。
+JEV_SAMPLE_MAX_PARAS = 8
+
+# ③ 预埋评论影子:cell.comment_seeds 逐条过读者侧评论题库,整组过评论区题库。
+# 结果进 stage_log `jev_comment_shadow`。
+ENABLE_JEV_COMMENT_SHADOW = True
+JEV_COMMENT_READER_BANK = "comment_reader_v0.4"
+JEV_COMMENT_THREAD_BANK = "comment_thread_v0.3"
+
+# ④ 预埋评论重生成(**会改产出,默认关**):按评论位(提问 / 补充经验 / 贴主
+# 回复答疑)用 Moonshot 出 k 条候选,人设与口吻取自该 cell 的 system_prompt,
+# Jev 判完取最好的一条,写回 cell.comment_seeds,再整组过评论区题库。
+# 跑在终审之前(终审看到的是新评论),stage_log `jev_comment_regen` 兼作续跑标记。
+ENABLE_JEV_COMMENT_REGEN = False
+JEV_COMMENT_REGEN_K = 3
+JEV_COMMENT_REGEN_MAX_CELLS = 12
+JEV_COMMENT_REGEN_MAX_OUTPUT_TOKENS = 400
+# 同时重生成几个 cell(每个 cell 内评论位按顺序出,回复位要等被回复的那条)。
+JEV_COMMENT_REGEN_CONCURRENCY = 4
+
+# ⑤ 画像第三路(**会改弱 cell 判据,默认关**):Jev 对每个 cell 按核心 / 边缘 /
+# 反面三位读者各答一次点开 / 划走 / 想留着(3 条 reactions,_source="jev"),
+# 弱 cell 判据从「所有跑通的 backend 都否决」改成「至少两路否决」。
+# 关着时画像模拟的行为与 v0.36.1 逐字节一致。Jev 的反应不注入 vibe_critic。
+ENABLE_JEV_PERSONA_ROUTE = False
 
 # ── 跨批次多样性:开头切入角度编号库 (v0.33.4) ───────────────────────────
 #

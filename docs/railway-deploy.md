@@ -44,6 +44,8 @@ stage 就少一次重跑。
 | `MOONSHOT_BASE_URL` | | 仅 .ai 站 key 需要覆盖 |
 | `DEEPSEEK_BASE_URL` | | 一般不用 |
 | `SOCIALDATAX_API_KEY` | | 趋势取样(PRE 默认 required,不配会导致新 run 失败,见 pipeline/config.py) |
+| `JUDGE_URL` | | 判定服务(judge / Jev)根地址,不带 `/judge`。不配 = 影子判定整体零副作用跳过(v0.37.0,见 architecture.md §10) |
+| `JUDGE_API_KEY` | | 判定服务的 `X-Judge-Key`(服务端 fail-closed,生产必配) |
 | `PIPELINE_EXECUTION_MODE` | ✅ | **web 服务设为 `worker`**(让 UI 入队而不是起线程)。worker 进程不读它。 |
 | `WORKER_POLL_SECONDS` | | worker 轮询间隔,默认 5 |
 | `WORKER_MAX_CONCURRENT_RUNS` | | 默认 1 |
