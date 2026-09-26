@@ -24,6 +24,7 @@ show_version_badge()
 # Reap zombie runs (stale heartbeat) before rendering — a run whose process
 # was killed gets marked failed here instead of spinning forever.
 from utils.liveness import maybe_reap_stale_runs
+from utils.stage_log_pairing import pair_following, second_review_summary
 
 maybe_reap_stale_runs()
 
@@ -1796,6 +1797,13 @@ with tabs[6]:
     # Vibe critic
     _vc_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_critic"]
     _vr_logs = [l for l in stage_logs if l.get("stage_name") == "vibe_rewriter"]
+    # v0.37.1: 二审仲裁与判定服务影子各写一条伴生 stage_log,按时间顺序配回所属那一轮
+    # (critic_result["_gemini_arbitration"] 是 vibe_critic 写库之后才挂上的,库里的
+    # vibe_critic output_data 永远没有它,见 utils/stage_log_pairing.py)。
+    _vc_companions = {
+        id(_a): _c
+        for _a, _c in pair_following(stage_logs, "vibe_critic", ("vibe_arbitration", "jev_critic_shadow"))
+    }
 
     if _vc_logs:
         for idx, vcl in enumerate(_vc_logs):
@@ -1829,36 +1837,83 @@ with tabs[6]:
                                 f"{_emoji} **{_cid}** — gut: {_gut} · {_gut_word} · severity: {_sev}"
                             )
 
-                    # 二审仲裁结果 (if any)
-                    _ga = _vc_out.get("_gemini_arbitration") or {}
-                    if _ga and _ga.get("verdict") != "skipped":
-                        st.divider()
-                        st.markdown("**二审（仲裁 · DeepSeek）**")
-                        _ga_failed = _ga.get("failed_cells") or []
-                        _ga_verdict = _ga.get("verdict", "unknown")
-                        _ga_usage = _ga.get("_gemini_usage") or {}
-                        if _ga_verdict == "all_pass" or not _ga_failed:
+                    # 二审仲裁（v4-flash）：读伴生的 vibe_arbitration stage_log
+                    _comp = _vc_companions.get(id(vcl)) or {}
+                    _arb_log = _comp.get("vibe_arbitration")
+                    st.divider()
+                    if _arb_log is None:
+                        st.caption(
+                            "本轮没有二审记录（v0.37.1 之前的 run 不记，或这一轮在二审前就中断了）。"
+                        )
+                    else:
+                        _sr = second_review_summary(_arb_log.get("output_data"))
+                        st.markdown(f"**二审（仲裁 · v4-flash）· {_sr['round'] or ''}**")
+                        if not _sr["ran"]:
+                            st.caption(f"二审没跑：{_sr['skip_reason'] or _sr['verdict']}")
+                        elif not _sr["added"]:
                             st.success(
-                                "二审也判全部通过——主判和二审意见一致。"
+                                f"二审复看了主判判过的 {len(_sr['main_passed'])} 个 cell，"
+                                "没有额外判 fail——主判和二审意见一致。"
                             )
                         else:
                             st.warning(
-                                f"二审额外 flag 了 {len(_ga_failed)} 个 cell "
-                                f"（主判 pass 但二审 fail）："
+                                f"二审额外 flag 了 {len(_sr['added'])} 个 cell"
+                                f"（主判 pass 但二审 fail，已进本轮重写）："
                             )
-                            for _gf in _ga_failed:
-                                _g_cid = _gf.get("cell_id", "?")
-                                _g_dir = _gf.get("rewrite_directives", "")
-                                st.caption(f"**{_g_cid}**：{_g_dir[:200]}")
+                            for _g_cid in _sr["added"]:
+                                st.caption(f"**{_g_cid}**：{_sr['added_directives'].get(_g_cid, '')[:200]}")
+                        for _r in _sr["reviews"]:
+                            _r_sev = _r.get("severity", "")
+                            _r_emoji = {"pass": "[通过]", "borderline": "[临界]", "fail": "[失败]"}.get(_r_sev, "[未知]")
+                            st.caption(f"二审 {_r_emoji} **{_r.get('cell_id', '?')}** — severity: {_r_sev}")
+                        _ga_usage = _sr["usage"]
                         if _ga_usage:
                             st.caption(
-                                f"二审费用：${_ga_usage.get('cost_usd', 0):.4f} · "
+                                f"二审费用：${_ga_usage.get('cost_usd', 0) or 0:.4f} · "
                                 f"tokens {_ga_usage.get('input_tokens', 0)}+{_ga_usage.get('output_tokens', 0)}"
+                                + (f" · {_ga_usage.get('model')}" if _ga_usage.get("model") else "")
                             )
-                    elif _ga and _ga.get("verdict") == "skipped":
-                        st.caption(
-                            f"二审跳过：{_ga.get('_skip_reason', 'unknown')}"
-                        )
+                        if _sr["prose_forced"]:
+                            st.caption(f"机审硬命中强制进重写：{', '.join(_sr['prose_forced'])}")
+                        if _sr["prose_soft"]:
+                            st.caption(
+                                "机审 SOFT 标记（只记录）："
+                                + "；".join(f"{k} × {len(v)}" for k, v in _sr["prose_soft"].items())
+                            )
+                        with st.expander("完整二审记录", expanded=False):
+                            st.json(_arb_log.get("output_data") or {})
+
+                    # 判定服务（Jev）影子：只记不分流，看它和主判的一致率
+                    _jev_log = _comp.get("jev_critic_shadow")
+                    if _jev_log is not None:
+                        _jv = _jev_log.get("output_data") or {}
+                        st.markdown("**判定服务影子（Jev · 只记录）**")
+                        if _jv.get("status") != "ok":
+                            st.caption(f"影子没判成：{_jv.get('status', _jev_log.get('status', 'unknown'))}")
+                        else:
+                            _sev = _jv.get("gate_severity_agreement_with_main") or {}
+                            if _sev.get("n"):
+                                st.caption(
+                                    f"门槛层判决与主判一致 {_sev.get('agree')}/{_sev.get('n')}"
+                                    f"（{(_sev.get('rate') or 0) * 100:.0f}%，只算 Jev 有把握的 cell）"
+                                )
+                            _per_q = _jv.get("agreement_with_main") or {}
+                            if _per_q:
+                                st.caption(
+                                    "逐题一致率："
+                                    + " · ".join(
+                                        f"{q} {a.get('agree')}/{a.get('n')}"
+                                        for q, a in _per_q.items() if a.get("n")
+                                    )
+                                )
+                            for _jc in _jv.get("cells") or []:
+                                st.caption(
+                                    f"**{_jc.get('cell_id', '?')}** — 主判 {(_jc.get('main') or {}).get('gate_severity', '?')}"
+                                    f" · 二审 {(_jc.get('v4') or {}).get('gate_severity', '—')}"
+                                    f" · Jev {(_jc.get('jev') or {}).get('gate_severity', '?')}"
+                                )
+                        with st.expander("完整影子报告", expanded=False):
+                            st.json(_jv)
 
                     with st.expander("完整 critic 输出", expanded=False):
                         st.json(_vc_out)

@@ -203,11 +203,35 @@ vibe_critic 已经是 `kimi-k2.6`，二审再用同一个模型等于自己复�
 **失败降级**：辅助层调用失败（未配置 / 限流 / 模型不存在）→ 打 warn 日志，流水线
 继续走主判单判，不阻塞。它也不占用主链路的 run token 预算。
 
+#### 判定服务 judge（Jev · 可选，v0.37.0）
+
+BYWOOD 三仓共用的闭集判定服务（独立仓库，Railway 单独一个服务）。三省六部拿它做
+**影子判定**：网感二审（`multiplier_gate` 四项 + 模板性给概率）、批量采样正文（fq 题库，
+写账本）、预埋评论（评论题库）。只记录到 stage_log，不改任何判决、分流和产出。
+
+```toml
+JUDGE_URL = "https://judge-xxx.up.railway.app"   # 不配 = 整体跳过，行为和没接之前一样
+JUDGE_API_KEY = "..."
+```
+
+会改产出的两件（预埋评论重生成、画像第三路）在 `pipeline/config.py` 里默认关。
+开关、数据出境口径和账本 id 见 [`docs/architecture.md`](docs/architecture.md) §10。
+
 ### 4. 启动
 
 ```bash
 streamlit run app.py
 ```
+
+### 5. 测试
+
+```bash
+pip install pytest
+python -m pytest tests/
+```
+
+测试不连任何外部服务（判定服务用本地假服务器 / 打桩），也不读 `.streamlit/secrets.toml`
+里的 `JUDGE_*`。
 
 ## 项目结构
 

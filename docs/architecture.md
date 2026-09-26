@@ -17,6 +17,7 @@ sanshengliubu 跑多家 LLM 后端,**目前是两套重试机制并存**,不打�
 | **Kimi** (Moonshot anthropic-compat) | `BaseAgent.run()` | 3s 普通 / 10s for 5xx | `MAX_RETRIES + 1` (默认 4) | `MAX_RETRIES` 控制 | `pipeline/agents/__init__.py::_call_model` |
 | **DeepSeek** (官方 anthropic-compat) | `BaseAgent.run()` | 3s | `MAX_RETRIES + 1` | — | 同上,共用一条路径 |
 | **辅助层** (Kimi / DeepSeek,二审·结构审·Vision) | `call_with_retry()` | 2s | 3 | 30s | `pipeline/llm_retry.py` + `pipeline/agents/kimi_client.py` |
+| **判定服务** (judge / Jev,HTTP,v0.37.0) | `call_with_retry()` | 1s | 2 | 2s | `pipeline/agents/judge_client.py`;只重试 429 / 502 / 504 / 超时 / 连不上,单次超时 8s |
 | **SocialDataX** (MCP,非 LLM) | 自带 transient 重试 | 1s / 2s | 3 | — | `pipeline/agents/socialdatax_client.py` |
 | **Claude / GPT**(历史路径,默认不再使用) | `BaseAgent.run()` | 3s | `MAX_RETRIES + 1` | — | 路由仍在,靠 `model_overrides` 才会走到 |
 
@@ -46,8 +47,17 @@ sanshengliubu 跑多家 LLM 后端,**目前是两套重试机制并存**,不打�
 - 调主链路退避参数 → 改 `pipeline/config.py::MAX_RETRIES / RETRY_BASE_DELAY_SECONDS`
 - 调辅助层退避参数 → 改 `pipeline/agents/kimi_client.py` 里 `call_with_retry(...)` 的
   `max_attempts / initial_wait / max_wait`
-- **辅助层的 token 不进 run 总账** —— 和 v0.31 的 Gemini 层一样。成本通过
-  返回值的 `cost_usd` 单独上报,`pipeline_run.total_cost_usd` 里看不到它
+- **辅助层的 token 不进 run 的 input/output 计数**(不碰 `MAX_TOKENS_PER_RUN` 熔断),
+  但**成本进总账**:辅助层客户端只把 `cost_usd` 放在返回值里,orchestrator 在调用点经
+  `accumulate_auxiliary_cost(..., source=...)` 记进 run 的 `cost_usd`(二审
+  `gemini_critic`、结构审 `gemini_structure`、批量采样 `batch_sampling`、判定服务
+  `jev_judge`),下一次主链路 stage 完成时随 totals 推到 `pipeline_run.total_cost_usd`。
+  (v0.37.0 更正:此前这里和 `accumulate_auxiliary_cost` 的 docstring 都写着「看不到它」,
+  和代码对不上。)
+- 判定服务的重试**不能**照搬辅助层:`_is_transient` 按异常文本找状态码,而 422 的
+  detail 里带 subject_id(含 run 的 UUID,随时可能出现「503」「429」子串)。所以
+  `judge_client` 对非瞬时状态**返回**状态码、不抛异常,只有 429 / 502 / 504 / 超时 /
+  连不上才以异常形式进 `call_with_retry`
 
 ### 跨厂家 fallback(v0.32.0 新增)
 
@@ -254,6 +264,13 @@ shadow copy,和第 4 节 `_SECRET_PATTERNS` 与 truth-vault 的对齐是同一�
 
 **改一边要同步另一边**,否则评分标准和提示词要求会悄悄分叉:分数还在涨,
 产出已经不按新规矩走了。
+
+v0.37.0 起这条义务由测试兜底(`tests/test_ai_cliches.py`),方向是**提示词 ⊆ Python**:
+`vibe_critic.md` 第 0.5 步、`vibe_rewriter.md`「通篇禁止」、`works_builder.md` 范式 A (c)
+三份清单里的每一条,都必须能在 `AI_CLICHE_BLACKLIST`、`BANNED_OPENING_PREFIXES` 或
+`PROMPT_ONLY_AI_CLICHES`(提示词有、机审有意不按全文查的,写明原因)里找到。反方向
+不强求 —— 提示词按设计只放少量带原因的禁令(第 9 节),逼着把机审全量抄进三份提示词
+等于把注意力预算花在清单上。
 
 ### SQL 自检模板
 
@@ -568,6 +585,104 @@ B 指纹」这种机扫过了、读者没过的劣化。
 `quality_metrics.check_redlines` 是 `prose_gate.scan_text` 的薄封装。
 两边各带一份黑名单必然漂移,而漂移的表现最难查:分数还在涨,闸门已经按新规矩
 走了。与其靠人记着同步,不如让它只有一份。
+
+v0.37.0 把最后一份私有副本也收了:`orchestrator._validate_prompt_cell` 的构建期
+校验此前自带 11 条 `ai_cliches`,和这里的 15 条互有缺漏,现在直接读
+`prose_gate.AI_CLICHE_BLACKLIST`(两份的并集,16 条)。
+
+### SOFT 档去哪了(v0.37.0)
+
+网感循环里对 critic 放过的 cell 跑的那次 `scan_text`,SOFT 结果以前写在矩阵 cell
+的 `_prose_soft_flags` 上 —— 全仓没人读,却跟着 cell 进了 rewriter 输入、终审输入
+和交付的矩阵,改写之后还是旧 demo 的标记。现在记在当轮 `critic_result["_prose_soft_flags"]`
+({cell_id: [...]},和 `_gemini_arbitration` 同一处);出货那一版的 SOFT 另有
+stage_log `prose_gate` 的 `per_cell.soft_flags`。**没有**按「喂给 critic 当参考」
+的原意注入下一轮 critic 输入:那会改 severity,不是记录。
+
+---
+
+## 10. 判定服务(judge / Jev):影子阶段 (v0.37.0)
+
+judge 是 BYWOOD 三仓共用的判定服务(独立仓库,Railway 单独一个服务):同一个 Jev
+模型、同一套题库纪律、同一张账本(truth_vault.note_feature_answers)。本仓只放薄客户端
+`pipeline/agents/judge_client.py`,影子阶段的纯函数在 `pipeline/jev_shadow.py`。
+judge 仓 docs/00 #5 拍板:**二审先影子跑(记不分流),采样正文落库后再判;persona 第三路后做。**
+
+### 开关与默认值(`pipeline/config.py`「判定服务 judge」一节)
+
+| 阶段 | 开关(默认) | 题库 | 写账本 | 结果去哪 | 改不改产出 |
+|------|-------------|------|--------|----------|-----------|
+| 网感二审影子 | `ENABLE_JEV_CRITIC_SHADOW`(开) | `ssll_critic_v0.1` | 否 | `critic_result["_jev_arbitration"]` + stage_log `jev_critic_shadow` | 否 |
+
+> v0.37.1:v4-flash 二审本身每轮另写一条 stage_log `vibe_arbitration`(原始结果、额外判 fail 的 cell、机审命中、Jev 一致率摘要),详情页 Tab 6 按时间顺序把它和 `jev_critic_shadow` 配回所属那一轮。`critic_result` 上挂的 `_gemini_arbitration` / `_jev_arbitration` / `_prose_soft_flags` 只在内存里和 `final_system.vibe_critic_result` 里,到不了那一轮 vibe_critic 的 stage_log(那条在 critic 返回前就写完了)。
+| 采样正文 | `ENABLE_JEV_SAMPLE_SHADOW`(开) | `feature_questions_v0_1` + 按段 `human_feel_para_v0.1` | fq 是(`ssll_sample`),段级否 | stage_log `jev_sample_shadow` | 否 |
+| 预埋评论 | `ENABLE_JEV_COMMENT_SHADOW`(开) | `comment_reader_v0.4` / `comment_thread_v0.3` | 否 | stage_log `jev_comment_shadow` | 否 |
+| 预埋评论重生成 | `ENABLE_JEV_COMMENT_REGEN`(**关**) | 同上 + Moonshot 生成端 | 否 | 写回 `cell.comment_seeds`,stage_log `jev_comment_regen`(兼续跑标记) | **是** |
+| 画像第三路 | `ENABLE_JEV_PERSONA_ROUTE`(**关**) | `ssll_critic_v0.1` 的 `persona_*` 三题 | 否 | 并进 `_persona_reactions`(`_source="jev"`),stage_log `jev_persona_route` | **是**:弱 cell 判据改成「至少两路否决」 |
+
+**没配 `JUDGE_URL` = 全部零副作用**:不发请求、不写 stage_log、不往任何结果上挂字段、
+连取消检查那次 DB 查询都不多发。两个会改产出的开关关着时,对应代码整段不执行,
+画像模拟与 v0.36.1 逐字节一致。
+
+### 二审影子为什么「只记不分流」
+
+Jev 按 `multiplier_gate` 四项 + `template_test.still_holds` 出概率,state 装齐主 critic
+判决时对照的锚点(`stop_trigger` / `reward_type` / `gap_direction` 来自 `_direction_index`,
+`product_role` 来自 cell_plan,`advertising_stance` 来自 brief)—— Jev 偏字面,锚点不装
+进去判的就不是同一件事。「任一 fail 即 fail、任一 weak 最多 borderline」这条规则
+(`vibe_critic.md` 210-213)在影子里只用来算一个对照数(`gate_severity`),不回写任何
+critic 结果;更不映射 strategic —— 那会触发策略升级回中书省重跑整轮,一次几分钱的
+调用能触发全流水线最贵的重入。现行 v4-flash 二审的 payload 同样缺这些锚点,但**没有**
+顺手补:它的结论直接进 failed,补锚点会改分流。
+
+### 数据出境与账本
+
+- 每个请求都带 `project = "ssll:<projects.id>"`、`category` 和 `published: false`。
+  `category` 由 brief 的 `product_category` 翻成 TV 统一词表:先看
+  `JUDGE_PROJECT_CATEGORY_OVERRIDES`(按项目手工指定),再按 `JUDGE_CATEGORY_RULES`
+  (医药类;分不清处方 / 非处方的药品从严按「处方药」发)、`JUDGE_CATEGORY_CLOSED_MARKERS`
+  (沾医疗但认不出的:医用 / 特医 / 医美…)、`JUDGE_CATEGORY_GENERAL_RULES`(非医药类)。
+  **认不出就不发**(v0.37.2):`_jev_judge` 直接记 `category_unrecognized` 跳过 ——
+  三省六部的项目在服务端没登记,处方药只能靠 `category` 拦,认不出的品类(「司美格鲁肽」
+  「降糖针」)不能当安全的放出去。处方药项目的未发布稿服务端 403,本仓记
+  `policy_blocked` 跳过,不重试。要放行某个项目,在 judge 仓 `config/data_policy.yaml`
+  里写 `ssll:<uuid>`。
+- 终审之后的辅助开销(批量采样、判定服务影子)只进进程内的 run 总账,收尾写 run 状态时
+  一并写 `pipeline_runs.total_tokens / total_cost_usd`(v0.37.2;之前后面没有 BaseAgent
+  阶段替它们落库)。
+- 只有采样稿的 fq 判定写账本:`subject_type = ssll_sample`,
+  `subject_id = <run_id>:<cell_id>:<代际>:<seed>`。**代际**(一次采样一个 UTC 时间戳)
+  是必需的:修订重跑会删掉 `batch_sampling` 日志、按同一组 seed 重采,不带代际新旧两批
+  正文就对应同一个账本主键,后写覆盖先写。`batch_sampling` 的 `per_sample[i].body`
+  现在存正文全文,`subject_id` 也一起落在那条 stage_log 里,能回查到「那一篇」。
+- demo / 画像 / 预埋评论的 id 不是 TV 的笔记或评论 id,一律 `write=false`。预埋评论用
+  `subject_type = comment`,靠 `published: false` 让出境策略按未发布稿处理。
+
+### 续跑与失效
+
+新 stage_log 名都登记在 `REFINEMENT_MARKER_ANCHORS`(`orchestrator.JEV_STAGE_LOG_NAMES`,
+测试钉着):二审影子、评论重生成锚 `vibe_critic`,画像第三路锚 `persona_simulator`,
+采样 / 评论影子锚 `chancellery_final`。续跑时已完成的采样 / 评论影子直接跳过;评论
+重生成的标记会把上次写回的评论重新贴回(从快照恢复的矩阵里是重生成之前的评论)。
+
+### SQL
+
+```sql
+-- 二审影子:每轮 Jev 与主 critic 在门槛层判决上的一致率
+SELECT sl.created_at,
+       sl.output_data->>'round' AS round,
+       sl.output_data->'gate_severity_agreement_with_main' AS gate_agree,
+       sl.output_data->'agreement_with_main' AS per_item
+FROM stage_logs sl
+WHERE sl.stage_name = 'jev_critic_shadow' AND sl.status = 'completed'
+ORDER BY sl.created_at DESC LIMIT 30;
+
+-- 采样影子:每个 cell 的 fq 答案分布(5 篇 × 20 题)
+SELECT sl.run_id, c->>'cell_id' AS cell, c->'fq_distribution' AS dist
+FROM stage_logs sl, LATERAL jsonb_array_elements(sl.output_data->'cells') c
+WHERE sl.stage_name = 'jev_sample_shadow'
+ORDER BY sl.created_at DESC LIMIT 50;
+```
 
 ---
 
