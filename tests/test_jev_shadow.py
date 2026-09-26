@@ -29,8 +29,19 @@ def _no_perf(obj) -> None:
     ("保健食品", "保健品"),
     ("医疗器械", "医疗器械"),
     ("感冒药", "处方药"),          # 分不清处方 / 非处方 → 从严按处方药
-    ("药妆护肤", None),            # 含「药」字但不是药品
-    ("护肤", None),
+    ("药妆护肤", "美妆"),          # 含「药」字但不是药品
+    ("护肤", "美妆"),
+    ("零食", "食品饮料"),
+    ("婴幼儿奶粉", "母婴"),
+    ("药食同源零食", "食品饮料"),
+    # 认不出 → None(orchestrator 据此不发,codex review P1 on #53)
+    ("司美格鲁肽", None),
+    ("Ozempic", None),
+    ("降糖针", None),
+    ("医用敷料", None),           # 沾医疗但不是明写的医疗器械:不猜
+    ("特医食品", None),           # 含「食品」也不归到食品饮料
+    ("医美护肤", None),
+    ("其他", None),
     ("", None),
     (None, None),
 ])
@@ -42,6 +53,23 @@ def test_judge_scope_always_has_project():
     s = js.judge_scope("proj-1", {"product_category": "保健品"})
     assert s == {"project": "ssll:proj-1", "category": "保健品"}
     assert js.judge_scope("proj-1", None) == {"project": "ssll:proj-1", "category": None}
+
+
+def test_judge_scope_override(monkeypatch):
+    monkeypatch.setitem(js.JUDGE_PROJECT_CATEGORY_OVERRIDES, "proj-1", "其他")
+    monkeypatch.setitem(js.JUDGE_PROJECT_CATEGORY_OVERRIDES, "proj-2", "不在词表里")
+    assert js.judge_scope("proj-1", {"product_category": "降糖针"})["category"] == "其他"
+    assert js.judge_scope("proj-2", {"product_category": "降糖针"})["category"] is None
+
+
+@pytest.mark.parametrize("platform,noun", [("小红书", "一篇小红书帖子"), ("", "一篇小红书帖子"),
+                                           ("抖音", "一条抖音内容"), ("B站", "一条B站内容")])
+def test_comment_states_use_the_cell_platform(platform, noun):
+    cell = {"cell_id": "D1", "platform": platform, "demo_output": "标题:t\n正文:第一句很长很长的正文内容。",
+            "comment_seeds": ["楼主在哪买的", "我也想问"]}
+    reader, thread = js.comment_subjects("run-1", cell)
+    assert reader[0]["state"]["说明"].startswith(f"以下是{noun}和它下面的一条候选评论")
+    assert thread["state"]["说明"].startswith(f"以下是{noun}和它下面能看到的全部评论")
 
 
 # ── ① 二审影子 ────────────────────────────────────────────────────────

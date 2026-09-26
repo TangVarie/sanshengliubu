@@ -1355,6 +1355,7 @@ class PipelineOrchestrator:
                 self.run_id,
                 status=final_status,
                 completed_at=datetime.now(timezone.utc).isoformat(),
+                **self._run_totals_fields(),
             )
             self.db.update_project(self.project_id, status=final_status)
 
@@ -3255,11 +3256,24 @@ class PipelineOrchestrator:
                 if ENABLE_JEV_PERSONA_ROUTE:
                     # v0.37.0 第三路开着:两个生成式后端 + Jev,「至少两路一致否决」
                     # 才判弱(docs/31 §6.1)。只跑通两路时这就是原来的交集。
+                    # 「跑通」按**这一个 cell** 算(codex review P2 on #53):只有一个生成式
+                    # 后端时,Jev 漏了 / 判不出某个 cell,这个 cell 就只有一路给了三个画像的
+                    # 判决 —— 那一路一致否决就算数,和「另一个后端没配 key」时退化成它自己
+                    # 是同一个道理;按全局的路数算,这种 cell 永远凑不够两票,弱 cell 告警就
+                    # 恰好在 Jev 部分失败时被悄悄吞掉。
+                    _routes_for_cell: dict[str, set[str]] = {}
+                    for (_cid, _src), _acts in _actions_by_cell_src.items():
+                        if len(_acts) >= 3:
+                            _routes_for_cell.setdefault(_cid, set()).add(_src)
+
+                    def _need(cid: str) -> int:
+                        return min(2, len(_routes_for_cell.get(cid) or ()))
+
                     _weak_cell_ids = sorted(
-                        cid for cid, srcs in _vetoed_by.items() if len(srcs) >= 2
+                        cid for cid, srcs in _vetoed_by.items() if len(srcs) >= _need(cid)
                     )
                     _single_sided = sorted(
-                        cid for cid, srcs in _vetoed_by.items() if len(srcs) < 2
+                        cid for cid, srcs in _vetoed_by.items() if len(srcs) < _need(cid)
                     )
                 else:
                     _weak_cell_ids = sorted(
@@ -5224,6 +5238,19 @@ class PipelineOrchestrator:
     #   · 新增的 stage_log 名全部在 JEV_STAGE_LOG_NAMES 里,登记在
     #     REFINEMENT_MARKER_ANCHORS,重跑 / 修订时跟着锚点一起失效。
 
+    def _run_totals_fields(self) -> dict:
+        """pipeline_runs 的 total_tokens / total_cost_usd,口径同 BaseAgent.run 收尾那次写。
+
+        终审之后的辅助开销(批量采样、判定服务影子)只进了进程内的 run 总账,后面没有
+        BaseAgent 阶段替它们落库 —— 换个进程或重启后看到的总花费会漏掉这一截
+        (codex review P2 on #53)。收尾写状态时一并写。进程里没有这条 run 的账
+        (比如续跑前的进程早就退了)就不写,不拿 0 盖掉库里已有的数。"""
+        t = get_run_totals(self.run_id)
+        if not t:
+            return {}
+        return {"total_tokens": int(t.get("input", 0)) + int(t.get("output", 0)),
+                "total_cost_usd": round(float(t.get("cost_usd", 0.0)), 4)}
+
     async def _jev_judge(
         self,
         bank: str,
@@ -5243,6 +5270,13 @@ class PipelineOrchestrator:
         scope = jev_shadow.judge_scope(self.project_id, brief)
         if not subjects:
             return {"status": "skipped", "reason": "no_subjects", "bank": bank, "scope": scope}
+        if scope["category"] is None:
+            # 从严(codex review P1 on #53):项目在服务端没登记,处方药只能靠 category 拦;
+            # 认不出品类就当可能是处方药,一个请求都不发。
+            return {"status": "skipped", "reason": "category_unrecognized",
+                    "detail": ("brief 的品类认不出属于 TV 统一词表哪一类,按从严处理不出境;"
+                               "在 config.JUDGE_PROJECT_CATEGORY_OVERRIDES 里给这个项目指定品类即可"),
+                    "bank": bank, "scope": scope}
         _tripped = getattr(self, "_jev_circuit", None)
         if _tripped:
             return {"status": "skipped", "reason": "circuit_open",
@@ -5406,6 +5440,10 @@ class PipelineOrchestrator:
             logger.info("[resume] 跳过预埋评论重生成,把上次写回的 %d 个 cell 的评论贴回矩阵", _n)
             return
         if not judge_client.is_configured():
+            return
+        if jev_shadow.judge_scope(self.project_id, brief)["category"] is None:
+            # 判定一定会被 _jev_judge 以 category_unrecognized 跳过:生成端的钱也别花
+            logger.info("[jev_comment_regen] 品类认不出,不出境,保留工部·构建产出的原评论")
             return
         try:
             await self._run_jev_comment_regen(final_system, brief)
@@ -5628,7 +5666,8 @@ class PipelineOrchestrator:
         gen_usage = {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
         # 这些原因换一个 cell 也一样,直接收手
         _fatal = {"not_configured", "unauthorized", "unavailable", "bad_url",
-                  "policy_blocked", "bank_missing", "bad_request", "circuit_open"}
+                  "policy_blocked", "bank_missing", "bad_request", "circuit_open",
+                  "category_unrecognized"}
         state: dict[str, Any] = {"abort_reason": None}
         sem = asyncio.Semaphore(JEV_COMMENT_REGEN_CONCURRENCY)
 
@@ -5677,7 +5716,8 @@ class PipelineOrchestrator:
                         "subject_type": jev_shadow.COMMENT_SUBJECT_TYPE,
                         "subject_id": f"{self.run_id}:{cid}:regen:{slot.id}:{i + 1}",
                         "state": jev_shadow.comment_state(
-                            post, t, role=slot.role, reply_to_text=reply_text
+                            post, t, role=slot.role, reply_to_text=reply_text,
+                            platform=jev_shadow.cell_platform(cell),
                         ),
                         "fill": fill,
                     }
@@ -5715,7 +5755,9 @@ class PipelineOrchestrator:
                 JEV_COMMENT_THREAD_BANK,
                 [{"subject_type": jev_shadow.COMMENT_SUBJECT_TYPE,
                   "subject_id": f"{self.run_id}:{cid}:regen:thread",
-                  "state": jev_shadow.thread_state(post, comments), "fill": fill}],
+                  "state": jev_shadow.thread_state(
+                      post, comments, platform=jev_shadow.cell_platform(cell)),
+                  "fill": fill}],
                 brief=brief,
             )
             _t_items = (jev_shadow.results_by_id(tres).get(

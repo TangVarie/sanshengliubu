@@ -2,11 +2,28 @@
 
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.37.1"
-VERSION_DATE = "2026-09-24"
+VERSION = "v0.37.2"
+VERSION_DATE = "2026-09-26"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.37.2 fix: 判定服务影子的四处修正(codex review on #53)。"
+    "\n\n"
+    "【认不出品类就不出境】项目在服务端没有登记,处方药只能靠 category 拦;以前没写「药」字的"
+    "处方药品类(「司美格鲁肽」「Ozempic」「降糖针」)拿不到 category 照样发出去。现在 brief 的"
+    "品类按医药类规则 → 沾医疗的词(医用 / 特医 / 医美…)→ 非医药类规则翻成 TV 统一词表,"
+    "认不出就整条 run 的判定影子跳过(reason = category_unrecognized),评论重生成连生成端都不调;"
+    "要跑的项目在 JUDGE_PROJECT_CATEGORY_OVERRIDES 里手工指定品类。"
+    "\n\n"
+    "【终审之后的开销落库】批量采样、判定服务影子在终审之后,只进了进程内的 run 总账,后面没有"
+    "BaseAgent 阶段替它们写 pipeline_runs.total_cost_usd;收尾写状态时一并写。"
+    "\n\n"
+    "【画像第三路按 cell 数路】开关开着时「至少两路否决」的路数按这个 cell 实际给了判决的路算:"
+    "Jev 漏了某个 cell 时,那个 cell 只有一路判过,那一路一致否决就算数(开关关着时不变)。"
+    "\n\n"
+    "【预埋评论按 cell 的平台判】评论 / 评论区的 state 以前一律说「小红书帖子」,抖音、微博、"
+    "B站的 cell 现在按自己的平台说。"
+    "\n\n---\n\n"
     "v0.37.1 fix: 详情页 Tab 6「二审(仲裁)」面板一直是空的,现在每轮都有真实数据。"
     "\n\n"
     "【为什么】critic_result[\"_gemini_arbitration\"] 是在 vibe_critic.run() 返回之后才挂上的,"
@@ -1827,9 +1844,16 @@ JUDGE_RUN_TAG = "primary"
 # 项目放行 / 标处方药,在 judge 仓 config/data_policy.yaml 里写这个代号。
 JUDGE_PROJECT_PREFIX = "ssll:"
 # brief.product_category 是自由文本(页面上填「护肤」「保健品」这类),要翻成
-# TV 统一词表才有意义。按顺序匹配,第一条命中即用;都不中就不发 category。
-# 最后一条「药」是**从严**的兜底:分不清处方 / 非处方的药品一律按处方药发,
-# 宁可让服务端 403 掉这次影子,也不把可能是处方药的未发布稿放出去。
+# TV 统一词表(TV docs/05 §9 的 14 值)。**认不出就不发**(codex review P1 on #53):
+# 三省六部的项目在服务端没有登记,处方药只能靠 category 拦;一个没写「药」字的
+# 处方药品类(「司美格鲁肽」「Ozempic」「降糖针」)以前拿不到 category 照样出境。
+# 现在顺序是:
+#   1. JUDGE_PROJECT_CATEGORY_OVERRIDES 里手工指定的(按 projects.id);
+#   2. 医药类规则(JUDGE_CATEGORY_RULES,第一条命中即用)。最后一条「药」是从严的
+#      兜底:分不清处方 / 非处方的药品一律按处方药发,让服务端 403 掉这次影子;
+#   3. 命中 JUDGE_CATEGORY_CLOSED_MARKERS 的(医用、特医、医美…)→ 认不出;
+#   4. 非医药类规则(JUDGE_CATEGORY_GENERAL_RULES);
+#   5. 都不中 → 认不出 → 这个 run 的判定服务影子一律跳过(reason = category_unrecognized)。
 JUDGE_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("非处方", "otc"), "OTC药"),
     (("处方",), "处方药"),
@@ -1839,6 +1863,30 @@ JUDGE_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 # 匹配前先从品类文本里剔掉的词(含「药」字但不是药品)。
 JUDGE_CATEGORY_EXCLUDE: tuple[str, ...] = ("药妆", "药食同源")
+# 沾医疗但上面几条没认出来的:不猜是不是非医药类,按认不出处理(不出境)。
+JUDGE_CATEGORY_CLOSED_MARKERS: tuple[str, ...] = (
+    "医用", "医疗", "医美", "特医", "注射", "针剂", "处方",
+)
+# 非医药类:只收写得明白的词。宁可认不出(少跑一次影子),不把药品错归到这里。
+JUDGE_CATEGORY_GENERAL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("美妆", "彩妆", "护肤", "化妆品"), "美妆"),
+    (("个护", "个人护理", "洗护"), "个护"),
+    (("母婴", "婴幼儿", "奶粉", "纸尿裤"), "母婴"),
+    (("酒类", "白酒", "啤酒", "葡萄酒", "红酒"), "酒类"),
+    (("食品", "饮料", "饮品", "零食"), "食品饮料"),
+    (("数码", "3c", "手机", "电脑"), "3C数码"),
+    (("家居", "家电"), "家居家电"),
+    (("服饰", "服装", "鞋", "箱包"), "服饰鞋包"),
+    (("教育", "课程", "培训"), "教育"),
+)
+# TV 统一词表(与 TV onboarder/vocab.py CATEGORIES、notes_v1_2 的 CHECK 一致)。
+JUDGE_TV_CATEGORIES: tuple[str, ...] = (
+    "处方药", "OTC药", "保健品", "医疗器械", "美妆", "个护", "酒类",
+    "食品饮料", "母婴", "3C数码", "家居家电", "服饰鞋包", "教育", "其他",
+)
+# 按项目手工指定品类(projects.id → JUDGE_TV_CATEGORIES 里的一个值),优先于上面的规则。
+# 认不出品类的项目想跑影子,就在这里登记;值不在词表里的条目忽略(仍按认不出处理)。
+JUDGE_PROJECT_CATEGORY_OVERRIDES: dict[str, str] = {}
 
 # ① 网感二审影子:每轮 vibe_critic 之后,把本轮评的 cell 交给 Jev 按
 # multiplier_gate 四项 + template_test.still_holds 出概率。结果只进

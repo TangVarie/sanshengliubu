@@ -29,9 +29,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pipeline.config import (
+    JUDGE_CATEGORY_CLOSED_MARKERS,
     JUDGE_CATEGORY_EXCLUDE,
+    JUDGE_CATEGORY_GENERAL_RULES,
     JUDGE_CATEGORY_RULES,
+    JUDGE_PROJECT_CATEGORY_OVERRIDES,
     JUDGE_PROJECT_PREFIX,
+    JUDGE_TV_CATEGORIES,
     JEV_SAMPLE_MAX_PARAS,
     JEV_SAMPLE_TITLE_EXTRACTION,
 )
@@ -46,7 +50,8 @@ UNANNOTATED = "（未标注）"
 # ══════════════════════════════════════════════════════════════════════
 
 def map_category(text: Any) -> str | None:
-    """brief.product_category(自由文本)→ TV 统一词表。认不出返回 None(不发)。"""
+    """brief.product_category(自由文本)→ TV 统一词表。认不出返回 None ——
+    调用方(orchestrator._jev_judge)见 None 就**不发**,见 config 里那段顺序说明。"""
     if isinstance(text, list):
         text = "、".join(str(t) for t in text)
     t = str(text or "").strip().lower()
@@ -57,15 +62,24 @@ def map_category(text: Any) -> str | None:
     for markers, label in JUDGE_CATEGORY_RULES:
         if any(m.lower() in t for m in markers):
             return label
+    if any(m.lower() in t for m in JUDGE_CATEGORY_CLOSED_MARKERS):
+        return None
+    for markers, label in JUDGE_CATEGORY_GENERAL_RULES:
+        if any(m.lower() in t for m in markers):
+            return label
     return None
 
 
 def judge_scope(project_id: str, brief: dict | None) -> dict[str, str | None]:
-    """每个请求都带的 project / category。project 必发(未发布稿没有它服务端 422)。"""
+    """每个请求都带的 project / category。project 必发(未发布稿没有它服务端 422);
+    category 为 None = 认不出品类,调用方一律不发(从严,codex review P1 on #53)。"""
     b = brief or {}
+    override = JUDGE_PROJECT_CATEGORY_OVERRIDES.get(str(project_id))
+    category = override if override in JUDGE_TV_CATEGORIES else \
+        map_category(b.get("product_category") or b.get("category"))
     return {
         "project": f"{JUDGE_PROJECT_PREFIX}{project_id}",
-        "category": map_category(b.get("product_category") or b.get("category")),
+        "category": category,
     }
 
 
@@ -606,9 +620,18 @@ def comment_fill(post: dict) -> dict[str, str]:
     return fill
 
 
-def comment_state(post: dict, text: str, *, role: str = "", reply_to_text: str = "") -> dict[str, str]:
-    """同 judge.comments.comment_state:帖子 + 这一条评论。"""
-    st = {"说明": "以下是一篇小红书帖子和它下面的一条候选评论。只根据帖子和这条评论判断。",
+def _post_noun(platform: str) -> str:
+    """state 里怎么称呼这条内容。小红书沿用 judge.comments 的原话(「一篇小红书帖子」),
+    别的平台按 cell 自己的平台说(codex review P2 on #53:以前一律说成小红书帖子,
+    抖音 / 微博 / B站的预埋评论是在错的平台语境下判的)。"""
+    p = (platform or "").strip() or "小红书"
+    return "一篇小红书帖子" if p == "小红书" else f"一条{p}内容"
+
+
+def comment_state(post: dict, text: str, *, role: str = "", reply_to_text: str = "",
+                  platform: str = "小红书") -> dict[str, str]:
+    """同 judge.comments.comment_state:帖子 + 这一条评论。platform = cell 的平台。"""
+    st = {"说明": f"以下是{_post_noun(platform)}和它下面的一条候选评论。只根据帖子和这条评论判断。",
           "帖子标题": post.get("title") or "（无标题）", "帖子正文": (post.get("body") or "")[:600]}
     if reply_to_text:
         st["回复对象"] = reply_to_text
@@ -618,16 +641,20 @@ def comment_state(post: dict, text: str, *, role: str = "", reply_to_text: str =
     return st
 
 
-def thread_state(post: dict, comments: list[dict]) -> dict[str, str]:
-    """同 judge.comments.thread_state:帖子 + 能看到的全部评论。"""
+def thread_state(post: dict, comments: list[dict], *, platform: str = "小红书") -> dict[str, str]:
+    """同 judge.comments.thread_state:帖子 + 能看到的全部评论。platform = cell 的平台。"""
     lines = []
     for i, c in enumerate(comments, 1):
         who = c.get("role") or "读者"
         rep = f"（回复「{c['reply_to_text'][:20]}」）" if c.get("reply_to_text") else ""
         lines.append(f"{i}. [{who}]{rep} {c['text']}")
-    return {"说明": "以下是一篇小红书帖子和它下面能看到的全部评论。只根据这些文字判断评论区整体。",
+    return {"说明": f"以下是{_post_noun(platform)}和它下面能看到的全部评论。只根据这些文字判断评论区整体。",
             "帖子标题": post.get("title") or "（无标题）", "帖子正文": (post.get("body") or "")[:600],
             "评论列表": "\n".join(lines)}
+
+
+def cell_platform(cell: dict) -> str:
+    return _text((cell or {}).get("platform")) or "小红书"
 
 
 def strip_seed_label(text: str) -> tuple[str, str]:
@@ -657,13 +684,15 @@ def comment_subjects(run_id: str, cell: dict) -> tuple[list[dict], dict | None]:
         return [], None
     post = post_from_demo(cell.get("demo_output") or "")
     fill = comment_fill(post)
+    platform = cell_platform(cell)
     reader = [
         {"subject_type": COMMENT_SUBJECT_TYPE, "subject_id": f"{run_id}:{cid}:seed{i + 1}",
-         "state": comment_state(post, text), "fill": fill}
+         "state": comment_state(post, text, platform=platform), "fill": fill}
         for i, (_label, text) in enumerate(seeds)
     ]
     thread = {"subject_type": COMMENT_SUBJECT_TYPE, "subject_id": f"{run_id}:{cid}:seeds",
-              "state": thread_state(post, [{"text": t} for _l, t in seeds]), "fill": fill}
+              "state": thread_state(post, [{"text": t} for _l, t in seeds], platform=platform),
+              "fill": fill}
     return reader, thread
 
 

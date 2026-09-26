@@ -21,6 +21,10 @@ def _fail_if_called(*a, **kw):
     raise AssertionError("没配 JUDGE_URL / 开关关着,却调了判定服务")
 
 
+# 认得出品类的 brief:认不出品类时 _jev_judge 一律不发(codex review P1 on #53)
+_BRIEF = {"product_category": "保健品"}
+
+
 # ── stage_log 登记 ────────────────────────────────────────────────────
 
 def test_every_jev_stage_log_is_registered_with_an_anchor():
@@ -45,7 +49,7 @@ def test_jev_stage_logs_invalidate_with_their_anchor(fake_db):
 
 def test_jev_judge_not_configured_is_a_clean_skip(orch, fake_db):
     reset_run_budget("run-1")
-    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}], brief={}))
+    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}], brief=_BRIEF))
     assert out["status"] == "skipped" and out["reason"] == "not_configured"
     assert fake_db.stage_logs == []
     assert get_run_totals("run-1").get("cost_usd", 0.0) == 0.0
@@ -81,7 +85,7 @@ def test_jev_judge_policy_refusal_is_a_skip(orch, monkeypatch):
         raise judge_client.JudgePolicyRefused("policy: 处方药项目不出境")
 
     monkeypatch.setattr(judge_client, "judge_many", refuse)
-    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}], brief={}))
+    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}], brief=_BRIEF))
     assert out["status"] == "skipped" and out["reason"] == "policy_blocked"
 
 
@@ -253,7 +257,7 @@ def test_persona_flag_on_two_of_three(persona_stubs, fake_db, monkeypatch):
 
     monkeypatch.setattr(judge_client, "judge_many", fake_many)
     fs = _persona_fs()
-    _run(persona_stubs._run_persona_simulation(fs, {"target_audience": "宝妈"}))
+    _run(persona_stubs._run_persona_simulation(fs, {"target_audience": "宝妈", **_BRIEF}))
     # D1: claude+deepseek 否决(Jev 点开)→ 2 路;D2: claude+Jev → 2 路;D3: 只有 Jev → 不算
     assert _weak(fs) == ["D1_xhs", "D2_xhs"]
     by = {w["cell_id"]: w for w in fs["strategic_warnings"]}
@@ -297,7 +301,7 @@ def test_sample_shadow_writes_ledger_only_for_fq(orch, fake_db, monkeypatch):
                 "cost_usd": 0.0, "elapsed_ms": 1, "requests": 1}
 
     monkeypatch.setattr(judge_client, "judge_many", fake_many)
-    _run(orch._run_jev_sample_shadow(_sampling(), {}))
+    _run(orch._run_jev_sample_shadow(_sampling(), _BRIEF))
     by_bank = {b: (w, ids) for b, w, ids in calls}
     assert by_bank["feature_questions_v0_1"] == (True, ["run-1:D1_xhs:g1:1", "run-1:D1_xhs:g1:21"])
     assert by_bank["human_feel_para_v0.1"][0] is False
@@ -318,7 +322,7 @@ def test_comment_shadow_sends_comment_type_unpublished_no_write(orch, fake_db, m
                 "elapsed_ms": 1, "requests": 1}
 
     monkeypatch.setattr(judge_client, "judge_many", fake_many)
-    _run(orch._run_jev_comment_shadow(_matrix(), {}))
+    _run(orch._run_jev_comment_shadow(_matrix(), _BRIEF))
     assert sorted(b for b, _k, _s in calls) == ["comment_reader_v0.4", "comment_thread_v0.3"]
     for _b, kw, subjects in calls:
         assert kw["write"] is False and kw["published"] is False
@@ -381,7 +385,7 @@ def _regen_fakes(monkeypatch, *, reader_status="ok"):
 def test_comment_regen_writes_back_and_logs_marker(orch, fake_db, monkeypatch):
     sent = _regen_fakes(monkeypatch)
     fs = _matrix()
-    _run(orch._run_jev_comment_regen(fs, {}))
+    _run(orch._run_jev_comment_regen(fs, _BRIEF))
     seeds = fs["prompt_matrix"][0]["comment_seeds"]
     assert len(seeds) == len(js.DEFAULT_COMMENT_SLOTS)
     assert all(not s.startswith(("(", "(", "「")) for s in seeds)      # 标签 / 引号已清
@@ -402,7 +406,7 @@ def test_comment_regen_writes_back_and_logs_marker(orch, fake_db, monkeypatch):
 def test_comment_regen_policy_refusal_keeps_original(orch, fake_db, monkeypatch):
     _regen_fakes(monkeypatch, reader_status="policy")
     fs = _matrix()
-    _run(orch._run_jev_comment_regen(fs, {}))
+    _run(orch._run_jev_comment_regen(fs, _BRIEF))
     assert fs["prompt_matrix"][0]["comment_seeds"] == ["楼主在哪买的"]
     log = fake_db.logs("jev_comment_regen")[0]
     assert log["status"] == "skipped"
@@ -418,8 +422,8 @@ def test_circuit_opens_after_service_down(orch, monkeypatch):
         raise judge_client.JudgeCallFailed("judge request timed out after 8s", kind="timeout")
 
     monkeypatch.setattr(judge_client, "judge_many", down)
-    first = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "a"}], brief={}))
-    second = _run(orch._jev_judge("comment_reader_v0.4", [{"subject_id": "b"}], brief={}))
+    first = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "a"}], brief=_BRIEF))
+    second = _run(orch._jev_judge("comment_reader_v0.4", [{"subject_id": "b"}], brief=_BRIEF))
     assert first["reason"] == "timeout" and second["reason"] == "circuit_open"
     assert n["calls"] == 1
 
@@ -433,8 +437,8 @@ def test_bank_level_failures_do_not_open_circuit(orch, monkeypatch):
         raise judge_client.JudgeCallFailed("没有题库", kind="bank_missing", status=404)
 
     monkeypatch.setattr(judge_client, "judge_many", missing)
-    _run(orch._jev_judge("ssll_critic_v0.1", [{"subject_id": "a"}], brief={}))
-    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "b"}], brief={}))
+    _run(orch._jev_judge("ssll_critic_v0.1", [{"subject_id": "a"}], brief=_BRIEF))
+    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "b"}], brief=_BRIEF))
     assert out["reason"] == "bank_missing" and n["calls"] == 2
 
 
@@ -481,3 +485,87 @@ def test_comment_regen_entry_not_configured_keeps_seeds(orch, fake_db, monkeypat
     _run(orch._maybe_run_jev_comment_regen(fs, {}, {}))
     assert fs["prompt_matrix"][0]["comment_seeds"] == ["楼主在哪买的"]
     assert fake_db.calls == []
+
+
+# ── codex review on #53 ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("category", ["司美格鲁肽", "Ozempic", "降糖针", "医用敷料", "", None])
+def test_unrecognized_category_never_leaves(orch, monkeypatch, category):
+    """项目在服务端没登记,处方药只能靠 category 拦:认不出品类就一个请求都不发。"""
+    monkeypatch.setenv("JUDGE_URL", "http://judge.test")
+    monkeypatch.setattr(judge_client, "judge_many", _fail_if_called)
+    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}],
+                               brief={"product_category": category}))
+    assert out["status"] == "skipped" and out["reason"] == "category_unrecognized"
+    assert out["scope"] == {"project": "ssll:proj-1", "category": None}
+
+
+def test_project_category_override_lets_it_through(orch, monkeypatch):
+    monkeypatch.setenv("JUDGE_URL", "http://judge.test")
+    monkeypatch.setitem(js.JUDGE_PROJECT_CATEGORY_OVERRIDES, "proj-1", "处方药")
+    seen = {}
+
+    def fake_many(bank, subjects, **kw):
+        seen.update(kw)
+        return {"results": [], "errors": 0, "written": None, "policy": None, "chunk_failures": [],
+                "usage": {}, "cost_usd": 0.0, "elapsed_ms": 1, "requests": 1}
+
+    monkeypatch.setattr(judge_client, "judge_many", fake_many)
+    out = _run(orch._jev_judge("feature_questions_v0_1", [{"subject_id": "x"}],
+                               brief={"product_category": "司美格鲁肽"}))
+    assert out["status"] == "ok" and seen["category"] == "处方药"    # 服务端据此 403
+
+
+def test_comment_regen_skips_generation_when_category_unrecognized(orch, fake_db, monkeypatch):
+    sent = _regen_fakes(monkeypatch)
+    import pipeline.agents.kimi_client as kc
+    gen = []
+    monkeypatch.setattr(kc, "call_kimi_text", lambda *a, **kw: gen.append(1) or {"text": "x"})
+    fs = _matrix()
+    _run(orch._maybe_run_jev_comment_regen(fs, {"product_category": "降糖针"}, {}))
+    assert gen == [] and sent == []                                  # 生成端的钱也不花
+    assert fs["prompt_matrix"][0]["comment_seeds"] == ["楼主在哪买的"]
+    assert fake_db.logs("jev_comment_regen") == []
+
+
+def test_run_totals_fields_carry_post_final_aux_cost(orch):
+    """终审之后的判定服务开销只进了进程内总账;收尾写 run 状态时要一并落库。"""
+    import pipeline.agents as agents
+    agents._run_totals.pop("run-1", None)
+    assert orch._run_totals_fields() == {}                   # 进程里没账:不拿 0 盖库
+    reset_run_budget("run-1")
+    orc.accumulate_auxiliary_cost("run-1", cost_usd=0.0123, input_tokens=500, source="jev_judge")
+    assert orch._run_totals_fields() == {"total_tokens": 0, "total_cost_usd": 0.0123}
+    reset_run_budget("run-1")
+
+
+def test_persona_route_counts_routes_per_cell(persona_stubs, fake_db, monkeypatch):
+    """只有一个生成式后端 + Jev,而 Jev 漏了某个 cell:那个 cell 只有一路判过,
+    这一路一致否决就算数 —— 不能因为全局看到两路就永远凑不够票。"""
+    monkeypatch.setattr(orc, "ENABLE_JEV_PERSONA_ROUTE", True)
+    monkeypatch.setenv("JUDGE_URL", "http://judge.test")
+
+    async def no_alt(*a, **kw):
+        raise RuntimeError("deepseek 没配")
+
+    monkeypatch.setattr(persona_stubs.persona_simulator_alt, "run", no_alt)
+    # claude: D1 skip / D2 skip / D3 click;Jev 只回 D1(点开)与 D3,D2 整个漏掉
+    jev_actions = {"D1_xhs": "点开", "D3_xhs": "划走"}
+
+    def fake_many(bank, subjects, **kw):
+        out = []
+        for s in subjects:
+            cid = s["subject_id"].split(":")[1]
+            if cid in jev_actions:
+                out.append({"subject_id": s["subject_id"], "items": {
+                    q: {"answer": jev_actions[cid], "p": 0.9} for q in s["qids"]}})
+        return {"results": out, "errors": 0, "written": None, "policy": None,
+                "chunk_failures": [], "usage": {"input_tokens": 1, "output_tokens": 0},
+                "cost_usd": 0.0, "elapsed_ms": 1, "requests": 1}
+
+    monkeypatch.setattr(judge_client, "judge_many", fake_many)
+    fs = _persona_fs()
+    _run(persona_stubs._run_persona_simulation(fs, {"target_audience": "宝妈", **_BRIEF}))
+    # D1:两路都判了、只有 claude 否决 → 不算;D2:只有 claude 判了且否决 → 算;
+    # D3:两路都判了、只有 Jev 否决 → 不算
+    assert _weak(fs) == ["D2_xhs"]

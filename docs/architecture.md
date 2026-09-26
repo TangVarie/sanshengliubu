@@ -637,11 +637,19 @@ critic 结果;更不映射 strategic —— 那会触发策略升级回中书省
 
 ### 数据出境与账本
 
-- 每个请求都带 `project = "ssll:<projects.id>"`、能认出来的 `category`(brief 的
-  `product_category` 按 `JUDGE_CATEGORY_RULES` 翻成 TV 词表,分不清处方 / 非处方的药品
-  从严按「处方药」发)和 `published: false`。处方药项目的未发布稿服务端 403,本仓记
+- 每个请求都带 `project = "ssll:<projects.id>"`、`category` 和 `published: false`。
+  `category` 由 brief 的 `product_category` 翻成 TV 统一词表:先看
+  `JUDGE_PROJECT_CATEGORY_OVERRIDES`(按项目手工指定),再按 `JUDGE_CATEGORY_RULES`
+  (医药类;分不清处方 / 非处方的药品从严按「处方药」发)、`JUDGE_CATEGORY_CLOSED_MARKERS`
+  (沾医疗但认不出的:医用 / 特医 / 医美…)、`JUDGE_CATEGORY_GENERAL_RULES`(非医药类)。
+  **认不出就不发**(v0.37.2):`_jev_judge` 直接记 `category_unrecognized` 跳过 ——
+  三省六部的项目在服务端没登记,处方药只能靠 `category` 拦,认不出的品类(「司美格鲁肽」
+  「降糖针」)不能当安全的放出去。处方药项目的未发布稿服务端 403,本仓记
   `policy_blocked` 跳过,不重试。要放行某个项目,在 judge 仓 `config/data_policy.yaml`
   里写 `ssll:<uuid>`。
+- 终审之后的辅助开销(批量采样、判定服务影子)只进进程内的 run 总账,收尾写 run 状态时
+  一并写 `pipeline_runs.total_tokens / total_cost_usd`(v0.37.2;之前后面没有 BaseAgent
+  阶段替它们落库)。
 - 只有采样稿的 fq 判定写账本:`subject_type = ssll_sample`,
   `subject_id = <run_id>:<cell_id>:<代际>:<seed>`。**代际**(一次采样一个 UTC 时间戳)
   是必需的:修订重跑会删掉 `batch_sampling` 日志、按同一组 seed 重采,不带代际新旧两批
