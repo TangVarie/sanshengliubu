@@ -1885,8 +1885,16 @@ JUDGE_TV_CATEGORIES: tuple[str, ...] = (
     "食品饮料", "母婴", "3C数码", "家居家电", "服饰鞋包", "教育", "其他",
 )
 # 按项目手工指定品类(projects.id → JUDGE_TV_CATEGORIES 里的一个值),优先于上面的规则。
-# 认不出品类的项目想跑影子,就在这里登记;值不在词表里的条目忽略(仍按认不出处理)。
-JUDGE_PROJECT_CATEGORY_OVERRIDES: dict[str, str] = {}
+# 认不出品类的项目想跑影子,就在这里登记;值不在词表里的条目忽略(仍按认不出处理,
+# tests/test_jev_shadow.py 钉着每一条都在词表里)。
+# 2026-09-26 owner 确认:下面五个项目的 brief 品类是自由描述,规则认不出。
+JUDGE_PROJECT_CATEGORY_OVERRIDES: dict[str, str] = {
+    "c013715f-f415-4a47-a376-04d82ff1dbd2": "保健品",    # 百健士儿童藻油(儿童营养品 / 复配藻油)
+    "5712b4b6-3e00-43a6-ac46-c51a724712fc": "教育",      # 途鸽留学求职(留学生回国求职服务)
+    "71f9e21f-5372-44d9-8baa-969331dee4b1": "食品饮料",  # SPORTSIX 能量胶 · 产品贴(运动能量胶)
+    "dd42c0ac-9e21-4db6-aa95-d7547f178435": "食品饮料",  # SPORTSIX 能量胶 · 流量贴(运动营养)
+    "ca63338b-dc1f-4f5e-a54b-8a8b07ce4e85": "服饰鞋包",  # WTG(贴身衣物 / 一次性内裤)
+}
 
 # ① 网感二审影子:每轮 vibe_critic 之后,把本轮评的 cell 交给 Jev 按
 # multiplier_gate 四项 + template_test.still_holds 出概率。结果只进

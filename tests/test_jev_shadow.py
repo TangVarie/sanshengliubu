@@ -55,6 +55,15 @@ def test_judge_scope_always_has_project():
     assert js.judge_scope("proj-1", None) == {"project": "ssll:proj-1", "category": None}
 
 
+def test_configured_overrides_are_all_valid_tv_categories():
+    """judge_scope 会安静地忽略词表外的值(仍按认不出不发),所以登记时写错一个字就等于没登记。"""
+    bad = {pid: c for pid, c in js.JUDGE_PROJECT_CATEGORY_OVERRIDES.items()
+           if c not in js.JUDGE_TV_CATEGORIES}
+    assert not bad, f"这些项目的品类不在 TV 统一词表里:{bad}"
+    for pid, c in js.JUDGE_PROJECT_CATEGORY_OVERRIDES.items():
+        assert js.judge_scope(pid, {"product_category": "随便写的描述"})["category"] == c
+
+
 def test_judge_scope_override(monkeypatch):
     monkeypatch.setitem(js.JUDGE_PROJECT_CATEGORY_OVERRIDES, "proj-1", "其他")
     monkeypatch.setitem(js.JUDGE_PROJECT_CATEGORY_OVERRIDES, "proj-2", "不在词表里")
