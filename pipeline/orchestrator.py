@@ -327,14 +327,33 @@ class PipelineOrchestrator:
 
     # ── Completed stages cache (for resume) ───────────────────────────
 
-    def _load_completed_stages(self) -> dict[str, dict]:
+    def _supersede_failure_markers(self, logs: list[dict]) -> None:
+        """新一次尝试开始:把本 run 之前几次失败留下的 run 级标记(failed)
+        改成 superseded。详情页只渲染 status=failed 的标记 —— 不改的话这次
+        若再失败,顶部会同时挂着上一次(甚至上一版代码)的失败横幅,用户分不清
+        哪条是当前原因。行保留,历史仍可查。"""
+        for log in logs:
+            if (
+                log.get("stage_name") in _FAILURE_MARKER_NAMES
+                and log.get("status") == "failed"
+            ):
+                try:
+                    self.db.update_stage_log(log["id"], status="superseded")
+                except Exception:
+                    logger.warning(
+                        "[run] 旧失败标记 %s 置 superseded 失败(不影响本次运行)",
+                        log.get("stage_name"),
+                    )
+
+    def _load_completed_stages(self, logs: list[dict] | None = None) -> dict[str, dict]:
         """Load outputs from already-completed stages in this run.
 
         Defensive: if a log row is missing `stage_name` (schema drift /
         partial write), skip it instead of crashing the whole pipeline on a
         KeyError at resume time.
         """
-        logs = self.db.get_stage_logs(self.run_id)
+        if logs is None:
+            logs = self.db.get_stage_logs(self.run_id)
         done: dict[str, dict] = {}
         for log in logs:
             if log.get("status") != "completed":
@@ -351,6 +370,36 @@ class PipelineOrchestrator:
                 continue
             done[name] = output
         return done
+
+    def _persist_debate_turn(self, stage_name: str, response: dict) -> None:
+        """把辩论轮的【最终判词】写回该轮 stage_log(status=completed)。
+
+        门下省轮的 stage_log 是 BaseAgent.run() 内部写的,记的是模型原话;
+        _strategy_loop 之后在内存里改判(提前收敛 / 末轮强制放行 / 末轮调用
+        失败的合成放行)必须回写,否则 resume 重建「已批准方案」时只认落库的
+        verdict == approved,找不到就把整场辩论重跑一遍 —— run 5e440827 就是
+        末轮强制放行没回写,点「应用修订意见并重跑」后中书省从头再辩。
+
+        拿不到 log_id,只能按 stage 名回查最后一条。status 也必须改成
+        completed:请旨超限时 _run_with_clarification 带部分产出返回,那条
+        stage_log 停在 needs_input;末轮调用失败时它是 failed ——
+        _load_completed_stages 只收 completed,只改 output_data 读不出来。"""
+        try:
+            _turn_logs = self.db.get_stage_logs(self.run_id, stage_name) or []
+            if _turn_logs:
+                self.db.update_stage_log(
+                    _turn_logs[-1]["id"], status="completed", output_data=response,
+                )
+            else:
+                logger.warning(
+                    "[strategy_debate] 找不到 %s 的 stage_log,最终判词没落库",
+                    stage_name,
+                )
+        except Exception:
+            logger.warning(
+                "[strategy_debate] %s 最终判词回写失败 —— resume 时可能重跑辩论"
+                "(不影响本轮结果)", stage_name,
+            )
 
     def _write_failure_marker(self, marker: str, message: str) -> None:
         """写一条 run 级失败标记(pages/3 顶部的失败横幅读它)。message 会先
@@ -556,7 +605,9 @@ class PipelineOrchestrator:
             # cap and a run could trip the guardrail on its first retry call.
             reset_run_budget(self.run_id)
 
-            done = self._load_completed_stages()
+            _stage_logs = self.db.get_stage_logs(self.run_id)
+            self._supersede_failure_markers(_stage_logs)
+            done = self._load_completed_stages(_stage_logs)
 
             # 太子产出是修补出来的残缺 JSON(_json_truncated:缺 raw_materials /
             # reference_summary)且下游还没在它上面建策略 → 当作未完成,续跑时
@@ -765,6 +816,34 @@ class PipelineOrchestrator:
                         ],
                     )
                     break
+                # 老 run 兼容:辩论跑满轮次且末轮门下省完整落库 = 当时 _strategy_loop
+                # 就在这里强制放行了,放行的正是末轮前一轮的中书省方案。v0.37.4
+                # 之前强制放行只改了内存里的判词、没回写 stage_log(末轮仍记着
+                # challenge),不认它的话这类 run 的任何续跑 / 应用修订都会把整场
+                # 辩论重跑一遍 —— run 5e440827 点「应用修订意见并重跑」就是这样
+                # 白跑了 11 分钟中书省、最后撞上模型空返回失败的。
+                # 以「实际跑到的最后一轮」为准,不直接用当前 MAX_DEBATE_TURNS -1:
+                # 轮次上限可能在这条 run 跑完后被调过。调大了 → 最后一轮够不到新
+                # 上限,照旧重辩(安全默认);调小了 → 真正的强制放行在更靠后的轮次,
+                # 取它前一轮才是当时交付的方案。
+                _last_turn = _debate_turns[0][0] if _debate_turns else -1
+                if (
+                    _approved_plan is None
+                    and _last_turn % 2 == 1
+                    and _last_turn >= int(MAX_DEBATE_TURNS) - 1
+                ):
+                    _sec_out = done.get(f"strategy_debate_{_last_turn - 1}") or {}
+                    _candidate_plan = _sec_out.get("current_plan") or _sec_out
+                    if (
+                        isinstance(_candidate_plan, dict)
+                        and _candidate_plan.get("tactical_directions")
+                    ):
+                        _approved_plan = _candidate_plan
+                        logger.info(
+                            "[resume] 辩论跑满 %d 轮(末轮为强制放行,老格式未回写"
+                            "判词),沿用 strategy_debate_%d 的方案",
+                            _last_turn + 1, _last_turn - 1,
+                        )
                 if _approved_plan is not None:
                     done["secretariat"] = _approved_plan
                 else:
@@ -1611,6 +1690,7 @@ class PipelineOrchestrator:
                     )
                     response = {
                         "verdict": "approved",
+                        "_synthetic_pass": True,
                         "challenges": [],
                         "overall_assessment": (
                             f"⚠️ 末轮审议调用失败({type(_dbt_err).__name__}),"
@@ -1644,6 +1724,12 @@ class PipelineOrchestrator:
                                if response.get("overall_assessment") else "")
                         ),
                     }
+
+                # 末轮强制放行 / 合成放行只改了内存里的判词,回写 stage_log ——
+                # 否则任何续跑 / 应用修订都认不出这场辩论已经收敛,从头重辩
+                # (提前收敛分支在下面,同样回写)。
+                if response.get("_forced_pass") or response.get("_synthetic_pass"):
+                    self._persist_debate_turn(stage_name, response)
 
                 _append_debate_entry("chancellery", turn, response)
 
@@ -1685,35 +1771,7 @@ class PipelineOrchestrator:
                             + (response.get("overall_assessment") or "")
                         ),
                     }
-                    # 这一轮的 stage_log 是 BaseAgent.run() 内部建的,拿不到
-                    # log_id,只能按 stage 名回查最后一条再更新。
-                    try:
-                        _turn_logs = self.db.get_stage_logs(
-                            self.run_id, stage_name
-                        ) or []
-                        if _turn_logs:
-                            # ⚠️ **同时**要把 status 改成 completed。这一轮如果
-                            # 触发过请旨且超了 MAX_CLARIFICATION_PER_AGENT,
-                            # _run_with_clarification 会带着部分产出返回,而那条
-                            # stage_log 还停在 needs_input ——
-                            # _load_completed_stages 只收 status=="completed" 的行,
-                            # 于是"已落库的批准"其实读不出来,下游一失败还是重跑
-                            # 整个策略辩论。只改 output_data 是个不完整的修复。
-                            self.db.update_stage_log(
-                                _turn_logs[-1]["id"],
-                                status="completed",
-                                output_data=response,
-                            )
-                        else:
-                            logger.warning(
-                                "[strategy_debate] 找不到 %s 的 stage_log,"
-                                "合成批准没落库", stage_name,
-                            )
-                    except Exception:
-                        logger.warning(
-                            "[strategy_debate] 合成批准回写失败 —— resume 时"
-                            "可能重跑辩论(不影响本轮结果)"
-                        )
+                    self._persist_debate_turn(stage_name, response)
 
                 if verdict == "approved":
                     logger.info(
@@ -5908,6 +5966,16 @@ class TrendScoutRequiredError(RuntimeError):
     stages finished so far stay saved for「继续执行」.
     """
 
+
+# run 级失败标记(stage_logs 里以下划线开头的伪阶段)。pages/3 顶部的失败
+# 横幅读它们;新一次尝试开始时由 _supersede_failure_markers 统一作废。
+_FAILURE_MARKER_NAMES = (
+    "_precondition_failed",
+    "_pipeline_error",
+    "_thread_target",
+    "_force_cancelled",
+    "_cancelled",
+)
 
 _SCREENSHOT_REF_TAG = "[参考文件: gemini_screenshot_analysis]"
 

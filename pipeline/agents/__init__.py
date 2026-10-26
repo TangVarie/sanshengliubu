@@ -278,6 +278,11 @@ class BalanceSuspendedError(RuntimeError):
     (已完成的阶段会被跳过,不重烧)。"""
 
 
+class EmptyModelResponseError(ValueError):
+    """模型这次调用返回了空正文。仍是 ValueError(重试分类与旧的 JSON 解析
+    失败一致,照常重试),但报错文案不再冒充「JSON 提取失败」。"""
+
+
 def _classify_llm_error(exc: BaseException, attempt: int) -> tuple[bool, bool]:
     """Vendor-agnostic error classification. Returns (retryable, is_5xx).
 
@@ -1714,15 +1719,29 @@ class BaseAgent:
                 )
             break
 
-        # Extract text from response — thinking responses have multiple content blocks
-        text = ""
-        has_thinking = False
-        for block in response.content:
-            if block.type == "thinking":
-                has_thinking = True
-            if block.type == "text":
-                text = block.text
-                break
+        # Extract text from response — thinking responses have multiple content
+        # blocks. 拼接【所有】text 块:此前只取第一个就 break,上游若先给一个
+        # 空 text 块(或把正文拆成多段),真正的 JSON 就被丢掉,表现为
+        # "Could not extract JSON (len=0)"。
+        has_thinking = any(b.type == "thinking" for b in response.content)
+        text = "".join(
+            getattr(b, "text", "") or ""
+            for b in response.content
+            if b.type == "text"
+        )
+        if not text.strip():
+            # 空正文时把能拿到的诊断全打出来:是推理吃光了输出、被截断,还是
+            # 上游返回了空内容 —— 这些只在原始响应里有,stage_log 里存不下。
+            logger.warning(
+                "[%s] 模型返回空文本: model=%s stop_reason=%s blocks=%s "
+                "output_tokens=%s max_tokens=%s",
+                self.stage_name,
+                effective_model,
+                getattr(response, "stop_reason", None),
+                [b.type for b in response.content],
+                getattr(response.usage, "output_tokens", None),
+                self.max_tokens,
+            )
 
         if self._use_thinking:
             logger.info(
@@ -2078,6 +2097,18 @@ class BaseAgent:
                 )
                 _check_run_budget(run_id)
                 _maybe_warn_no_cache_hits(run_id)
+
+                if not (text or "").strip():
+                    # 空正文不是「JSON 格式不对」,别让它以 Could not extract JSON
+                    # (len=0) 的面目出现在 UI 上把人引向解析问题。仍按可重试处理。
+                    raise EmptyModelResponseError(
+                        f"[{self.stage_name}] 模型返回了空内容(0 字,"
+                        f"output_tokens={output_tokens}/{self.max_tokens},"
+                        f"模型 {actual_model or self.model})。这不是 JSON 格式问题:"
+                        f"常见原因是输出全用在了推理上、上游提前断流或被内容审核"
+                        f"拦截。stop_reason 与返回块类型见 worker 日志里"
+                        f"「[{self.stage_name}] 模型返回空文本」那一行。"
+                    )
 
                 output = self._extract_json(text)
                 duration = time.time() - start_time
