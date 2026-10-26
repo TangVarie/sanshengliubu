@@ -49,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -80,6 +81,19 @@ _TRANSIENT_MARKERS = (
     "connection reset", "connection refused", "connection error",
     "temporarily", "eof occurred", "broken pipe",
 )
+
+# 失败归类(报错文案 / stage_log 用,不参与重试判断)。账户级错误必须和网络
+# 抖动分开:积分不足、key 无效时「重试」必然再失败,用户该做的是充值或换 key。
+_QUOTA_MARKERS = (
+    "积分不足", "余额不足", "额度不足", "欠费", "充值",
+    "insufficient", "billing", "quota", "credit",
+)
+_AUTH_MARKERS = (
+    "unauthorized", "forbidden", "invalid api key", "invalid_api_key",
+    "api key 无效", "无效的 api key", "未授权", "鉴权失败",
+)
+_QUOTA_CODE_RE = re.compile(r"\b402\b")
+_AUTH_CODE_RE = re.compile(r"\b40[13]\b")
 
 # Human-facing platform label → SocialDataX MCP platform id (URL segment).
 # All ASCII keys lowercase; CJK keys are unaffected by .lower().
@@ -149,9 +163,11 @@ def _resolve_api_key() -> str:
             return val.strip()
 
     raise SocialDataXNotConfigured(
-        f"{_PRIMARY_KEY_NAME} not set in .streamlit/secrets.toml (or env). "
-        f"Request one at https://socialdatax.com/?from=npm and add it as a "
-        f"top-level `{_PRIMARY_KEY_NAME}` field."
+        f"{_PRIMARY_KEY_NAME} not set. Railway: add it to the WORKER service's "
+        f"Variables (runs execute there; also set it on the web service so the "
+        f"settings page reports correctly). Local: top-level "
+        f"`{_PRIMARY_KEY_NAME}` in .streamlit/secrets.toml. Request a key at "
+        f"https://socialdatax.com/?from=npm."
     )
 
 
@@ -198,6 +214,25 @@ def _extract_text_content(content: Any) -> str:
 def _is_transient(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+def classify_failure(reason: str) -> str:
+    """把取样 / 参考分析的失败原因归成四类:quota_exhausted(积分/余额)、
+    auth(key 无效 / 无权限)、not_configured、other(网络、上游、格式等)。
+
+    只看文本特征。SocialDataX 的账户级错误都是一句供应商原文塞在
+    "call_failed: xhs/<tool> returned an error: ..." 里,不分类的话 UI、日志、
+    报错文案都只能给一套笼统的修复建议(例如对积分不足也说「请重试」)。
+    """
+    text = str(reason or "")
+    if text.startswith("not_configured"):
+        return "not_configured"
+    low = text.lower()
+    if any(m in low for m in _QUOTA_MARKERS) or _QUOTA_CODE_RE.search(text):
+        return "quota_exhausted"
+    if any(m in low for m in _AUTH_MARKERS) or _AUTH_CODE_RE.search(text):
+        return "auth"
+    return "other"
 
 
 def _unwrap_result(platform_id: str, tool: str, result: Any) -> Any:

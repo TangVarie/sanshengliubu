@@ -831,17 +831,26 @@ for i, (stage_key, stage_label, stage_icon) in enumerate(PIPELINE_STAGES):
 # failures, force-cancel) log under MARKER names that are NOT in PIPELINE_STAGES,
 # so the progress row above can show all-green while the run is actually failed.
 # Surface them here so a failed run is never "莫名其妙" with zero explanation.
-_MARKER_NAMES = ("_pipeline_error", "_thread_target", "_force_cancelled")
+_MARKER_NAMES = (
+    "_precondition_failed", "_pipeline_error", "_thread_target", "_force_cancelled",
+)
+_run_failed = (run or {}).get("status") == "failed"
+# 只在 run 当前确实是 failed 时显示标记。标记是失败那一刻写的,不会随
+# 「继续执行」清除 —— 否则续跑排队、运行、甚至跑完之后顶部还挂着上一次的
+# 红色横幅,看起来像续跑又失败了(生产上已有 completed 的 run 挂着它)。
 _markers = [
     log_map[n] for n in _MARKER_NAMES
-    if (log_map.get(n) or {}).get("status") == "failed"
+    if _run_failed and (log_map.get(n) or {}).get("status") == "failed"
 ]
-_run_failed = (run or {}).get("status") == "failed"
 _any_failed_log = any(
     (lg or {}).get("status") == "failed" for lg in log_map.values()
 )
 if _markers:
-    st.markdown("### ❌ 流水线在编排层失败")
+    if all(lg.get("stage_name") == "_precondition_failed" for lg in _markers):
+        # 积分不足 / key 无效这类运行条件问题:不是代码故障,补齐后可续跑。
+        st.markdown("### ⛔ 运行条件不满足,流水线已提前终止")
+    else:
+        st.markdown("### ❌ 流水线在编排层失败")
     for _lg in _markers:
         render_stage_error(_lg)
 elif _run_failed and not _any_failed_log:
@@ -1353,9 +1362,10 @@ with tabs[0]:
                 )
             elif "not_configured" in reason:
                 st.warning(
-                    "跳过（SocialDataX 未配置）——配置好 `SOCIALDATAX_API_KEY` "
-                    "（https://socialdatax.com/?from=npm）且 "
-                    "`ENABLE_SOCIALDATAX_TREND_SCOUT_PRE=True` 后下次生效。"
+                    "跳过（SocialDataX 未配置）——在 Railway **worker 服务**的 "
+                    "Variables 里配置 `SOCIALDATAX_API_KEY`（本地是 "
+                    "`.streamlit/secrets.toml`；申请 https://socialdatax.com/?from=npm）"
+                    "后下次生效。"
                 )
             elif "parse_error" in reason:
                 _raw = ts_out.get("_raw_text_preview", "")

@@ -1757,11 +1757,22 @@ class BaseAgent:
 
         LLMs frequently emit multi-line content inside JSON string values without
         escaping the newlines/tabs. Python's strict=False decoder accepts these.
-        Also normalizes smart/chinese quotes to ASCII equivalents before parsing.
+        Falls back to normalizing smart/chinese quotes to ASCII only when the
+        text doesn't parse as-is.
         """
-        # Normalize common non-ASCII quote variants that LLMs sometimes produce
-        # around JSON keys or values. We only touch quotes; Chinese punctuation
-        # inside string VALUES is fine and gets preserved naturally.
+        decoder = json.JSONDecoder(strict=False)
+        # 先按原文解析,失败才做引号归一化。归一化会把字符串【值里】的中文
+        # 引号 “” 也换成 ASCII ",任何引用了原话的中文内容(太子的
+        # raw_materials、六部文案)都会因此从合法 JSON 变成非法,再被截断修补
+        # 从出错处砍掉后半截 —— 生产上 12 个阶段共 32 份产出这样静默残缺,
+        # 太子 21 份里 5 份丢了 raw_materials/reference_summary(token 用量远
+        # 低于 max_tokens,不是真截断)。
+        try:
+            return decoder.decode(text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Normalize non-ASCII quote variants that LLMs sometimes produce
+        # AROUND JSON keys/values (as delimiters).
         normalized = (
             text
             .replace("\u201c", '"')  # left double quote
@@ -1769,7 +1780,7 @@ class BaseAgent:
             .replace("\u2018", "'")  # left single quote
             .replace("\u2019", "'")  # right single quote
         )
-        return json.JSONDecoder(strict=False).decode(normalized)
+        return decoder.decode(normalized)
 
     @staticmethod
     def _extract_json(response_text: str) -> dict[str, Any]:
@@ -1818,7 +1829,9 @@ class BaseAgent:
             repaired = BaseAgent._try_repair_truncated_json(fragment)
             if repaired is not None:
                 logger.warning(
-                    f"JSON was truncated (len={len(response_text)}), repaired by closing brackets"
+                    f"JSON incomplete or unparseable past some point "
+                    f"(len={len(response_text)}); kept the longest parseable "
+                    f"prefix and closed brackets — fields after the cut are lost"
                 )
                 if isinstance(repaired, dict):
                     # 让下游知道"这是被 max_tokens 截断后修补的残缺产出",而非静默
@@ -2075,9 +2088,12 @@ class BaseAgent:
                 # 持久化(下面 update_stage_log 原样写 output),UI/SQL 可查。
                 if isinstance(output, dict) and output.get("_json_truncated"):
                     logger.warning(
-                        "[%s] 输出被 max_tokens 截断,已用闭合括号修补 —— 产出可能"
-                        "残缺(如画像池被砍短)。建议调高该 stage 的 max_tokens 或分块。",
+                        "[%s] 输出 JSON 不完整 —— 被 max_tokens 截断,或中途有无法"
+                        "解析的内容。已保留最长可解析前缀并闭合括号,其后的字段丢失"
+                        "(如画像池被砍短)。output_tokens=%d/%d,接近上限才是截断。",
                         self.stage_name,
+                        output_tokens,
+                        self.max_tokens,
                     )
 
                 # ── Check if agent is requesting clarification ─────────

@@ -1,12 +1,51 @@
 """Pipeline configuration — model assignments, retry strategy, constants."""
 
+import os
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """环境变量布尔开关:0/false/no/off(不分大小写)为 False,其余非空为
+    True,未设或空串用 default。只读 os.environ,不碰 st.secrets —— config
+    在 worker 进程和导入期都会被加载。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 # ── Version ────────────────────────────────────────────────────────────────
 # Bump on every meaningful release. Format: vMAJOR.MINOR.PATCH (date) — feature
-VERSION = "v0.37.2"
-VERSION_DATE = "2026-09-26"
+VERSION = "v0.37.3"
+VERSION_DATE = "2026-10-26"
 # v0.33.0 ~ v0.33.8 是同一轮改造的九次迭代,加上这一批评审修复,一起收敛成
 # 一个发布号。下面是这一轮到底做了什么的总账;逐版细节仍保留在 _VERSION_NOTES_V033x。
 VERSION_NOTES = (
+    "v0.37.3 fix: 取样积分耗尽(run 5e440827)暴露的一串问题。"
+    "\n\n"
+    "【中文引号弄坏 JSON】_lenient_json_loads 先把中文引号 “” 全换成 ASCII \" "
+    "再解析 —— 字符串值里的 “” 也被换掉,合法 JSON 变非法,截断修补从出错处"
+    "砍掉后半截。生产上 12 个阶段 32 份产出静默残缺,太子 21 份里 5 份丢了 "
+    "raw_materials/reference_summary(其中一份总共才 1,856 token,根本不是截断)。"
+    "现在先按原文解析,失败才归一化。"
+    "\n\n"
+    "【续跑】(1) 续跑复用太子时补回 _user_raw_input 与原始高信号字段 —— 此前"
+    "续跑后整条下游读不到用户原文(debca3ae / bccb6430 续跑后 builder 输入原文"
+    "0 字),「追加并重跑」追加的文字也进不了下游。(2) 太子产出残缺且尚未建策略"
+    "时,续跑重跑太子;太子输入不再混入上一轮的 _user_raw_input/_json_truncated"
+    "(原文曾在太子输入里出现三份)。(3) 本 run 已取样成功就直接复用,不再计费"
+    "(31 次取样里 21 次是重复调用)。"
+    "\n\n"
+    "【报错】取样失败按原因分类(积分不足 / key 无效 / 未配置 / 其他),给对应"
+    "修复步骤:key 配在 worker 服务、处理好后点「继续执行」而不是「重跑」;"
+    "REQUIRED 可用环境变量 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=0 关闭,不必"
+    "改代码重新部署。这类预期内的前置条件失败只写一条 _precondition_failed、"
+    "不附 traceback;其他失败由 run() 落库一次,_thread_target 不再追加一条"
+    "「在 run() 之外失败」的假横幅(也不再绕过所有权守卫写状态)。详情页只在"
+    "run 当前为 failed 时显示失败横幅。"
+    "\n\n"
+    "【设置页】Railway 上没有 secrets.toml,设置页第一行 st.secrets.get 就抛"
+    "StreamlitSecretNotFoundError,整页打不开。改走 secrets_compat。"
+    "\n\n"
     "v0.37.2 fix: 判定服务影子的四处修正(codex review on #53)。"
     "\n\n"
     "【认不出品类就不出境】项目在服务端没有登记,处方药只能靠 category 拦;以前没写「药」字的"
@@ -1482,9 +1521,11 @@ GEMINI_MODEL_OVERRIDES = KIMI_ASSIST_MODEL_OVERRIDES
 #   - POST: after chancellery_final, per direction, for side-by-side
 #           comparison with our produced demos. Advisory, non-blocking.
 #
-# Auth: top-level `SOCIALDATAX_API_KEY` in .streamlit/secrets.toml (request
-# one at https://socialdatax.com/?from=npm). Missing key → scout returns
-# verdict="skipped" and the pipeline proceeds (advisory-only, never blocks).
+# Auth: `SOCIALDATAX_API_KEY` — on Railway an env var on the WORKER service
+# (runs execute there; set it on web too so the settings page is accurate);
+# locally a top-level field in .streamlit/secrets.toml. Request one at
+# https://socialdatax.com/?from=npm. A missing key or failed call blocks the
+# run under SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED (below), else is skipped.
 #
 # Cost: SocialDataX bills per API call by plan. PRE is ~1 call/run; POST is
 # ~1 call per tactical direction (~5-8/run). Set SOCIALDATAX_COST_PER_CALL_USD
@@ -1529,7 +1570,13 @@ ENABLE_SOCIALDATAX_TREND_SCOUT_POST = False
 # Set False to restore pure advisory behavior (skip + proceed).
 # POST is ALWAYS advisory — it runs after all content is produced, so a
 # failure there only loses the side-by-side references, never the output.
-SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED = True
+#
+# 运行时开关:环境变量 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=0 即关闭(worker
+# 服务上设,Railway 改变量会自动重启)。此前只能改这行代码再重新部署,而报错
+# 文案恰恰是在积分耗尽、急着出稿时让人这么做。
+SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED = _env_flag(
+    "SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED", True
+)
 
 # How many posts to keep per invocation (ranked by real engagement).
 SOCIALDATAX_TREND_SCOUT_TARGET_COUNT = 10

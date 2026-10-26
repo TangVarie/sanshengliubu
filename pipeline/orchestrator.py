@@ -82,6 +82,9 @@ from pipeline.agents.kimi_structure_reviewer import (
     format_revision_hints as _format_structure_hints,
     run_kimi_structure_review,
 )
+from pipeline.agents.socialdatax_client import (
+    classify_failure as classify_socialdatax_failure,
+)
 from pipeline.agents.socialdatax_reference_analyzer import run_reference_analyzer
 from pipeline.retrieve_samples import (
     retrieve_reference_packs,
@@ -349,6 +352,52 @@ class PipelineOrchestrator:
             done[name] = output
         return done
 
+    def _write_failure_marker(self, marker: str, message: str) -> None:
+        """写一条 run 级失败标记(pages/3 顶部的失败横幅读它)。message 会先
+        脱敏、超 8000 字截断;写库失败只记日志,不掩盖原始失败。"""
+        try:
+            text = mask_secrets(message)
+            if len(text) > 8000:
+                text = text[:7900] + "\n[... 截断于 8000 字符 ...]"
+            _mlog = self.db.create_stage_log(
+                self.run_id,
+                marker,
+                {"failed_at": datetime.now(timezone.utc).isoformat()},
+            )
+            self.db.update_stage_log(_mlog["id"], status="failed", error_message=text)
+        except Exception as _persist_err:
+            logger.warning(
+                "[run] failed to persist %s marker: %r", marker, _persist_err
+            )
+
+    def _mark_failed_if_owned(self) -> None:
+        """把 run 与 project 标成 failed —— 前提是 run 还归本线程管。
+
+        审计 COR-003(轻量守卫):force_cancel 已把 run 标 failed、同项目可能
+        已有新 run 接管项目,旧线程此刻再无条件把 project 写 failed 就是跨 run
+        串写。run 状态已不是 running/paused_for_review 说明状态所有权已移交,
+        只记日志。"""
+        _still_owned = True
+        try:
+            _cur = self.db.get_pipeline_run(self.run_id) or {}
+            _cur_status = (_cur.get("status") or "").strip().lower()
+            _still_owned = _cur_status in ("running", "paused_for_review")
+        except Exception:
+            pass  # 查询失败按仍归本线程处理,保持旧行为(宁可多写不悬空)
+        if _still_owned:
+            self.db.update_pipeline_run(
+                self.run_id,
+                status="failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self.db.update_project(self.project_id, status="failed")
+        else:
+            logger.info(
+                "[run] run %s 已被外部终结(force_cancel/收割),"
+                "跳过失败状态回写以免覆盖新 run 的项目状态",
+                self.run_id,
+            )
+
     def _recover_completed_cells(
         self, stage_name: str, field: str, validate: bool = False,
     ) -> tuple[dict[str, dict], list[dict]]:
@@ -509,6 +558,23 @@ class PipelineOrchestrator:
 
             done = self._load_completed_stages()
 
+            # 太子产出是修补出来的残缺 JSON(_json_truncated:缺 raw_materials /
+            # reference_summary)且下游还没在它上面建策略 → 当作未完成,续跑时
+            # 重跑太子,而不是把残缺 brief 原样喂给整条下游。已经建了策略的不动:
+            # 中途换 brief 会让已定稿的策略与后续阶段对不上。
+            _cp_done = done.get("crown_prince") or {}
+            if _cp_done.get("_json_truncated") and not any(
+                k == "secretariat" or k.startswith("strategy_debate_")
+                for k in done
+            ):
+                logger.warning(
+                    "[resume] 太子产出不完整(_json_truncated,缺 %s),下游尚未"
+                    "建策略 —— 本次重跑太子",
+                    [k for k in ("raw_materials", "reference_summary")
+                     if k not in _cp_done],
+                )
+                done.pop("crown_prince")
+
             # Revision mode: if chancellery_final rejected this run and the user
             # clicked "应用修订意见并重跑", revise_and_resume_pipeline_in_background
             # stored the review feedback in project.brief._revision_context and
@@ -547,30 +613,25 @@ class PipelineOrchestrator:
             # 1. 太子 — parse brief
             if "crown_prince" in done:
                 logger.info("Resuming: skipping crown_prince (already completed)")
-                structured_brief = done["crown_prince"]
+                structured_brief = dict(done["crown_prince"])
+                # stage_log 里存的是太子 agent 的原始产出,不含新跑分支在太子之后
+                # 补上的用户原文与原始高信号字段(_user_raw_input 等,见下方)。
+                # 不补回来,续跑后整条下游(策略→六部→工部→builder)都读不到用户
+                # 原文,foundation_common.md 的「太子缺细节时翻原文」兜底整体失效;
+                # 「追加并重跑」追加进 free_text 的内容也只能经由这里进下游。
+                # 生产证据:debca3ae / bccb6430 续跑后 builder 输入的原文均为 0 字。
+                _project = self.db.get_project(self.project_id) or {}
+                _attach_user_inputs(
+                    structured_brief,
+                    _compose_user_raw_input(_project),
+                    _project.get("brief") or {},
+                )
             else:
                 project = self.db.get_project(self.project_id)
-                _free_text = project.get("free_text", "") or ""
                 _brief_dict = project.get("brief") or {}
-
-                # v0.30.3 fix #1: 把截图分析文本拼进 free_text 的 [参考文件]
-                # 包装,让它受 crown_prince 的 60% 硬留存规则保护。之前
-                # _screenshot_analysis_text 只挂在 brief 字段上,crown_prince
-                # 把它当成普通 brief 字段自由概括,几百字的 Gemini 视觉转写
-                # 被压成一句话总结。
-                _shot_txt = (_brief_dict.get("_screenshot_analysis_text") or "").strip()
-                if _shot_txt and "[参考文件: gemini_screenshot_analysis]" not in _free_text:
-                    _free_text = (
-                        _free_text
-                        + "\n\n[参考文件: gemini_screenshot_analysis]\n"
-                        + _shot_txt
-                        + "\n[/参考文件]"
-                    )
-                    logger.info(
-                        "[crown_prince] 注入 _screenshot_analysis_text "
-                        "(%d 字)进 free_text 的 [参考文件] 包装",
-                        len(_shot_txt),
-                    )
+                # v0.30.3 fix #1:截图转写拼进 free_text 的 [参考文件] 包装,
+                # 受太子 60% 硬留存规则保护(见 _compose_user_raw_input)。
+                _free_text = _compose_user_raw_input(project)
 
                 # v0.30.3 fix #2: strip 流水线内部状态(如 _revision_context、
                 # strategic_warnings、_strategic_escalation_history)避免重跑时
@@ -587,6 +648,13 @@ class PipelineOrchestrator:
                     # 会以陈旧"当前爆款"身份混进 crown_prince 输入并扩散到下游。
                     # 趋势取样(step 1b)会用当前值重填,这里剥离保证不吃旧数据。
                     "_trend_intel",
+                    # 上一轮太子之后挂上的派生字段。_user_raw_input/_raw_input_text
+                    # 就是 free_text 的拷贝(free_text 已单独传入),不剥会让用户原文
+                    # 在太子输入里出现三份;_json_truncated 是上一轮的解析标记,
+                    # 不剥模型会看到自己上次的残缺产出带着这个标记。
+                    "_user_raw_input",
+                    "_raw_input_text",
+                    "_json_truncated",
                 )
                 _clean_brief = {
                     k: v for k, v in _brief_dict.items()
@@ -615,21 +683,10 @@ class PipelineOrchestrator:
                 #   _raw_input_text  — 老字段名,保留兼容(老 prompt 可能引用)
                 # 注意:_free_text 是已经包了 _screenshot_analysis_text 的版本,
                 # 比 project.free_text 更全。
-                if _free_text:
-                    structured_brief["_user_raw_input"] = _free_text
-                    structured_brief["_raw_input_text"] = _free_text  # 兼容
-                # crown_prince 的输出会整体覆写 project.brief。它的结构化 schema
-                # 不回显这些"用户原始高信号输入"字段,若不并回,update_project 会把
-                # 它们静默丢弃 —— 尤其 _reference_post_urls(用户手贴的对标爆文
-                # URL),丢了之后参考分析器(step 1a)永远拿不到 URL。setdefault:
-                # 只在 crown_prince 没自己产出同名字段时补,不覆盖它的输出。
-                for _k in (
-                    "_reference_post_urls",
-                    "_library_sample_analyses",
-                    "_screenshot_analysis_text",
-                ):
-                    if _k in _brief_dict:
-                        structured_brief.setdefault(_k, _brief_dict[_k])
+                # 同时并回用户原始高信号字段(见 _attach_user_inputs):crown_prince
+                # 的输出会整体覆写 project.brief,不并回会被静默丢弃。续跑分支
+                # 走同一个 helper,两边口径一致。
+                _attach_user_inputs(structured_brief, _free_text, _brief_dict)
                 self.db.update_project(self.project_id, brief=structured_brief)
 
             self._check_cancelled("太子之后")
@@ -648,8 +705,9 @@ class PipelineOrchestrator:
             # 的 _trend_intel 字段。这些是**原文样本**不是趋势分析。
             # ⚠️ REQUIRED 默认开:取样失败且无可复用数据时抛
             # TrendScoutRequiredError 提前终止 run(fail-fast,见
-            # SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED)。
-            await self._run_gemini_trend_scout_pre(structured_brief)
+            # SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED)。续跑时本 run 已取样成功的
+            # 直接复用,不再计费(见函数内)。
+            await self._run_gemini_trend_scout_pre(structured_brief, done)
 
             # 2. 中书省 ↔ 门下省 — strategy loop (step 1: skeleton + review)
             # v0.30.10: 修复"strategy_loop 每次 resume 都强制重跑"的老 bug。
@@ -1382,6 +1440,15 @@ class PipelineOrchestrator:
             # 状态由 force_cancel_pipeline 负责(它已经把 run 标成 failed 了),
             # 这里正常返回即可。
             return
+        except TrendScoutRequiredError as e:
+            # 预期内、用户自己能处理的前置条件失败(积分不足 / key 无效 / 没配
+            # key …),不是代码故障:不打 traceback、不附堆栈、不 re-raise。与
+            # 上面 PipelineCancelled 同理 —— 往上抛会被 _thread_target 再记一条
+            # 「run() 之外失败」的假横幅,并绕过下面的所有权守卫。
+            logger.warning("[run] 前置条件不满足,提前终止: %s", str(e)[:300])
+            self._write_failure_marker("_precondition_failed", str(e))
+            self._mark_failed_if_owned()
+            return
         except Exception as e:
             logger.exception("Pipeline failed")
             # Persist the failure where the UI can actually show it. run()'s
@@ -1390,58 +1457,24 @@ class PipelineOrchestrator:
             # the detail page renders "failed but error_message empty, 请查看
             # 服务端日志" — unreachable on Streamlit Cloud. Mirror the
             # _force_cancelled marker pattern so pages/3 can render it.
+            import traceback as _tb
+
+            self._write_failure_marker(
+                "_pipeline_error",
+                "流水线中途失败:下面这个异常没有被任何单个阶段处理。看第一行的"
+                "异常类型和信息判断原因,完整 traceback 附在后面。\n\n"
+                f"{type(e).__name__}: {e}\n--- traceback ---\n"
+                + "".join(_tb.format_exception(type(e), e, e.__traceback__)),
+            )
+            self._mark_failed_if_owned()
+            # 告诉 _thread_target 这次失败已经落库、状态也按所有权守卫处理过了。
+            # 此前它照样再写一条 _thread_target 标记(文案声称失败发生在
+            # 「orchestrator.run() 之外」)并无条件把 run/project 写 failed ——
+            # 每次 run 内失败都出两条横幅,第二条把排查方向引向线程初始化。
             try:
-                import traceback as _tb
-                _detail = mask_secrets(
-                    f"{type(e).__name__}: {e}\n--- traceback ---\n"
-                    + "".join(_tb.format_exception(type(e), e, e.__traceback__))
-                )
-                if len(_detail) > 8000:
-                    _detail = _detail[:7900] + "\n[... 截断于 8000 字符 ...]"
-                _elog = self.db.create_stage_log(
-                    self.run_id,
-                    "_pipeline_error",
-                    {"failed_at": datetime.now(timezone.utc).isoformat()},
-                )
-                self.db.update_stage_log(
-                    _elog["id"],
-                    status="failed",
-                    error_message=(
-                        "流水线在编排层抛出未被单个阶段捕获的错误（常见于策略/"
-                        "工部阶段的校验失败：重建 cell 为空、cell 数量对不上、"
-                        "六部有部执行失败等）。完整 traceback 见下：\n\n"
-                        + _detail
-                    ),
-                )
-            except Exception as _persist_err:
-                logger.warning(
-                    "[run] failed to persist _pipeline_error marker: %r",
-                    _persist_err,
-                )
-            # 审计 COR-003(轻量守卫):失败回写前确认这条 run 还归本线程管。
-            # force_cancel 已把 run 标 failed、同项目可能已有新 run 接管项目,
-            # 旧线程此刻再无条件把 project 写 failed 就是跨 run 串写。run 状态
-            # 已不是 running/paused_for_review 说明状态所有权已移交,只记日志。
-            _still_owned = True
-            try:
-                _cur = self.db.get_pipeline_run(self.run_id) or {}
-                _cur_status = (_cur.get("status") or "").strip().lower()
-                _still_owned = _cur_status in ("running", "paused_for_review")
+                e._failure_recorded_by_run = True
             except Exception:
-                pass  # 查询失败按仍归本线程处理,保持旧行为(宁可多写不悬空)
-            if _still_owned:
-                self.db.update_pipeline_run(
-                    self.run_id,
-                    status="failed",
-                    completed_at=datetime.now(timezone.utc).isoformat(),
-                )
-                self.db.update_project(self.project_id, status="failed")
-            else:
-                logger.info(
-                    "[run] run %s 已被外部终结(force_cancel/收割),"
-                    "跳过失败状态回写以免覆盖新 run 的项目状态",
-                    self.run_id,
-                )
+                pass
             raise
         finally:
             # Release budget tracker memory for this run
@@ -3443,7 +3476,9 @@ class PipelineOrchestrator:
             verdict,
         )
 
-    async def _run_gemini_trend_scout_pre(self, brief: dict) -> None:
+    async def _run_gemini_trend_scout_pre(
+        self, brief: dict, done: dict | None = None
+    ) -> None:
         """A1: pre-secretariat trend scout. Pulls real current 小红书 爆款
         via SocialDataX (first-party XHS access) to calibrate downstream
         copy writing against current platform voice.
@@ -3466,6 +3501,38 @@ class PipelineOrchestrator:
         for UI compatibility.)
         """
         if not ENABLE_SOCIALDATAX_TREND_SCOUT_PRE:
+            return
+
+        # 续跑复用:本 run 已有一条成功的取样(stage_log completed 且带 posts)
+        # 就原样沿用,不再调 SocialDataX。此前每次「继续执行」/ 僵尸自动接续 /
+        # 从后段「追加并重跑」都会重新取样 —— 生产上 31 次取样里 21 次是同一
+        # run 策略早已定稿后的重复调用,白耗积分;而且新样本会覆盖
+        # project.brief._trend_intel,下游看到的样本和校准策略时用的不是同一批。
+        # 从太子「追加并重跑」会按失效图删掉这条 stage_log,照常重新取样。
+        _prev = (done or {}).get("gemini_trend_scout_pre") or {}
+        if _prev.get("posts"):
+            _ti = {
+                "posts": _prev.get("posts", []),
+                "queries_used": _prev.get("queries_used", []),
+                "grounding_urls": _prev.get("grounding_urls", []),
+                # completed 且带 posts 就是成功取样;formatter 只认 all_pass,
+                # 老格式的 stage_log 若没存 verdict 也不能因此拿到空校准块。
+                "formatted_block": format_trend_intel_for_prompt(
+                    {**_prev, "verdict": "all_pass"}
+                ),
+            }
+            brief["_trend_intel"] = _ti
+            # 太子在本次续跑里被重跑过的话,它整列覆写 project.brief 时已抹掉
+            # _trend_intel;补回去,UI 与后续续跑才看得到(read-modify-merge)。
+            _fresh = (self.db.get_project(self.project_id) or {}).get("brief") or {}
+            if not (_fresh.get("_trend_intel") or {}).get("posts"):
+                _fresh["_trend_intel"] = _ti
+                self.db.update_project(self.project_id, brief=_fresh)
+            logger.info(
+                "[trend_scout pre] 续跑复用本 run 已取到的 %d 条样本,不再调用 "
+                "SocialDataX",
+                len(_ti["posts"]),
+            )
             return
 
         # Ordered SEARCH-KEYWORD candidates. product_category is the best
@@ -3571,25 +3638,20 @@ class PipelineOrchestrator:
                 and not deterministic
             )
 
+            failure_kind = classify_socialdatax_failure(reason)
             error_message = None
             if required_fail:
-                error_message = (
-                    f"趋势取样(SocialDataX)未能拿到校准样本：{reason}。"
-                    f"该阶段是策略校准的关键输入,缺失会导致全程产出跑偏,"
-                    f"故按 SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True 提前终止"
-                    f"(此时只消耗了太子阶段)。修复方式:"
-                    f"① 配置 .streamlit/secrets.toml 顶层 SOCIALDATAX_API_KEY"
-                    f"(https://socialdatax.com/?from=npm);"
-                    f"② 网络/配额问题请重试;"
-                    f"③ 若想跳过取样直接跑,把 pipeline/config.py 的 "
-                    f"SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED 设为 False。"
-                )
+                error_message = _trend_scout_required_message(reason, failure_kind)
 
             self.db.update_stage_log(
                 log_id,
                 status="failed" if required_fail else "skipped",
                 output_data={
                     "_skip_reason": reason,
+                    # quota_exhausted / auth / not_configured / other:UI、SQL
+                    # 按原因区分「积分用完」「key 不对」「网络抖动」,不必再去
+                    # 读 _skip_reason 里的供应商原文。
+                    "_failure_kind": failure_kind,
                     "queries_used": result.get("queries_used", []),
                     "_partial_failures": result.get(
                         "_partial_failures", []
@@ -5839,12 +5901,111 @@ def _apply_comment_seeds(prompt_cells: list[dict], applied: dict) -> int:
 class TrendScoutRequiredError(RuntimeError):
     """Raised by _run_gemini_trend_scout_pre when
     SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=True and the scout can't deliver
-    calibration posts (and the brief has none to reuse). Propagates to
-    run()'s top-level handler, which marks the run failed — a deliberate
-    fail-fast: at that point only the 太子 stage has been paid for, whereas
-    silently proceeding without calibration data skews the whole strategy
-    and forces a full rerun.
+    calibration posts (and the brief has none to reuse). run() handles it in
+    a dedicated branch — an expected, user-fixable precondition failure, not
+    a crash: clean message, no traceback, no re-raise. Deliberate fail-fast:
+    proceeding without calibration data skews the whole strategy, while the
+    stages finished so far stay saved for「继续执行」.
     """
+
+
+_SCREENSHOT_REF_TAG = "[参考文件: gemini_screenshot_analysis]"
+
+# 用户原始高信号输入:太子的结构化 schema 不回显它们,太子产出覆写
+# project.brief 时不并回就会被静默丢弃 —— 尤其 _reference_post_urls(用户手贴
+# 的对标爆文 URL),丢了之后参考分析器(step 1a)永远拿不到 URL。
+_USER_INPUT_PASSTHROUGH_KEYS = (
+    "_reference_post_urls",
+    "_library_sample_analyses",
+    "_screenshot_analysis_text",
+)
+
+
+def _compose_user_raw_input(project: dict) -> str:
+    """project.free_text 加上截图转写的 [参考文件] 包装 —— 既是太子的输入
+    原文,也是下游 _user_raw_input 的内容。新跑与续跑共用这一份口径。
+
+    v0.30.3 fix #1:截图转写只挂在 brief 字段上时,太子把它当普通字段自由
+    概括,几百字的视觉转写被压成一句话;包进 [参考文件] 才受 60% 硬留存
+    规则保护。"""
+    free_text = project.get("free_text", "") or ""
+    shot = ((project.get("brief") or {}).get("_screenshot_analysis_text") or "").strip()
+    if shot and _SCREENSHOT_REF_TAG not in free_text:
+        free_text = (
+            free_text + "\n\n" + _SCREENSHOT_REF_TAG + "\n" + shot + "\n[/参考文件]"
+        )
+        logger.info(
+            "[user_raw_input] 拼入 _screenshot_analysis_text(%d 字)的 "
+            "[参考文件] 包装",
+            len(shot),
+        )
+    return free_text
+
+
+def _attach_user_inputs(
+    structured_brief: dict, user_raw_input: str, source_brief: dict
+) -> None:
+    """把用户原文与原始高信号字段挂到太子产出上(原地修改)。
+
+    _user_raw_input 是主字段,_raw_input_text 是老字段名(老 prompt 可能
+    引用);foundation_common.md 的「用户原始输入访问协议」指引下游何时翻
+    原文。高信号字段用 setdefault:太子自己产出了同名字段就不覆盖。"""
+    if user_raw_input:
+        structured_brief["_user_raw_input"] = user_raw_input
+        structured_brief["_raw_input_text"] = user_raw_input  # 兼容
+    for k in _USER_INPUT_PASSTHROUGH_KEYS:
+        if k in source_brief:
+            structured_brief.setdefault(k, source_brief[k])
+
+
+_SCOUT_FAILURE_HEADLINES = {
+    "quota_exhausted": "SocialDataX 的 API Key 积分不足",
+    "auth": "SocialDataX 的 API Key 无效或没有权限",
+    "not_configured": "没有配置 SocialDataX 的 API Key",
+    "other": "调用 SocialDataX 失败(网络、上游接口或返回格式问题)",
+}
+
+
+def _trend_scout_required_message(reason: str, kind: str) -> str:
+    """REQUIRED 模式下取样失败的用户可读说明:按失败原因给修复步骤。
+
+    旧文案对所有原因给同一套 ①②③:指向生产上不存在的 secrets.toml、对积分
+    不足也说「请重试」、跳过开关要改代码重新部署,而且没说该点「继续执行」
+    而不是「重跑流水线」(后者从太子重新付费)。"""
+    headline = _SCOUT_FAILURE_HEADLINES.get(kind, _SCOUT_FAILURE_HEADLINES["other"])
+    key_where = (
+        "Railway 上改 **worker 服务** Variables 里的 `SOCIALDATAX_API_KEY`"
+        "(取样在 worker 里执行;web 服务也配上,设置页才显示得准);"
+        "本地改 `.streamlit/secrets.toml`"
+    )
+    if kind == "quota_exhausted":
+        step1 = (
+            "到 https://socialdatax.com/dashboard/billing 充值;"
+            f"或者换一个有余额的 key —— {key_where}。"
+        )
+    elif kind == "auth":
+        step1 = f"检查或更换 key —— {key_where}。"
+    elif kind == "not_configured":
+        step1 = f"配置 key(申请:https://socialdatax.com/?from=npm)—— {key_where}。"
+    else:
+        step1 = (
+            "多半是临时问题(网络或上游抖动),不用改配置;反复失败的话在 worker "
+            "上跑 `python scripts/probe_socialdatax.py` 看原始报错。"
+        )
+    detail = str(reason).strip().rstrip("。.;; ")
+    return (
+        f"趋势取样(SocialDataX)失败:{headline}。\n\n"
+        f"原始错误:{detail}\n\n"
+        "趋势取样是策略校准的关键输入,缺了这批当前爆款样本,后面的策略会跑偏,"
+        "所以按 `SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED` 在这里提前终止。"
+        "已完成的阶段都已保存。\n\n"
+        f"① {step1}\n\n"
+        "② 然后在本页点「继续执行」:已完成的阶段直接复用,不重复计费。"
+        "不要点「重跑流水线」,那会从太子重新开始。\n\n"
+        "③ 实在要先跑:在 worker 服务设环境变量 "
+        "`SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=0`(Railway 改完会自动重启),"
+        "取样失败时跳过继续,但产出没有经过当前爆款校准。"
+    )
 
 
 class PipelineCancelled(RuntimeError):
@@ -6049,19 +6210,28 @@ def start_pipeline_in_background(
             loop.run_until_complete(orchestrator.run())
         except Exception as e:
             # Two failure classes land here:
-            #   (a) Exception inside orchestrator.run() — its own try/except
-            #       already updated pipeline_run.status to "failed" and
-            #       re-raised, so we just log.
+            #   (a) Exception inside orchestrator.run() — its own handler
+            #       already wrote the _pipeline_error marker, applied the
+            #       ownership-guarded status write-back and tagged the
+            #       exception (_failure_recorded_by_run) before re-raising.
             #   (b) Exception BEFORE orchestrator.run() got to run its try
             #       block — e.g. PipelineOrchestrator.__init__ crashed,
             #       event-loop setup failed, the thread was killed early.
             #       In that case pipeline_run.status is still whatever the
             #       caller set it to ("running") and the UI will auto-refresh
             #       forever waiting for a completion that will never come.
-            # We can't always tell (a) from (b), so redundantly mark the run
-            # failed here: it's idempotent if (a) already did it, and the
-            # safety net for (b). Swallow DB errors so we don't crash the
-            # thread cleanup.
+            # (a) is skipped: writing again produced a second banner falsely
+            # claiming the failure happened "outside orchestrator.run()",
+            # a duplicate traceback in the logs, and an UNguarded status
+            # write that could clobber a run re-queued after force_cancel.
+            # Untagged exceptions (b) — or (a) whose write-back itself
+            # failed — still get the full safety net below.
+            if getattr(e, "_failure_recorded_by_run", False):
+                logger.info(
+                    "[thread_target] run=%s 失败已由 run() 落库: %s",
+                    run_id, type(e).__name__,
+                )
+                return
             logger.exception("Background pipeline thread failed")
             try:
                 err_str = f"{type(e).__name__}: {e}"

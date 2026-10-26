@@ -11,6 +11,7 @@ from pipeline.config import (
     VERSION,
     VERSION_DATE,
 )
+from utils.secrets_compat import get_secret, has_secret
 from utils.version_badge import show_version_badge
 
 st.set_page_config(page_title="设置", page_icon="省")
@@ -26,13 +27,17 @@ st.subheader("连接状态")
 # fall back to direct/relay. Direct/relay mode is considered configured
 # when EITHER a [claude_relay_presets.*] section exists OR the legacy
 # top-level ANTHROPIC_API_KEY is set (backward compat path).
-_gcp_project = st.secrets.get("GCP_PROJECT_ID", "")
-_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-_base_url = st.secrets.get("ANTHROPIC_BASE_URL", "")
+#
+# 一律经由 secrets_compat 读:Railway 的 web 服务也没有 secrets.toml,
+# st.secrets.get 在那里直接抛 StreamlitSecretNotFoundError(FileNotFoundError
+# 子类,不是 KeyError,get 的默认值兜不住),整个设置页在这一行就崩了。
+_gcp_project = get_secret("GCP_PROJECT_ID", "") or ""
+_api_key = get_secret("ANTHROPIC_API_KEY", "") or ""
+_base_url = get_secret("ANTHROPIC_BASE_URL", "") or ""
 # Detect new preset format — any non-empty claude_relay_presets dict
 # counts as "Claude configured" even without top-level ANTHROPIC_API_KEY.
 try:
-    _relay_presets_raw = st.secrets.get("claude_relay_presets") or {}
+    _relay_presets_raw = get_secret("claude_relay_presets") or {}
     _has_relay_presets = bool(dict(_relay_presets_raw)) if _relay_presets_raw else False
 except Exception:
     _has_relay_presets = False
@@ -46,8 +51,8 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("**Claude 接入**")
     if _active_mode == "vertex":
-        _region = st.secrets.get("GCP_REGION", "us-east5")
-        _has_sa = "gcp_service_account" in st.secrets
+        _region = get_secret("GCP_REGION", "us-east5") or "us-east5"
+        _has_sa = has_secret("gcp_service_account")
         st.success(f"Vertex AI · `{_gcp_project}` @ `{_region}`")
         if _has_sa:
             st.caption("Service Account 凭证已就绪")
@@ -224,8 +229,8 @@ if _active_mode == "direct":
 
 with col2:
     st.markdown("**Supabase**")
-    supa_url = st.secrets.get("SUPABASE_URL", "")
-    supa_key = st.secrets.get("SUPABASE_KEY", "")
+    supa_url = get_secret("SUPABASE_URL", "") or ""
+    supa_key = get_secret("SUPABASE_KEY", "") or ""
     if supa_url and supa_url != "https://xxx.supabase.co":
         try:
             from db.supabase_client import SupabaseClient
@@ -244,9 +249,10 @@ with col2:
 st.divider()
 st.subheader("SocialDataX 趋势取样")
 
-_sdx_key = (
-    st.secrets.get("SOCIALDATAX_API_KEY", "")
-    or st.secrets.get("SOCIAL_MEDIA_MCP_API_KEY", "")
+_sdx_key = str(
+    get_secret("SOCIALDATAX_API_KEY", "")
+    or get_secret("SOCIAL_MEDIA_MCP_API_KEY", "")
+    or ""
 ).strip()
 try:
     from pipeline.agents.socialdatax_client import is_available as _sdx_ok
@@ -261,20 +267,27 @@ try:
             "趋势取样(A1)在中书省之前拉真实爆款(原文+互动量)做策略校准。"
             + (
                 "当前为 **REQUIRED** 模式:取样失败且无可复用数据时 run 会"
-                "提前终止(fail-fast,只消耗太子阶段)。"
+                "提前终止(fail-fast);已完成的阶段会保留,处理好后点「继续执行」。"
                 if SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED
                 else "当前为 advisory 模式:失败跳过不阻塞。"
             )
+        )
+        st.caption(
+            "这里只能确认 key 存在,看不到积分余额。取样在 **worker 服务**里"
+            "执行,本页读的是 web 服务的环境变量 —— 两个服务的 "
+            "`SOCIALDATAX_API_KEY` 要一致(Railway Shared Variables)。"
+            "临时关掉 REQUIRED:worker 服务设 "
+            "`SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=0`。"
         )
     elif ENABLE_SOCIALDATAX_TREND_SCOUT_PRE and \
             SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED:
         st.error(
             "未配置 `SOCIALDATAX_API_KEY`,而趋势取样当前是 **REQUIRED** "
             "模式——**每次 run 都会在取样阶段提前失败**。"
-            "去 https://socialdatax.com/?from=npm 申请 Key 填入 "
-            "`.streamlit/secrets.toml` 顶层;或把 `pipeline/config.py` 的 "
-            "`SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED` 设为 `False` 恢复"
-            "跳过不阻塞。"
+            "去 https://socialdatax.com/?from=npm 申请 Key,配到 Railway "
+            "**worker 服务**(和 web 服务)的 Variables(本地是 "
+            "`.streamlit/secrets.toml` 顶层);或在 worker 服务设 "
+            "`SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED=0` 恢复跳过不阻塞。"
         )
     else:
         st.warning(
@@ -289,7 +302,7 @@ except Exception as _sdx_e:  # noqa: BLE001 — settings 页永不因状态区�
 st.divider()
 st.subheader("辅助层（Kimi · 可选）")
 
-_kimi_key = st.secrets.get("MOONSHOT_API_KEY", "").strip()
+_kimi_key = str(get_secret("MOONSHOT_API_KEY", "") or "").strip()
 if not ENABLE_KIMI_ASSIST:
     st.info(
         "已在 `pipeline/config.py` 里禁用（`ENABLE_KIMI_ASSIST=False`）。"

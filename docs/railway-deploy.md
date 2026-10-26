@@ -43,7 +43,8 @@ stage 就少一次重跑。
 | `DEEPSEEK_API_KEY` | ✅* | DeepSeek 对抗/廉价档 |
 | `MOONSHOT_BASE_URL` | | 仅 .ai 站 key 需要覆盖 |
 | `DEEPSEEK_BASE_URL` | | 一般不用 |
-| `SOCIALDATAX_API_KEY` | | 趋势取样(PRE 默认 required,不配会导致新 run 失败,见 pipeline/config.py) |
+| `SOCIALDATAX_API_KEY` | | 趋势取样。**取样在 worker 里执行,worker 必配**;web 也配上设置页才显示得准。PRE 默认 required:没配 / 积分不足 / key 无效都会让 run 在取样处提前终止,处理好后点「继续执行」即可(已完成阶段复用) |
+| `SOCIALDATAX_TREND_SCOUT_PRE_REQUIRED` | | `0` = 取样失败时跳过继续(advisory,产出未经当前爆款校准);默认开。worker 上设,改完自动重启生效 |
 | `JUDGE_URL` | | 判定服务(judge / Jev)根地址,不带 `/judge`。不配 = 影子判定整体零副作用跳过(v0.37.0,见 architecture.md §10) |
 | `JUDGE_API_KEY` | | 判定服务的 `X-Judge-Key`(服务端 fail-closed,生产必配) |
 | `PIPELINE_EXECUTION_MODE` | ✅ | **web 服务设为 `worker`**(让 UI 入队而不是起线程)。worker 进程不读它。 |

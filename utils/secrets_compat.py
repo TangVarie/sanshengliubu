@@ -11,8 +11,10 @@ worker 进程里没有 .streamlit/secrets.toml —— Railway 的配置全部走
   3. 环境变量值以 '{' 或 '[' 开头时按 JSON 解析(承接 secrets.toml 里的
      table 型配置,如 gcp_service_account / claude_relay_presets)。
 
-UI 专属代码(pages/)可以继续直接用 st.secrets;凡是 worker 也要跑到的
-共享模块(db/、pipeline/),一律经由这里。
+所有代码一律经由这里,pages/ 也不例外:Railway 的 web 服务同样没有
+secrets.toml,直接 st.secrets.get(k, default) 会抛 StreamlitSecretNotFoundError
+(FileNotFoundError 子类,不是 KeyError,default 兜不住)—— 设置页曾因此在
+生产上一打开就崩。
 """
 
 from __future__ import annotations
